@@ -35,7 +35,7 @@ func testStore(db *GoDB) {
 	time.Sleep(time.Second)
 	start := time.Now()
 	// Store data in database
-	for i := 1; i <= 100_000; i++ {
+	for i := 1; i <= 10_000; i++ {
 		count := fmt.Sprintf("%d", i)
 		// Serialize data
 		data, err := json.Marshal(&SampleEntry{
@@ -46,17 +46,17 @@ func testStore(db *GoDB) {
 			Skills:      map[string]string{"german": "native", "english": "veri nais"},
 		})
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal(":: DEBUG ERROR serializing", err)
 		}
 		// Insert into db
 		err = db.Insert(data, map[string]string{
 			"count": count,
 		})
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal(":: DEBUG ERROR inserting", err)
 		}
-		if math.Mod(float64(i), float64(1_000)) == 0 {
-			fmt.Printf("> %d\n", i)
+		if math.Mod(float64(i), float64(10_000)) == 0 {
+			fmt.Printf("> Inserted %d\n", i)
 		}
 	}
 	fmt.Printf(">>> DEBUG DB STORE END after %f s\n", time.Since(start).Seconds())
@@ -69,7 +69,7 @@ func testSelect(db *GoDB) {
 	start := time.Now()
 	// Retrieve data from database
 	resp, err := db.Select(map[string]string{
-		"count": "^(69|420|666|777|999|69429)$",
+		"count": "^888$",
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -78,14 +78,14 @@ func testSelect(db *GoDB) {
 	arr := <-resp
 	timeRan := time.Since(start).Seconds()
 	fmt.Printf(">> Results: %d\n", len(arr))
-	for _, entry := range arr {
+	for index, entry := range arr {
 		// Deserialize
 		adr := &SampleEntry{}
 		err := json.Unmarshal(entry.Data, adr)
 		if err != nil {
-			log.Fatal(err)
+			continue
 		}
-		fmt.Println(">", adr.Skills["english"])
+		fmt.Printf("%d > %s %s\n", index, entry.Index.uuid7, adr.Description)
 	}
 	fmt.Printf("\n>>> DEBUG DB SELECT END after %f s\n", timeRan)
 	time.Sleep(time.Second)

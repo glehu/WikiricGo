@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"github.com/gofrs/uuid"
@@ -79,7 +80,6 @@ type DB interface {
 	// Internal Methods
 
 	checkIXFile(index string, level int32) error
-	getIXCacheLength() int
 	writeIXCache(index string, uUID uuid.UUID, indexEntry *Index) error
 	singleIndexQuery(index, query *regexp.Regexp, responses chan *EntryResponse, wg *sync.WaitGroup)
 	readFromDB(pos int64, len int64) ([]byte, error)
@@ -93,12 +93,12 @@ func OpenDB(module string, indices []string) *GoDB {
 	// Create DB file if missing
 	databaseFilename, err := checkDBFile(module, workDirTmp)
 	if err != nil {
-		log.Panic("err during db file check:", err)
+		log.Fatal("err during db file check:", err)
 	}
 	// Set file pointer
 	dbFileTmp, err := os.OpenFile(databaseFilename, os.O_RDWR, 0644)
 	if err != nil {
-		log.Panic("err during db file open:", err)
+		log.Fatal("err during db file open:", err)
 	}
 	// Create db struct pointer and return
 	ixChannelTmp := make(chan *IXChannelCommand, 1_000)
@@ -119,7 +119,7 @@ func OpenDB(module string, indices []string) *GoDB {
 	for _, indexName := range indices {
 		err := goDB.checkIXFile(indexName, 0)
 		if err != nil {
-			log.Panic("err during db ix file check")
+			log.Fatal("err during db ix file check", err)
 		}
 	}
 	go startIXFileWorker(goDB, ixChannelTmp)
@@ -130,7 +130,7 @@ func startIXFileWorker(goDB *GoDB, jobs <-chan *IXChannelCommand) {
 	for job := range jobs {
 		err := goDB.writeIXCache(job.index, job.uUID, job.indexEntry)
 		if err != nil {
-			log.Panic("ix cache write fail:", err)
+			log.Fatal("ix cache write fail:", err)
 		}
 	}
 }
@@ -171,6 +171,7 @@ func (goDB *GoDB) Insert(data []byte, indices map[string]string) error {
 				pos:   offset,
 				len:   int64(len(data)),
 			}
+
 			goDB.indices[key].index.Set(indexEntry)
 			key := key
 			goDB.ixChannel <- &IXChannelCommand{
@@ -307,30 +308,51 @@ func (goDB *GoDB) checkIXFile(index string, level int32) error {
 	if err != nil {
 		log.Panic("err during ix file open:", err)
 	}
+	// Create the B-Tree holding all indices
 	bTree := btree.NewBTreeG[*Index](IndexComparator)
 	goDB.indices[index] = IndexMap{index: bTree, ixFile: ixFileTmp, ixFileMutex: &sync.RWMutex{}}
+	// Read available stored indices and set them
+	reader := csv.NewReader(ixFileTmp)
+	store, err := reader.ReadAll()
+	if err != nil {
+		return errors.New("err reading stored indices")
+	}
+	var uUID uuid.UUID
+	var pos, length int64
+	storedCount := 0
+	for _, value := range store {
+		uUID, err = uuid.FromString(value[1])
+		if err != nil {
+			return errors.New("err reading stored index (uuid)")
+		}
+		pos, err = strconv.ParseInt(value[2], 10, 64)
+		if err != nil {
+			return errors.New("err reading stored index (pos)")
+		}
+		length, err = strconv.ParseInt(value[3], 10, 64)
+		if err != nil {
+			return errors.New("err reading stored index (len)")
+		}
+		indexEntry := &Index{
+			value: value[0],
+			uuid7: uUID,
+			pos:   pos,
+			len:   length,
+		}
+		goDB.indices[index].index.Set(indexEntry)
+		storedCount++
+	}
+	fmt.Printf("DB %s IX %s <- LOAD %d\n", goDB.module, index, storedCount)
 	return nil
-}
-
-func (goDB *GoDB) getIXCacheLength() int {
-	// UUID
-	cacheLength := 16
-	// Index Value
-	cacheLength += goDB.DBSettings.ixMaxLength
-	// DB Pos & Size
-	cacheLength += 19 + 19
-	// Delimiter
-	cacheLength += 1
-	return cacheLength
 }
 
 func (goDB *GoDB) writeIXCache(index string, uUID uuid.UUID, indexEntry *Index) error {
 	ixCache := fmt.Sprintf(
-		"%s;%s;%s;%s\n",
-		uUID.String(),
+		"\"%s\",\"%s\",\"%d\",\"%d\"\n",
 		indexEntry.value,
-		strconv.FormatInt(indexEntry.pos, 10),
-		strconv.FormatInt(indexEntry.len, 10),
+		uUID.String(),
+		indexEntry.pos,
+		indexEntry.len,
 	)
 	ixFile := goDB.indices[index].ixFile
 	ixFileMutex := goDB.indices[index].ixFileMutex
