@@ -58,5 +58,6 @@ func getConfig() (Config, error) {
 }
 
 func setupDatabases() {
-	testDB()
+	// TestBTreeG()
+	TestDB()
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"time"
 )
@@ -12,14 +13,15 @@ type SampleEntry struct {
 	Description string
 	Age         int
 	Website     bool
+	Skills      map[string]string
 }
 
-func testDB() {
+func TestDB() {
 	db := OpenDB("debug", []string{"count"})
 	defer func() {
 		err := db.CloseDB()
 		if err != nil {
-			return
+			log.Fatal(err)
 		}
 	}()
 	// Store Data
@@ -29,25 +31,31 @@ func testDB() {
 }
 
 func testStore(db *GoDB) {
-	time.Sleep(time.Second)
 	fmt.Println(">>> DEBUG DB STORE START")
+	time.Sleep(time.Second)
 	start := time.Now()
 	// Store data in database
-	for i := 1; i <= 100; i++ {
+	for i := 1; i <= 100_000; i++ {
 		count := fmt.Sprintf("%d", i)
-		sample := &SampleEntry{
+		// Serialize data
+		data, err := json.Marshal(&SampleEntry{
 			Field:       "Sample Contact",
 			Description: "Mr Sample Name " + count,
 			Age:         i,
 			Website:     true,
+			Skills:      map[string]string{"german": "native", "english": "veri nais"},
+		})
+		if err != nil {
+			log.Fatal(err)
 		}
-		err := db.Insert(sample, map[string]string{
+		// Insert into db
+		err = db.Insert(data, map[string]string{
 			"count": count,
 		})
 		if err != nil {
-			return
+			log.Fatal(err)
 		}
-		if math.Mod(float64(i), float64(100)) == 0 {
+		if math.Mod(float64(i), float64(1_000)) == 0 {
 			fmt.Printf("> %d\n", i)
 		}
 	}
@@ -56,30 +64,29 @@ func testStore(db *GoDB) {
 }
 
 func testSelect(db *GoDB) {
-	time.Sleep(time.Second)
 	fmt.Println(">>> DEBUG DB SELECT START")
+	time.Sleep(time.Second)
 	start := time.Now()
 	// Retrieve data from database
 	resp, err := db.Select(map[string]string{
-		"count": "^(69|420|666|777|999)$",
+		"count": "^(69|420|666|777|999|69429)$",
 	})
 	if err != nil {
-		return
+		log.Fatal(err)
 	}
+	// Listen for the response
 	arr := <-resp
+	timeRan := time.Since(start).Seconds()
 	fmt.Printf(">> Results: %d\n", len(arr))
 	for _, entry := range arr {
-		adr := entryToObj(entry)
-		fmt.Println(">", adr.Description)
+		// Deserialize
+		adr := &SampleEntry{}
+		err := json.Unmarshal(entry.Data, adr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(">", adr.Skills["english"])
 	}
-	fmt.Printf(">>> DEBUG DB SELECT END after %f s\n", time.Since(start).Seconds())
+	fmt.Printf("\n>>> DEBUG DB SELECT END after %f s\n", timeRan)
 	time.Sleep(time.Second)
-}
-
-func entryToObj(entry interface{}) SampleEntry {
-	ent := entry.(*Entry).Data
-	adt, _ := json.Marshal(ent)
-	adr := SampleEntry{}
-	_ = json.Unmarshal(adt, &adr)
-	return adr
 }
