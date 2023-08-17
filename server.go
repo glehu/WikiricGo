@@ -4,11 +4,14 @@ import (
 	"fmt"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
+	"github.com/gofrs/uuid"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 var tokenAuth *jwtauth.JWTAuth
@@ -57,11 +60,34 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config) {
 
 func setupJWTAuth(config Config) {
 	tokenAuth = jwtauth.New("HS256", []byte(config.jwtSecret), nil)
-	_, tokenString, _ := tokenAuth.Encode(map[string]interface{}{
-		"user_id":   0,
-		"user_name": "debug_usr",
-	})
-	fmt.Printf("\nDEBUG: a sample jwt is \n%s\n\n", tokenString)
+	generateDebugToken()
+}
+
+func generateToken(user User) string {
+	claims := map[string]interface{}{
+		"u_uuid": user.UUID,
+		"u_name": user.Username,
+	}
+	jwtauth.SetExpiryIn(claims, time.Minute*30)
+	_, tokenString, err := tokenAuth.Encode(claims)
+	if err != nil {
+		log.Panicf("err generating jwt token for %s", user.UUID)
+	}
+	return tokenString
+}
+
+func generateDebugToken() {
+	uuidDebug, _ := uuid.NewV7()
+	claims := map[string]interface{}{
+		"u_uuid": uuidDebug,
+		"u_name": "debug_usr",
+	}
+	jwtauth.SetExpiryIn(claims, time.Minute*30)
+	_, tokenString, _ := tokenAuth.Encode(claims)
+	decoded, _ := tokenAuth.Decode(tokenString)
+	userName, _ := decoded.Get("_name")
+	fmt.Printf("\nDEBUG: JWT (u_name=%s) Expires @ %s \n%s\n\n",
+		userName, time.Now().Add(time.Minute*30), tokenString)
 }
 
 func checkHTTPS() bool {
@@ -91,7 +117,13 @@ func setShutdownURL(r chi.Router) {
 
 func setPublicRoutes(r chi.Router) {
 	r.Get("/sample", sampleMessage)
-	vueJSWikiric(r)
+	vueJSWikiricEndpoint(r)
+	// Users
+	userDB := OpenUserDatabase()
+	userDB.UserEndpoints(r, tokenAuth)
+	// Chat Server
+	CreateChatServer().WebsocketChatEndpoint(r, tokenAuth, userDB)
+
 }
 
 func setProtectedRoutes(r chi.Router) {
@@ -102,8 +134,10 @@ func setProtectedRoutes(r chi.Router) {
 		// Protected routes
 		r.Get("/jwt", func(w http.ResponseWriter, r *http.Request) {
 			_, claims, _ := jwtauth.FromContext(r.Context())
-			_, _ = w.Write([]byte(fmt.Sprintf("ID: %v, USR: %v", claims["user_id"], claims["user_name"])))
+			_, _ = w.Write([]byte(fmt.Sprintf("ID: %v, USR: %v", claims["u_uiid"], claims["u_name"])))
 		})
+		// #### Users
+
 	})
 }
 
@@ -122,8 +156,8 @@ func sampleMessage(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// vueJSWikiric serves the wikiric vueJS PWA website
-func vueJSWikiric(r chi.Router) {
+// vueJSWikiricEndpoint serves the wikiric vueJS PWA website
+func vueJSWikiricEndpoint(r chi.Router) {
 	workDir, _ := os.Getwd()
 	filesDir := http.Dir(filepath.Join(workDir, "vue", "dist"))
 	FileServer(r, "/", filesDir)
