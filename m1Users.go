@@ -13,10 +13,11 @@ import (
 )
 
 type User struct {
-	UUID     uuid.UUID `json:"uuid"`
-	Username string    `json:"usr"`
-	Email    string    `json:"email"`
-	PassHash string    `json:"pwhash"`
+	UUID        uuid.UUID `json:"uuid"`
+	Username    string    `json:"usr"`
+	DisplayName string    `json:"name"`
+	Email       string    `json:"email"`
+	PassHash    string    `json:"pwhash"`
 }
 
 type registerRequest struct {
@@ -27,25 +28,47 @@ type registerRequest struct {
 
 func OpenUserDatabase() *GoDB {
 	db := OpenDB("users", []string{
-		"uuid",
 		"username",
 	})
 	return db
 }
 
-func (db *GoDB) UserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth) {
-	r.Route("/users", func(r chi.Router) {
-		r.Post("/signup", db.handleRegisterUser())
+func (db *GoDB) PublicUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth) {
+	r.Route("/users/public", func(r chi.Router) {
+		r.Get("/count", db.handleUserCount())
+		r.Post("/signup", db.handleUserRegistration())
 	})
 }
 
-func (db *GoDB) handleRegisterUser() http.HandlerFunc {
+func (db *GoDB) ProtectedUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth) {
+	r.Route("/users/private", func(r chi.Router) {
+		r.Get("/signin", db.handleUserLogin())
+	})
+}
+
+func (db *GoDB) handleUserCount() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintln(w, db.indices["uuid"].index.Len())
+	}
+}
+
+func (db *GoDB) handleUserLogin() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		token := generateToken(user)
+		_, _ = fmt.Fprintln(w, token)
+	}
+}
+
+func (db *GoDB) handleUserRegistration() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Retrieve POST payload
 		request := &registerRequest{}
 		if err := render.Bind(r, request); err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
+		// Check Parameters
 		if request.Username == "" {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
@@ -90,23 +113,17 @@ func (db *GoDB) handleRegisterUser() http.HandlerFunc {
 			return
 		}
 		err = db.Insert(jsonEntry, map[string]string{
-			"uuid":     uUID.String(),
 			"username": request.Username,
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		_, err = fmt.Fprintln(w, newUser.UUID.String())
-		if err != nil {
-			return
-		}
+		_, _ = fmt.Fprintln(w, newUser.UUID.String())
 	}
 }
 
-func (a *registerRequest) Bind(r *http.Request) error {
-	// a.Article is nil if no Article fields are sent in the request. Return an
-	// error to avoid a nil pointer dereference.
+func (a *registerRequest) Bind(_ *http.Request) error {
 	if a.Username == "" {
 		return errors.New("missing username")
 	}

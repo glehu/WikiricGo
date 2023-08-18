@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/json"
 	"fmt"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/httprate"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/gofrs/uuid"
 	"log"
@@ -13,6 +18,8 @@ import (
 	"sync"
 	"time"
 )
+
+const REALM = "Access to the '/' path"
 
 var tokenAuth *jwtauth.JWTAuth
 
@@ -25,11 +32,19 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config) {
 	setupJWTAuth(config)
 	// Are we using HTTPS or not?
 	isSecure := checkHTTPS()
-	// Create Router
+	// Create Router (with rate limit 100r/10s/endpoint)
 	r := chi.NewRouter()
+	r.Use(httprate.Limit(
+		100,
+		10*time.Second,
+		httprate.WithKeyFuncs(httprate.KeyByIP, httprate.KeyByEndpoint),
+	))
+	// Databases
+	userDB := OpenUserDatabase()
 	// Routes
-	setPublicRoutes(r)
-	setProtectedRoutes(r)
+	setPublicRoutes(r, userDB)
+	setBasicProtectedRoutes(r, userDB)
+	setJWTProtectedRoutes(r)
 	// Shutdown URL
 	setShutdownURL(r)
 	// Start Server
@@ -63,7 +78,7 @@ func setupJWTAuth(config Config) {
 	generateDebugToken()
 }
 
-func generateToken(user User) string {
+func generateToken(user *User) string {
 	claims := map[string]interface{}{
 		"u_uuid": user.UUID,
 		"u_name": user.Username,
@@ -115,29 +130,42 @@ func setShutdownURL(r chi.Router) {
 	r.Get("/secret/shutdown", handleShutdown)
 }
 
-func setPublicRoutes(r chi.Router) {
+func setPublicRoutes(r chi.Router, userDB *GoDB) {
 	r.Get("/sample", sampleMessage)
 	vueJSWikiricEndpoint(r)
 	// Users
-	userDB := OpenUserDatabase()
-	userDB.UserEndpoints(r, tokenAuth)
-	// Chat Server
-	CreateChatServer().WebsocketChatEndpoint(r, tokenAuth, userDB)
-
+	userDB.PublicUserEndpoints(r, tokenAuth)
+	// Chat WS Server
+	chatServer := CreateChatServer()
+	chatServer.PublicChatEndpoint(r, tokenAuth, userDB)
 }
 
-func setProtectedRoutes(r chi.Router) {
+func setBasicProtectedRoutes(r chi.Router, userDB *GoDB) {
+	r.Group(func(r chi.Router) {
+		r.Use(BasicAuth(userDB))
+		// Debug/Testing Route
+		r.Get("/basic", func(w http.ResponseWriter, r *http.Request) {
+			user := r.Context().Value("user").(*User)
+			_, _ = w.Write([]byte(fmt.Sprintf("ID: %v, USR: %v", user.UUID, user.Username)))
+		})
+		// Protected routes
+		// #### Users
+		userDB.ProtectedUserEndpoints(r, tokenAuth)
+	})
+}
+
+func setJWTProtectedRoutes(r chi.Router) {
 	r.Group(func(r chi.Router) {
 		// Seek, verify and validate JWT tokens
 		r.Use(jwtauth.Verifier(tokenAuth))
 		r.Use(jwtauth.Authenticator)
-		// Protected routes
+		// Debug/Testing Route
 		r.Get("/jwt", func(w http.ResponseWriter, r *http.Request) {
 			_, claims, _ := jwtauth.FromContext(r.Context())
 			_, _ = w.Write([]byte(fmt.Sprintf("ID: %v, USR: %v", claims["u_uiid"], claims["u_name"])))
 		})
+		// Protected routes
 		// #### Users
-
 	})
 }
 
@@ -180,4 +208,55 @@ func FileServer(r chi.Router, path string, root http.FileSystem) {
 		fs := http.StripPrefix(pathPrefix, http.FileServer(root))
 		fs.ServeHTTP(w, r)
 	})
+}
+
+func BasicAuth(userDB *GoDB) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Retrieve user credentials
+			user, pass, ok := r.BasicAuth()
+			if !ok {
+				basicAuthFailed(w)
+				return
+			}
+			// Check if user exists in the database then compare passwords
+			resp, err := userDB.Select(map[string]string{
+				"username": user,
+			})
+			if err != nil {
+				basicAuthFailed(w)
+				return
+			}
+			response := <-resp
+			if len(response) < 1 {
+				basicAuthFailed(w)
+				return
+			}
+			userFromDB := &User{}
+			err = json.Unmarshal(response[0].Data, userFromDB)
+			if err != nil {
+				basicAuthFailed(w)
+				return
+			}
+			// Retrieve hashed password from db user
+			credPass := userFromDB.PassHash
+			// Hash password from request
+			h := sha256.New()
+			h.Write([]byte(pass))
+			userPass := fmt.Sprintf("%x", h.Sum(nil))
+			// Compare both passwords
+			if subtle.ConstantTimeCompare([]byte(userPass), []byte(credPass)) != 1 {
+				basicAuthFailed(w)
+				return
+			}
+			// Set user to context to be used for next steps after this middleware
+			ctx := context.WithValue(r.Context(), "user", userFromDB)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+func basicAuthFailed(w http.ResponseWriter) {
+	w.Header().Add("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, REALM))
+	w.WriteHeader(http.StatusUnauthorized)
 }

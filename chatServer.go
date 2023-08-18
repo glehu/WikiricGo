@@ -37,8 +37,8 @@ func CreateChatServer() *ChatServer {
 	return server
 }
 
-// WebsocketChatEndpoint will manage all websocket connections
-func (server *ChatServer) WebsocketChatEndpoint(r chi.Router, tokenAuth *jwtauth.JWTAuth, userDB *GoDB) {
+// PublicChatEndpoint will manage all websocket connections
+func (server *ChatServer) PublicChatEndpoint(r chi.Router, tokenAuth *jwtauth.JWTAuth, userDB *GoDB) {
 	server.tokenAuth = tokenAuth
 	// Route
 	r.HandleFunc("/ws/chat/{chatID}", server.handleChatEndpoint(userDB))
