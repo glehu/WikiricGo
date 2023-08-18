@@ -69,10 +69,8 @@ type DB interface {
 	// Storage Methods
 
 	Insert(data []byte, indices map[string]string) error
-
-	// TODO: Update
-	// TODO: Delete
-
+	Update(uUID string, data []byte, indices map[string]string) error
+	Delete(uUID string) error
 	Select(indices map[string]string) (chan *EntryResponse, error)
 
 	// Utility Methods
