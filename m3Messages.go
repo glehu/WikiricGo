@@ -26,15 +26,17 @@ func OpenChatMessageDatabase() *GoDB {
 	return db
 }
 
-func (db *GoDB) ProtectedChatMessagesEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, chatServer *ChatServer) {
+func (db *GoDB) ProtectedChatMessagesEndpoints(
+	r chi.Router, tokenAuth *jwtauth.JWTAuth, chatServer *ChatServer, chatGroupDB, chatMemberDB *GoDB,
+) {
 	r.Route(
 		"/msg/private", func(r chi.Router) {
-			r.Post("/create", db.handleChatMessageCreate(chatServer))
+			r.Post("/create", db.handleChatMessageCreate(chatServer, chatGroupDB, chatMemberDB))
 		},
 	)
 }
 
-func (db *GoDB) handleChatMessageCreate(chatServer *ChatServer) http.HandlerFunc {
+func (db *GoDB) handleChatMessageCreate(chatServer *ChatServer, chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -48,7 +50,21 @@ func (db *GoDB) handleChatMessageCreate(chatServer *ChatServer) http.HandlerFunc
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		// TODO: Check rights
+		// Check if a password was provided in the url query
+		password := r.URL.Query().Get("pw")
+		// Check rights of group member
+		chatGroup, chatMember, _, _ := GetChatGroupAndMember(
+			chatGroupDB, chatMemberDB, request.ChatGroupUUID, user.Username, password,
+		)
+		if chatMember == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		canWrite := CheckWriteRights(chatMember, chatGroup)
+		if !canWrite {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
 		// Initialize message
 		request.TimeCreated = TimeNowIsoString()
 		request.Username = user.Username

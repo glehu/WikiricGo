@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"github.com/go-chi/chi/v5"
@@ -17,9 +16,11 @@ import (
 )
 
 type Session struct {
-	Username string
-	Conn     *websocket.Conn
-	Ctx      context.Context
+	ChatMember *ChatMember
+	Conn       *websocket.Conn
+	Ctx        context.Context
+	CanWrite   bool
+	CanRead    bool
 }
 
 type ChatServer struct {
@@ -101,7 +102,7 @@ func (server *ChatServer) handleChatEndpoint(userDB, chatGroupDB, chatMessagesDB
 			)
 			return
 		}
-		username, ok := token.Get("u_name")
+		usernameTmp, ok := token.Get("u_name")
 		if !ok {
 			_ = c.Close(
 				http.StatusUnauthorized,
@@ -109,201 +110,42 @@ func (server *ChatServer) handleChatEndpoint(userDB, chatGroupDB, chatMessagesDB
 			)
 			return
 		}
-		// Check if chat group exists
-		query := fmt.Sprintf(
-			"^%s$",
-			chatID,
-		)
-		resp, err := chatGroupDB.Select(
-			map[string]string{
-				"uuid": query,
-			},
-		)
-		if err != nil {
-			http.Error(
-				w,
-				http.StatusText(http.StatusInternalServerError),
-				http.StatusInternalServerError,
-			)
-			return
-		}
-		response := <-resp
-		if len(response) < 1 {
+		username := usernameTmp.(string)
+		// Check if a password was provided in the url query
+		password := r.URL.Query().Get("pw")
+		chatGroup, chatMember, _, err := GetChatGroupAndMember(chatGroupDB, chatMemberDB, chatID, username, password)
+		if chatMember == nil || err != nil {
 			_ = c.Close(
-				http.StatusNotFound,
-				http.StatusText(http.StatusNotFound),
+				http.StatusUnauthorized,
+				http.StatusText(http.StatusUnauthorized),
 			)
 			return
 		}
-		// Retrieve chat group from database
-		chatGroup := &ChatGroup{}
-		err = json.Unmarshal(
-			response[0].Data,
-			chatGroup,
-		)
-		if err != nil {
-			http.Error(
-				w,
-				http.StatusText(http.StatusInternalServerError),
-				http.StatusInternalServerError,
-			)
-			return
-		}
-		// Is this a sub chat group? If so, then retrieve the main chat group
-		if chatGroup.ParentUUID != "" {
-			chatID = chatGroup.ParentUUID
-			query = fmt.Sprintf(
-				"^%s$",
-				chatID,
-			)
-			resp, err = chatGroupDB.Select(
-				map[string]string{
-					"uuid": query,
-				},
-			)
-			if err != nil {
-				http.Error(
-					w,
-					http.StatusText(http.StatusInternalServerError),
-					http.StatusInternalServerError,
-				)
-				return
-			}
-			response = <-resp
-			if len(response) < 1 {
-				_ = c.Close(
-					http.StatusNotFound,
-					http.StatusText(http.StatusNotFound),
-				)
-				return
-			}
-			// Retrieve chat group from database
-			chatGroup = &ChatGroup{}
-			err = json.Unmarshal(
-				response[0].Data,
-				chatGroup,
-			)
-			if err != nil {
-				http.Error(
-					w,
-					http.StatusText(http.StatusInternalServerError),
-					http.StatusInternalServerError,
-				)
-				return
-			}
-		}
-		// Retrieve chat member
-		query = fmt.Sprintf(
-			"^%s-%s$",
-			chatID,
-			username,
-		)
-		resp, err = chatMemberDB.Select(
-			map[string]string{
-				"chat-user": query,
-			},
-		)
-		if err != nil {
-			http.Error(
-				w,
-				http.StatusText(http.StatusInternalServerError),
-				http.StatusInternalServerError,
-			)
-			return
-		}
-		response = <-resp
-		var chatMember *ChatMember
-		if len(response) < 1 {
-			// No user was found -> Is the chat group private? If not, join
-			if chatGroup.IsPrivate {
-				// Check if a password was provided in the url query
-				password := r.URL.Query().Get("pw")
-				isMatch := subtle.ConstantTimeCompare(
-					[]byte(password),
-					[]byte(chatGroup.Password),
-				)
-				if isMatch != 1 {
-					_ = c.Close(
-						http.StatusUnauthorized,
-						http.StatusText(http.StatusUnauthorized),
-					)
-					return
-				}
-			}
-			chatMember = &ChatMember{
-				Username:             username.(string),
-				ChatGroupUUID:        chatID,
-				DisplayName:          username.(string),
-				Roles:                []string{"member"},
-				PublicKey:            "", // Public Key will be submitted by the client
-				ThumbnailURL:         "",
-				ThumbnailAnimatedURL: "",
-				BannerURL:            "",
-				BannerAnimatedURL:    "",
-			}
-			newMember, err := json.Marshal(chatMember)
-			_, err = chatMemberDB.Insert(
-				newMember,
-				map[string]string{
-					"chat-user": fmt.Sprintf(
-						"%s-%s",
-						chatID,
-						username.(string),
-					),
-				},
-			)
-			if err != nil {
-				http.Error(
-					w,
-					http.StatusText(http.StatusInternalServerError),
-					http.StatusInternalServerError,
-				)
-				return
-			}
-		} else {
-			// Retrieve user from database
-			chatMember = &ChatMember{}
-			err = json.Unmarshal(
-				response[0].Data,
-				chatMember,
-			)
-			if err != nil {
-				http.Error(
-					w,
-					http.StatusText(http.StatusInternalServerError),
-					http.StatusInternalServerError,
-				)
-				return
-			}
-		}
+		canWrite := CheckWriteRights(chatMember, chatGroup)
+		canRead := CheckReadRights(chatMember, chatGroup)
 		server.ChatGroupsMu.Lock()
 		sessions, ok := server.ChatGroups.Get(chatIDOriginal)
+		session := &Session{
+			ChatMember: chatMember,
+			Conn:       c,
+			Ctx:        ctx,
+			CanWrite:   canWrite,
+			CanRead:    canRead,
+		}
 		if ok {
-			sessions[chatMember.Username] = &Session{
-				Username: chatMember.Username,
-				Conn:     c,
-				Ctx:      ctx,
-			}
+			sessions[chatMember.Username] = session
 		} else {
 			server.ChatGroups.Set(
 				chatIDOriginal,
 				map[string]*Session{
-					chatMember.Username: {
-						Username: chatMember.Username,
-						Conn:     c,
-						Ctx:      ctx,
-					},
+					chatMember.Username: session,
 				},
 			)
 		}
 		server.ChatGroupsMu.Unlock()
 		// Replace chatID with original chatID to preserve access to sub chat groups
 		chatMember.ChatGroupUUID = chatIDOriginal
-		server.handleChatSession(
-			c,
-			ctx,
-			chatMember,
-		)
+		server.handleChatSession(session)
 	}
 }
 
@@ -349,30 +191,24 @@ func (server *ChatServer) checkToken(
 	return true, token
 }
 
-func (server *ChatServer) handleChatSession(
-	c *websocket.Conn,
-	ctx context.Context,
-	user *ChatMember,
-) {
+func (server *ChatServer) handleChatSession(s *Session) {
 	messages := listenToMessages(
-		c,
-		ctx,
+		s.Conn,
+		s.Ctx,
 	)
 	for {
 		select {
 		case resp := <-messages:
 			server.handleIncomingMessage(
-				c,
-				ctx,
+				s,
 				resp,
-				user,
 			)
 			break
-		case <-ctx.Done():
+		case <-s.Ctx.Done():
 			server.ChatGroupsMu.Lock()
-			sessions, ok := server.ChatGroups.Get(user.ChatGroupUUID)
+			sessions, ok := server.ChatGroups.Get(s.ChatMember.ChatGroupUUID)
 			if ok {
-				sessions[user.Username] = nil
+				sessions[s.ChatMember.Username] = nil
 			}
 			server.ChatGroupsMu.Unlock()
 			return
@@ -381,15 +217,16 @@ func (server *ChatServer) handleChatSession(
 }
 
 func (server *ChatServer) handleIncomingMessage(
-	c *websocket.Conn,
-	ctx context.Context,
+	s *Session,
 	resp *MessageResponse,
-	user *ChatMember,
 ) {
+	if !s.CanWrite {
+		return
+	}
 	msg := &ChatMessage{
-		ChatGroupUUID: user.ChatGroupUUID,
+		ChatGroupUUID: s.ChatMember.ChatGroupUUID,
 		Text:          string(resp.Msg),
-		Username:      user.Username,
+		Username:      s.ChatMember.Username,
 		TimeCreated:   TimeNowIsoString(),
 	}
 	go server.DistributeChatMessageJSON(msg)
@@ -398,7 +235,7 @@ func (server *ChatServer) handleIncomingMessage(
 		return
 	}
 	_, _ = server.DB.Insert(jsonEntry, map[string]string{
-		"chatID": user.ChatGroupUUID,
+		"chatID": s.ChatMember.ChatGroupUUID,
 	})
 }
 

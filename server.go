@@ -182,7 +182,7 @@ func setJWTProtectedRoutes(
 			// #### Chat Groups
 			chatGroupDB.ProtectedChatGroupEndpoints(r, tokenAuth, userDB, chatMemberDB)
 			// #### Chat Messages
-			chatMessagesDB.ProtectedChatMessagesEndpoints(r, tokenAuth, chatServer)
+			chatMessagesDB.ProtectedChatMessagesEndpoints(r, tokenAuth, chatServer, chatGroupDB, chatMemberDB)
 		},
 	)
 }
@@ -241,9 +241,10 @@ func BasicAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 					return
 				}
 				// Check if user exists in the database then compare passwords
+				query := fmt.Sprintf("^%s$", user)
 				resp, err := userDB.Select(
 					map[string]string{
-						"username": user,
+						"username": query,
 					},
 				)
 				if err != nil {
