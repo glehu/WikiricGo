@@ -57,7 +57,7 @@ func testStore(db *GoDB) {
 			log.Panic(":: DEBUG ERROR serializing", err)
 		}
 		// Insert into db
-		err = db.Insert(data, map[string]string{
+		_, err = db.Insert(data, map[string]string{
 			"count": count,
 		})
 		if err != nil {
@@ -78,7 +78,7 @@ func testSelect(db *GoDB) string {
 	start := time.Now()
 	// Retrieve data from database
 	resp, err := db.Select(map[string]string{
-		"count": "^1337$",
+		"count": "^1$",
 	})
 	if err != nil {
 		log.Panic(err)

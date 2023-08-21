@@ -8,22 +8,21 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
-	"github.com/gofrs/uuid"
 	"net/http"
 )
 
 type User struct {
-	UUID        uuid.UUID `json:"uuid"`
-	Username    string    `json:"usr"`
-	DisplayName string    `json:"name"`
-	Email       string    `json:"email"`
-	PassHash    string    `json:"pwhash"`
+	Username    string `json:"usr"`
+	DisplayName string `json:"name"`
+	Email       string `json:"email"`
+	PassHash    string `json:"pwhash"`
 }
 
 type registerRequest struct {
-	Username string `json:"username"`
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Username    string `json:"username"`
+	DisplayName string `json:"displayName"`
+	Email       string `json:"email"`
+	Password    string `json:"password"`
 }
 
 func OpenUserDatabase() *GoDB {
@@ -96,30 +95,25 @@ func (db *GoDB) handleUserRegistration() http.HandlerFunc {
 		h.Write([]byte(request.Password))
 		passwordHash := fmt.Sprintf("%x", h.Sum(nil))
 		// Create new user
-		uUID, err := uuid.NewV7()
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
 		newUser := &User{
-			UUID:     uUID,
-			Username: request.Username,
-			Email:    request.Email,
-			PassHash: passwordHash,
+			Username:    request.Username,
+			DisplayName: request.DisplayName,
+			Email:       request.Email,
+			PassHash:    passwordHash,
 		}
 		jsonEntry, err := json.Marshal(newUser)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Insert(jsonEntry, map[string]string{
+		uUID, err := db.Insert(jsonEntry, map[string]string{
 			"username": request.Username,
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		_, _ = fmt.Fprintln(w, newUser.UUID.String())
+		_, _ = fmt.Fprintln(w, uUID)
 	}
 }
 

@@ -147,11 +147,8 @@ func startIXFileWorker(goDB *GoDB, jobs <-chan *IXChannelCommand) {
 // ### DB Functions ###
 
 // Insert adds an entry to the database
-func (db *GoDB) Insert(data []byte, indices map[string]string) error {
-	indicesClean, err := db.validateIndices(indices)
-	if err != nil {
-		return err
-	}
+func (db *GoDB) Insert(data []byte, indices map[string]string) (string, error) {
+	indicesClean, _ := db.validateIndices(indices, false)
 	// Generate UUID
 	uUIDTmp, err := uuid.NewV7()
 	if err != nil {
@@ -159,7 +156,7 @@ func (db *GoDB) Insert(data []byte, indices map[string]string) error {
 	}
 	uUID := uUIDTmp.String()
 	err = db.doInsert(uUID, data, indicesClean)
-	return err
+	return uUID, err
 }
 
 func (db *GoDB) doInsert(uUID string, data []byte, indices map[string]string) error {
@@ -217,7 +214,7 @@ func (db *GoDB) Delete(uUID string) error {
 
 // Update changes an entry in the database
 func (db *GoDB) Update(uUID string, data []byte, indices map[string]string) error {
-	indicesClean, err := db.validateIndices(indices)
+	indicesClean, err := db.validateIndices(indices, false)
 	if err != nil {
 		return err
 	}
@@ -262,7 +259,7 @@ func (db *GoDB) Update(uUID string, data []byte, indices map[string]string) erro
 
 // Select returns entries from the database
 func (db *GoDB) Select(indices map[string]string) (chan []*EntryResponse, error) {
-	indicesClean, err := db.validateIndices(indices)
+	indicesClean, err := db.validateIndices(indices, true)
 	if err != nil {
 		return nil, err
 	}
@@ -289,9 +286,11 @@ func (db *GoDB) Select(indices map[string]string) (chan []*EntryResponse, error)
 			case <-done:
 				close(responsesInternal)
 				// Sort by uuid V7 to ensure order of returned values
-				sort.SliceStable(sortedEntries, func(i, j int) bool {
-					return sortedEntries[i].uUID > sortedEntries[j].uUID
-				})
+				sort.SliceStable(
+					sortedEntries, func(i, j int) bool {
+						return sortedEntries[i].uUID > sortedEntries[j].uUID
+					},
+				)
 				// Send back to receiver
 				responsesExternal <- sortedEntries
 				close(responsesExternal)
@@ -305,10 +304,11 @@ func (db *GoDB) Select(indices map[string]string) (chan []*EntryResponse, error)
 	return responsesExternal, nil
 }
 
-func (db *GoDB) validateIndices(indices map[string]string) (map[string]string, error) {
+func (db *GoDB) validateIndices(indices map[string]string, isSelect bool) (map[string]string, error) {
 	indicesClean := make(map[string]string)
 	for key, value := range indices {
-		if key == "uuid" {
+		// Skip uuid unless we're selecting
+		if key == "uuid" && !isSelect {
 			continue
 		}
 		if _, present := db.indices[key]; present {
@@ -321,25 +321,29 @@ func (db *GoDB) validateIndices(indices map[string]string) (map[string]string, e
 	return indicesClean, nil
 }
 
-func (db *GoDB) singleIndexQuery(index string, query *regexp.Regexp, responses chan *EntryResponse, wg *sync.WaitGroup) {
+func (db *GoDB) singleIndexQuery(
+	index string, query *regexp.Regexp, responses chan *EntryResponse, wg *sync.WaitGroup,
+) {
 	// MUTEX LOCK
 	db.indices[index].ixFileMutex.RLock()
 	// Filter index map
 	var match bool
-	db.indices[index].index.Reverse(func(key string, value *Index) bool {
-		if match = query.MatchString(value.value); match {
-			content, err := db.readFromDB(value.pos, value.len)
-			if err == nil {
-				entryResponse := &EntryResponse{
-					uUID:  key,
-					Index: value,
-					Data:  content,
+	db.indices[index].index.Reverse(
+		func(key string, value *Index) bool {
+			if match = query.MatchString(value.value); match {
+				content, err := db.readFromDB(value.pos, value.len)
+				if err == nil {
+					entryResponse := &EntryResponse{
+						uUID:  key,
+						Index: value,
+						Data:  content,
+					}
+					responses <- entryResponse
 				}
-				responses <- entryResponse
 			}
-		}
-		return true
-	})
+			return true
+		},
+	)
 	// MUTEX UNLOCK
 	db.indices[index].ixFileMutex.RUnlock()
 	wg.Done()
@@ -495,7 +499,7 @@ func (db *GoDB) writeIndices(uUID string, offset, length int64, indices map[stri
 	db.ixMutex.Lock()
 	// Write base index (uuid)
 	indexEntry := &Index{
-		value: "uuid",
+		value: uUID,
 		pos:   offset,
 		len:   length,
 	}

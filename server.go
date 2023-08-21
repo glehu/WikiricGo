@@ -9,7 +9,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/httprate"
 	"github.com/go-chi/jwtauth/v5"
-	"github.com/gofrs/uuid"
 	"log"
 	"net/http"
 	"os"
@@ -34,17 +33,23 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config) {
 	isSecure := checkHTTPS()
 	// Create Router (with rate limit 100r/10s/endpoint)
 	r := chi.NewRouter()
-	r.Use(httprate.Limit(
-		100,
-		10*time.Second,
-		httprate.WithKeyFuncs(httprate.KeyByIP, httprate.KeyByEndpoint),
-	))
+	r.Use(
+		httprate.Limit(
+			100,
+			10*time.Second,
+			httprate.WithKeyFuncs(httprate.KeyByIP, httprate.KeyByEndpoint),
+		),
+	)
 	// Databases
 	userDB := OpenUserDatabase()
+	chatGroupDB := OpenChatGroupDatabase()
+	chatMemberDB := OpenChatMemberDatabase()
+	chatMessagesDB := OpenChatMessageDatabase()
+	chatServer := CreateChatServer(chatMessagesDB)
 	// Routes
-	setPublicRoutes(r, userDB)
+	setPublicRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, chatServer)
 	setBasicProtectedRoutes(r, userDB)
-	setJWTProtectedRoutes(r)
+	setJWTProtectedRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, chatServer)
 	// Shutdown URL
 	setShutdownURL(r)
 	// Start Server
@@ -80,29 +85,28 @@ func setupJWTAuth(config Config) {
 
 func generateToken(user *User) string {
 	claims := map[string]interface{}{
-		"u_uuid": user.UUID,
 		"u_name": user.Username,
 	}
 	jwtauth.SetExpiryIn(claims, time.Minute*30)
 	_, tokenString, err := tokenAuth.Encode(claims)
 	if err != nil {
-		log.Panicf("err generating jwt token for %s", user.UUID)
+		log.Panicf("err generating jwt token for %s", user.Username)
 	}
 	return tokenString
 }
 
 func generateDebugToken() {
-	uuidDebug, _ := uuid.NewV7()
 	claims := map[string]interface{}{
-		"u_uuid": uuidDebug,
 		"u_name": "debug_usr",
 	}
 	jwtauth.SetExpiryIn(claims, time.Minute*30)
 	_, tokenString, _ := tokenAuth.Encode(claims)
 	decoded, _ := tokenAuth.Decode(tokenString)
 	userName, _ := decoded.Get("_name")
-	fmt.Printf("\nDEBUG: JWT (u_name=%s) Expires @ %s \n%s\n\n",
-		userName, time.Now().Add(time.Minute*30), tokenString)
+	fmt.Printf(
+		"\nDEBUG: JWT (u_name=%s) Expires @ %s \n%s\n\n",
+		userName, time.Now().Add(time.Minute*30), tokenString,
+	)
 }
 
 func checkHTTPS() bool {
@@ -130,43 +134,57 @@ func setShutdownURL(r chi.Router) {
 	r.Get("/secret/shutdown", handleShutdown)
 }
 
-func setPublicRoutes(r chi.Router, userDB *GoDB) {
+func setPublicRoutes(r chi.Router, userDB, chatGroupDB, chatMessagesDB, chatMemberDB *GoDB, chatServer *ChatServer) {
 	r.Get("/sample", sampleMessage)
 	vueJSWikiricEndpoint(r)
 	// Users
 	userDB.PublicUserEndpoints(r, tokenAuth)
 	// Chat WS Server
-	chatServer := CreateChatServer()
-	chatServer.PublicChatEndpoint(r, tokenAuth, userDB)
+	chatServer.PublicChatEndpoint(r, tokenAuth, userDB, chatGroupDB, chatMessagesDB, chatMemberDB)
 }
 
 func setBasicProtectedRoutes(r chi.Router, userDB *GoDB) {
-	r.Group(func(r chi.Router) {
-		r.Use(BasicAuth(userDB))
-		// Debug/Testing Route
-		r.Get("/basic", func(w http.ResponseWriter, r *http.Request) {
-			user := r.Context().Value("user").(*User)
-			_, _ = w.Write([]byte(fmt.Sprintf("ID: %v, USR: %v", user.UUID, user.Username)))
-		})
-		// Protected routes
-		// #### Users
-		userDB.ProtectedUserEndpoints(r, tokenAuth)
-	})
+	r.Group(
+		func(r chi.Router) {
+			r.Use(BasicAuth(userDB))
+			// Debug/Testing Route
+			r.Get(
+				"/basic", func(w http.ResponseWriter, r *http.Request) {
+					user := r.Context().Value("user").(*User)
+					_, _ = w.Write([]byte(fmt.Sprintf("USR: %v", user.Username)))
+				},
+			)
+			// Protected routes
+			// #### Users
+			userDB.ProtectedUserEndpoints(r, tokenAuth)
+		},
+	)
 }
 
-func setJWTProtectedRoutes(r chi.Router) {
-	r.Group(func(r chi.Router) {
-		// Seek, verify and validate JWT tokens
-		r.Use(jwtauth.Verifier(tokenAuth))
-		r.Use(jwtauth.Authenticator)
-		// Debug/Testing Route
-		r.Get("/jwt", func(w http.ResponseWriter, r *http.Request) {
-			_, claims, _ := jwtauth.FromContext(r.Context())
-			_, _ = w.Write([]byte(fmt.Sprintf("ID: %v, USR: %v", claims["u_uiid"], claims["u_name"])))
-		})
-		// Protected routes
-		// #### Users
-	})
+func setJWTProtectedRoutes(
+	r chi.Router, userDB, chatGroupDB, chatMessagesDB, chatMemberDB *GoDB, chatServer *ChatServer,
+) {
+	r.Group(
+		func(r chi.Router) {
+			// Seek, verify and validate JWT tokens
+			r.Use(jwtauth.Verifier(tokenAuth))
+			r.Use(jwtauth.Authenticator)
+			r.Use(BearerAuth(userDB))
+			// Debug/Testing Route
+			r.Get(
+				"/jwt", func(w http.ResponseWriter, r *http.Request) {
+					_, claims, _ := jwtauth.FromContext(r.Context())
+					_, _ = w.Write([]byte(fmt.Sprintf("ID: %v, USR: %v", claims["u_uiid"], claims["u_name"])))
+				},
+			)
+			// Protected routes
+			// #### Users
+			// #### Chat Groups
+			chatGroupDB.ProtectedChatGroupEndpoints(r, tokenAuth, userDB, chatMemberDB)
+			// #### Chat Messages
+			chatMessagesDB.ProtectedChatMessagesEndpoints(r, tokenAuth, chatServer)
+		},
+	)
 }
 
 func handleShutdown(w http.ResponseWriter, req *http.Request) {
@@ -202,61 +220,106 @@ func FileServer(r chi.Router, path string, root http.FileSystem) {
 		path += "/"
 	}
 	path += "*"
-	r.Get(path, func(w http.ResponseWriter, r *http.Request) {
-		rctx := chi.RouteContext(r.Context())
-		pathPrefix := strings.TrimSuffix(rctx.RoutePattern(), "/*")
-		fs := http.StripPrefix(pathPrefix, http.FileServer(root))
-		fs.ServeHTTP(w, r)
-	})
+	r.Get(
+		path, func(w http.ResponseWriter, r *http.Request) {
+			rctx := chi.RouteContext(r.Context())
+			pathPrefix := strings.TrimSuffix(rctx.RoutePattern(), "/*")
+			fs := http.StripPrefix(pathPrefix, http.FileServer(root))
+			fs.ServeHTTP(w, r)
+		},
+	)
 }
 
 func BasicAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Retrieve user credentials
-			user, pass, ok := r.BasicAuth()
-			if !ok {
-				basicAuthFailed(w)
-				return
-			}
-			// Check if user exists in the database then compare passwords
-			resp, err := userDB.Select(map[string]string{
-				"username": user,
-			})
-			if err != nil {
-				basicAuthFailed(w)
-				return
-			}
-			response := <-resp
-			if len(response) < 1 {
-				basicAuthFailed(w)
-				return
-			}
-			userFromDB := &User{}
-			err = json.Unmarshal(response[0].Data, userFromDB)
-			if err != nil {
-				basicAuthFailed(w)
-				return
-			}
-			// Retrieve hashed password from db user
-			credPass := userFromDB.PassHash
-			// Hash password from request
-			h := sha256.New()
-			h.Write([]byte(pass))
-			userPass := fmt.Sprintf("%x", h.Sum(nil))
-			// Compare both passwords
-			if subtle.ConstantTimeCompare([]byte(userPass), []byte(credPass)) != 1 {
-				basicAuthFailed(w)
-				return
-			}
-			// Set user to context to be used for next steps after this middleware
-			ctx := context.WithValue(r.Context(), "user", userFromDB)
-			next.ServeHTTP(w, r.WithContext(ctx))
-		})
+		return http.HandlerFunc(
+			func(w http.ResponseWriter, r *http.Request) {
+				// Retrieve user credentials
+				user, pass, ok := r.BasicAuth()
+				if !ok {
+					basicAuthFailed(w)
+					return
+				}
+				// Check if user exists in the database then compare passwords
+				resp, err := userDB.Select(
+					map[string]string{
+						"username": user,
+					},
+				)
+				if err != nil {
+					basicAuthFailed(w)
+					return
+				}
+				response := <-resp
+				if len(response) < 1 {
+					basicAuthFailed(w)
+					return
+				}
+				userFromDB := &User{}
+				err = json.Unmarshal(response[0].Data, userFromDB)
+				if err != nil {
+					basicAuthFailed(w)
+					return
+				}
+				// Retrieve hashed password from db user
+				credPass := userFromDB.PassHash
+				// Hash password from request
+				h := sha256.New()
+				h.Write([]byte(pass))
+				userPass := fmt.Sprintf("%x", h.Sum(nil))
+				// Compare both passwords
+				if subtle.ConstantTimeCompare([]byte(userPass), []byte(credPass)) != 1 {
+					basicAuthFailed(w)
+					return
+				}
+				// Set user to context to be used for next steps after this middleware
+				ctx := context.WithValue(r.Context(), "user", userFromDB)
+				next.ServeHTTP(w, r.WithContext(ctx))
+			},
+		)
 	}
 }
 
 func basicAuthFailed(w http.ResponseWriter) {
 	w.Header().Add("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, REALM))
 	w.WriteHeader(http.StatusUnauthorized)
+}
+
+func BearerAuth(userDB *GoDB) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(
+			func(w http.ResponseWriter, r *http.Request) {
+				// Retrieve user credentials
+				// Get client user
+				_, claims, _ := jwtauth.FromContext(r.Context())
+				username := claims["u_name"].(string)
+				userQuery := fmt.Sprintf("^%s$", username)
+				resp, err := userDB.Select(
+					map[string]string{
+						"username": userQuery,
+					},
+				)
+				if err != nil {
+					fmt.Println(err)
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+				response := <-resp
+				if len(response) < 1 {
+					http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+					return
+				}
+				userFromDB := &User{}
+				err = json.Unmarshal(response[0].Data, userFromDB)
+				if err != nil {
+					fmt.Println(err)
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+				// Set user to context to be used for next steps after this middleware
+				ctx := context.WithValue(r.Context(), "user", userFromDB)
+				next.ServeHTTP(w, r.WithContext(ctx))
+			},
+		)
+	}
 }
