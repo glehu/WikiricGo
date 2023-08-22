@@ -80,7 +80,7 @@ func (db *GoDB) handleUserRegistration() http.HandlerFunc {
 		query := fmt.Sprintf("^%s$", request.Username)
 		resp, err := db.Select(map[string]string{
 			"username": query,
-		})
+		}, nil)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return

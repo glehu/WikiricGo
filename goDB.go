@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 )
 
 // ### CONST ###
@@ -62,6 +64,12 @@ type GoDB struct {
 	ixMutex   *sync.RWMutex
 	ixChannel chan *IXChannelCommand
 	DBSettings
+}
+
+type SelectOptions struct {
+	MaxResults int64
+	Page       int64
+	Skip       int64
 }
 
 // DB Interface
@@ -258,30 +266,62 @@ func (db *GoDB) Update(uUID string, data []byte, indices map[string]string) erro
 }
 
 // Select returns entries from the database
-func (db *GoDB) Select(indices map[string]string) (chan []*EntryResponse, error) {
+func (db *GoDB) Select(indices map[string]string, options *SelectOptions) (chan []*EntryResponse, error) {
 	indicesClean, err := db.validateIndices(indices, true)
 	if err != nil {
 		return nil, err
 	}
+	// Check *SelectOptions
+	maxResults := int64(-1)
+	page := int64(0)
+	skip := int64(0)
+	if options != nil {
+		maxResults = options.MaxResults
+		page = options.Page
+		skip = options.Skip
+	}
+	// Return if no results are wanted (probably malformed input)
+	if maxResults == 0 {
+		return nil, nil
+	}
+	hasMaxResults := maxResults != int64(-1)
+	// Calculate final skip count if page is not the first one + maxResults is set
+	if page > int64(0) && maxResults != int64(-1) {
+		// Skip an additional maxResults * page results
+		skip += maxResults * page
+	}
+	// Return if all results had been skipped (probably malformed input)
+	if skip >= int64(db.indices["uuid"].index.Len()) {
+		return nil, nil
+	}
+	// Prepare wait group and response channels
 	wg := sync.WaitGroup{}
 	responsesInternal := make(chan *EntryResponse)
 	responsesExternal := make(chan []*EntryResponse)
 	done := make(chan bool)
+	ctx, cancel := context.WithCancel(context.Background())
+	// Launch index search goroutines
 	for key, value := range indicesClean {
 		wg.Add(1)
 		query, err := regexp.Compile(value)
 		if err == nil {
-			go db.singleIndexQuery(key, query, responsesInternal, &wg)
+			go db.singleIndexQuery(key, query, responsesInternal, &wg, ctx)
 		}
 	}
-
+	// Start goroutine awaiting a cancellation
 	go func() {
 		wg.Wait()
 		done <- true
 	}()
+	// Start goroutine collecting all results
 	go func() {
 		sortedEntries := make([]*EntryResponse, 0)
-		for true {
+		count := &atomic.Int64{}
+		attempts := &atomic.Int64{}
+		current := int64(0)
+		skipDone := skip == int64(0) // If skip = 0, skipDone is automatically true
+		gatherDone := false
+		for {
 			select {
 			case <-done:
 				close(responsesInternal)
@@ -296,11 +336,29 @@ func (db *GoDB) Select(indices map[string]string) (chan []*EntryResponse, error)
 				close(responsesExternal)
 				return
 			case entry := <-responsesInternal:
-				// Collect all found values
-				sortedEntries = append(sortedEntries, entry)
+				if gatherDone {
+					break
+				}
+				// Collect all found values after having skipped all results that had to be skipped
+				if skipDone || attempts.Load() >= skip {
+					// Append the result to the slice
+					sortedEntries = append(sortedEntries, entry)
+					if hasMaxResults {
+						current = count.Add(1)
+						// Check if we've reached the maximum results
+						if current >= maxResults {
+							cancel()
+							gatherDone = true
+						}
+					}
+				} else {
+					attempts.Add(1)
+				}
+				break
 			}
 		}
 	}()
+	// Return response channel
 	return responsesExternal, nil
 }
 
@@ -322,7 +380,7 @@ func (db *GoDB) validateIndices(indices map[string]string, isSelect bool) (map[s
 }
 
 func (db *GoDB) singleIndexQuery(
-	index string, query *regexp.Regexp, responses chan *EntryResponse, wg *sync.WaitGroup,
+	index string, query *regexp.Regexp, responses chan *EntryResponse, wg *sync.WaitGroup, ctx context.Context,
 ) {
 	// MUTEX LOCK
 	db.indices[index].ixFileMutex.RLock()
@@ -330,18 +388,23 @@ func (db *GoDB) singleIndexQuery(
 	var match bool
 	db.indices[index].index.Reverse(
 		func(key string, value *Index) bool {
-			if match = query.MatchString(value.value); match {
-				content, err := db.readFromDB(value.pos, value.len)
-				if err == nil {
-					entryResponse := &EntryResponse{
-						uUID:  key,
-						Index: value,
-						Data:  content,
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+				if match = query.MatchString(value.value); match {
+					content, err := db.readFromDB(value.pos, value.len)
+					if err == nil {
+						entryResponse := &EntryResponse{
+							uUID:  key,
+							Index: value,
+							Data:  content,
+						}
+						responses <- entryResponse
 					}
-					responses <- entryResponse
 				}
+				return true
 			}
-			return true
 		},
 	)
 	// MUTEX UNLOCK

@@ -69,16 +69,9 @@ func (server *ChatServer) handleChatEndpoint(userDB, chatGroupDB, chatMessagesDB
 		r *http.Request,
 	) {
 		ctx := r.Context()
-		chatID := chi.URLParam(
-			r,
-			"chatID",
-		)
+		chatID := chi.URLParam(r, "chatID")
 		if chatID == "" {
-			http.Error(
-				w,
-				http.StatusText(http.StatusBadRequest),
-				http.StatusBadRequest,
-			)
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
 		chatIDOriginal := chatID
@@ -163,6 +156,7 @@ func (server *ChatServer) checkToken(
 	if err != nil {
 		return false, nil
 	}
+	// Check token's expiry date
 	expTmp, ok := token.Get("exp")
 	if ok != true {
 		return false, nil

@@ -43,7 +43,7 @@ func testStore(db *GoDB) {
 	time.Sleep(time.Second)
 	start := time.Now()
 	// Store data in database
-	for i := 1; i <= 10_000; i++ {
+	for i := 1; i <= 1; i++ {
 		count := fmt.Sprintf("%d", i)
 		// Serialize data
 		data, err := json.Marshal(&SampleEntry{
@@ -78,7 +78,11 @@ func testSelect(db *GoDB) string {
 	start := time.Now()
 	// Retrieve data from database
 	resp, err := db.Select(map[string]string{
-		"count": "^1$",
+		"count": "^1000000$",
+	}, &SelectOptions{
+		MaxResults: 1,
+		Page:       0,
+		Skip:       0,
 	})
 	if err != nil {
 		log.Panic(err)

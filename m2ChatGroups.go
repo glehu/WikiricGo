@@ -15,6 +15,7 @@ type ChatRole struct {
 	Name     string  `json:"t"`
 	Index    float32 `json:"index"`
 	ColorHex string  `json:"hex"`
+	IsAdmin  bool    `json:"admin"`
 }
 
 type SubChatroom struct {
@@ -76,11 +77,13 @@ func (db *GoDB) handleChatGroupCreate(userDB, chatMemberDB *GoDB) http.HandlerFu
 					Name:     "owner",
 					Index:    20_000,
 					ColorHex: "",
+					IsAdmin:  true,
 				},
 				ChatRole{
 					Name:     "member",
 					Index:    40_000,
 					ColorHex: "",
+					IsAdmin:  false,
 				})
 		}
 		if request.Subchatrooms == nil {
@@ -173,7 +176,7 @@ func (db *GoDB) handleChatGroupGet() http.HandlerFunc {
 		resp, err := db.Select(
 			map[string]string{
 				"uuid": query,
-			},
+			}, nil,
 		)
 		if err != nil {
 			fmt.Println(err)
@@ -209,14 +212,14 @@ func GetChatGroupAndMember(
 	resp, err := chatGroupDB.Select(
 		map[string]string{
 			"uuid": query,
-		},
+		}, nil,
 	)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	response := <-resp
 	if len(response) < 1 {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil
 	}
 	// Retrieve chat group from database
 	chatGroupOriginal := &ChatGroup{}
@@ -239,25 +242,26 @@ func GetChatGroupAndMember(
 		resp, err = chatGroupDB.Select(
 			map[string]string{
 				"uuid": query,
-			},
+			}, nil,
 		)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		response = <-resp
-		if len(response) < 1 {
-			return nil, nil, nil, err
+		if len(response) > 0 {
+			// Retrieve chat group from database
+			chatGroupMain = &ChatGroup{}
+			err = json.Unmarshal(
+				response[0].Data,
+				chatGroupMain,
+			)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			chatGroup = *chatGroupMain
+		} else {
+			chatGroupMain = nil
 		}
-		// Retrieve chat group from database
-		chatGroupMain = &ChatGroup{}
-		err = json.Unmarshal(
-			response[0].Data,
-			chatGroupMain,
-		)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		chatGroup = *chatGroupMain
 	} else {
 		chatGroupMain = nil
 	}
@@ -270,7 +274,7 @@ func GetChatGroupAndMember(
 	resp, err = chatMemberDB.Select(
 		map[string]string{
 			"chat-user": query,
-		},
+		}, nil,
 	)
 	if err != nil {
 		return nil, nil, nil, err

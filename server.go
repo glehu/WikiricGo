@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,7 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config) {
 			httprate.WithKeyFuncs(httprate.KeyByIP, httprate.KeyByEndpoint),
 		),
 	)
+	r.Use(PaginationMiddleware())
 	// Databases
 	userDB := OpenUserDatabase()
 	chatGroupDB := OpenChatGroupDatabase()
@@ -245,7 +247,7 @@ func BasicAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 				resp, err := userDB.Select(
 					map[string]string{
 						"username": query,
-					},
+					}, nil,
 				)
 				if err != nil {
 					basicAuthFailed(w)
@@ -298,7 +300,7 @@ func BearerAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 				resp, err := userDB.Select(
 					map[string]string{
 						"username": userQuery,
-					},
+					}, nil,
 				)
 				if err != nil {
 					fmt.Println(err)
@@ -319,6 +321,76 @@ func BearerAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 				}
 				// Set user to context to be used for next steps after this middleware
 				ctx := context.WithValue(r.Context(), "user", userFromDB)
+				next.ServeHTTP(w, r.WithContext(ctx))
+			},
+		)
+	}
+}
+
+func PaginationMiddleware() func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(
+			func(w http.ResponseWriter, r *http.Request) {
+				maxResultsTmp := r.URL.Query().Get("results")
+				pageTmp := r.URL.Query().Get("page")
+				skipTmp := r.URL.Query().Get("skip")
+				// Check maxResults and page (page only if maxResults is present)
+				var maxResults int64
+				var page int64
+				var err error
+				if maxResultsTmp != "" {
+					maxResults, err = strconv.ParseInt(maxResultsTmp, 10, 64)
+					if err != nil {
+						// no max results, no page
+						maxResults = -1
+						page = 0
+					} else {
+						// Sanitize
+						if maxResults < -1 {
+							maxResults = -1
+						}
+						// maxResults is present so page can be checked now
+						if pageTmp != "" {
+							page, err = strconv.ParseInt(pageTmp, 10, 64)
+							if err != nil {
+								page = 0
+							} else {
+								// Sanitize
+								if page < -1 {
+									page = -1
+								}
+							}
+						} else {
+							page = 0
+						}
+					}
+				} else {
+					// no max results, no page
+					maxResults = -1
+					page = 0
+				}
+				// Check for entries to be skipped
+				var skip int64
+				if skipTmp != "" {
+					skip, err = strconv.ParseInt(skipTmp, 10, 64)
+					if err != nil {
+						skip = 0
+					} else {
+						// Sanitize
+						if skip < -1 {
+							skip = -1
+						}
+					}
+				} else {
+					skip = 0
+				}
+				options := &SelectOptions{
+					MaxResults: maxResults,
+					Page:       page,
+					Skip:       skip,
+				}
+				// Set pagination options to context to be used for next steps after this middleware
+				ctx := context.WithValue(r.Context(), "pagination", options)
 				next.ServeHTTP(w, r.WithContext(ctx))
 			},
 		)
