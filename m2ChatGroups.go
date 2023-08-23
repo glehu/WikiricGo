@@ -9,11 +9,17 @@ import (
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
 	"net/http"
+	"strings"
 )
+
+type ChatUserRoleModification struct {
+	Username string `json:"usr"`
+	Role     string `json:"role"`
+}
 
 type ChatRole struct {
 	Name     string  `json:"t"`
-	Index    float32 `json:"index"`
+	Index    float64 `json:"index"`
 	ColorHex string  `json:"hex"`
 	IsAdmin  bool    `json:"admin"`
 }
@@ -22,6 +28,11 @@ type SubChatroom struct {
 	UUID        string
 	Name        string
 	Description string
+}
+
+type ChatGroupEntry struct {
+	*ChatGroup
+	UUID string
 }
 
 type ChatGroup struct {
@@ -34,7 +45,7 @@ type ChatGroup struct {
 	IsPrivate            bool          `json:"priv"`
 	Password             string        `json:"pw"`
 	Subchatrooms         []SubChatroom `json:"subc"`
-	ParentUUID           string        `json:"parent"`
+	ParentUUID           string        `json:"pid"`
 	ThumbnailURL         string        `json:"iurl"`
 	ThumbnailAnimatedURL string        `json:"iurla"`
 	BannerURL            string        `json:"burl"`
@@ -47,11 +58,19 @@ func OpenChatGroupDatabase() *GoDB {
 }
 
 func (db *GoDB) ProtectedChatGroupEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, userDB, chatMemberDB *GoDB) {
-	r.Route(
-		"/chat/private", func(r chi.Router) {
-			r.Post("/create", db.handleChatGroupCreate(userDB, chatMemberDB))
-			r.Get("/get/{chatID}", db.handleChatGroupGet())
+	r.Route("/chat/private", func(r chi.Router) {
+		// Creation and Retrieval
+		r.Post("/create", db.handleChatGroupCreate(userDB, chatMemberDB))
+		r.Get("/get/{chatID}", db.handleChatGroupGet())
+		// Roles
+		r.Post("/roles/mod/{chatID}", db.handleChatGroupRoleModification())
+		// Users
+		r.Route("/users", func(r chi.Router) {
+			r.Post("/roles/mod/{chatID}", db.handleChatMemberRoleModification(chatMemberDB))
+			r.Get("/members/{chatID}", db.handleChatGroupGetMembers(chatMemberDB))
 		},
+		)
+	},
 	)
 }
 
@@ -66,7 +85,7 @@ func (db *GoDB) handleChatGroupCreate(userDB, chatMemberDB *GoDB) http.HandlerFu
 		request := &ChatGroup{}
 		if err := render.Bind(r, request); err != nil {
 			fmt.Println(err)
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
 		// Initialize chat group
@@ -165,6 +184,23 @@ func (a *ChatGroup) Bind(_ *http.Request) error {
 	return nil
 }
 
+func (a *ChatRole) Bind(_ *http.Request) error {
+	if a.Name == "" {
+		return errors.New("missing name")
+	}
+	return nil
+}
+
+func (a *ChatUserRoleModification) Bind(_ *http.Request) error {
+	if a.Username == "" {
+		return errors.New("missing username")
+	}
+	if a.Role == "" {
+		return errors.New("missing role")
+	}
+	return nil
+}
+
 func (db *GoDB) handleChatGroupGet() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		chatID := chi.URLParam(r, "chatID")
@@ -172,24 +208,13 @@ func (db *GoDB) handleChatGroupGet() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		query := fmt.Sprintf("^%s$", chatID)
-		resp, err := db.Select(
-			map[string]string{
-				"uuid": query,
-			}, nil,
-		)
-		if err != nil {
-			fmt.Println(err)
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-		response := <-resp
-		if len(response) < 1 {
+		response, ok := db.Get(chatID)
+		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
 		chatGroup := &ChatGroup{}
-		err = json.Unmarshal(response[0].Data, chatGroup)
+		err := json.Unmarshal(response.Data, chatGroup)
 		if err != nil {
 			fmt.Println(err)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -202,29 +227,18 @@ func (db *GoDB) handleChatGroupGet() http.HandlerFunc {
 }
 
 func GetChatGroupAndMember(
-	chatGroupDB, chatMemberDB *GoDB, chatID, username, password string) (*ChatGroup, *ChatMember, *ChatGroup, error,
+	chatGroupDB, chatMemberDB *GoDB, chatID, username, password string) (
+	*ChatGroupEntry, *ChatMemberEntry, *ChatGroupEntry, error,
 ) {
 	// Check if chat group exists
-	query := fmt.Sprintf(
-		"^%s$",
-		chatID,
-	)
-	resp, err := chatGroupDB.Select(
-		map[string]string{
-			"uuid": query,
-		}, nil,
-	)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	response := <-resp
-	if len(response) < 1 {
+	dataOriginal, ok := chatGroupDB.Get(chatID)
+	if !ok {
 		return nil, nil, nil, nil
 	}
 	// Retrieve chat group from database
 	chatGroupOriginal := &ChatGroup{}
-	err = json.Unmarshal(
-		response[0].Data,
+	err := json.Unmarshal(
+		dataOriginal.Data,
 		chatGroupOriginal,
 	)
 	if err != nil {
@@ -233,55 +247,48 @@ func GetChatGroupAndMember(
 	chatGroup := *chatGroupOriginal
 	// Is this a sub chat group? If so, then retrieve the main chat group
 	var chatGroupMain *ChatGroup
+	var dataMain *EntryResponse
 	if chatGroupOriginal.ParentUUID != "" {
 		chatID = chatGroupOriginal.ParentUUID
-		query = fmt.Sprintf(
-			"^%s$",
-			chatID,
-		)
-		resp, err = chatGroupDB.Select(
-			map[string]string{
-				"uuid": query,
-			}, nil,
+		dataMain, ok = chatGroupDB.Get(chatID)
+		if !ok {
+			return nil, nil, nil, nil
+		}
+		// Retrieve chat group from database
+		chatGroupMain = &ChatGroup{}
+		err = json.Unmarshal(
+			dataMain.Data,
+			chatGroupMain,
 		)
 		if err != nil {
-			return nil, nil, nil, err
-		}
-		response = <-resp
-		if len(response) > 0 {
-			// Retrieve chat group from database
-			chatGroupMain = &ChatGroup{}
-			err = json.Unmarshal(
-				response[0].Data,
-				chatGroupMain,
-			)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			chatGroup = *chatGroupMain
-		} else {
 			chatGroupMain = nil
 		}
 	} else {
 		chatGroupMain = nil
 	}
 	// Retrieve chat member
-	query = fmt.Sprintf(
+	query := fmt.Sprintf(
 		"^%s-%s$",
 		chatID,
 		username,
 	)
-	resp, err = chatMemberDB.Select(
+	// MaxResults 1 to have maximum performance (it avoids unnecessary searching)
+	options := &SelectOptions{
+		MaxResults: 1,
+		Page:       0,
+		Skip:       0,
+	}
+	resp, err := chatMemberDB.Select(
 		map[string]string{
 			"chat-user": query,
-		}, nil,
+		}, options,
 	)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	response = <-resp
+	responseMember := <-resp
 	var chatMember *ChatMember
-	if len(response) < 1 {
+	if len(responseMember) < 1 {
 		// No user was found -> Is the chat group private? If not, join
 		if chatGroup.IsPrivate {
 			isMatch := subtle.ConstantTimeCompare(
@@ -321,14 +328,31 @@ func GetChatGroupAndMember(
 		// Retrieve user from database
 		chatMember = &ChatMember{}
 		err = json.Unmarshal(
-			response[0].Data,
+			responseMember[0].Data,
 			chatMember,
 		)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 	}
-	return chatGroupOriginal, chatMember, chatGroupMain, nil
+	chatGroupEntry := &ChatGroupEntry{
+		ChatGroup: chatGroupOriginal,
+		UUID:      dataOriginal.uUID,
+	}
+	var chatGroupMainEntry *ChatGroupEntry
+	if chatGroupMain != nil {
+		chatGroupMainEntry = &ChatGroupEntry{
+			ChatGroup: chatGroupMain,
+			UUID:      dataMain.uUID,
+		}
+	} else {
+		chatGroupMainEntry = nil
+	}
+	chatMemberEntry := &ChatMemberEntry{
+		ChatMember: chatMember,
+		UUID:       responseMember[0].uUID,
+	}
+	return chatGroupEntry, chatMemberEntry, chatGroupMainEntry, nil
 }
 
 func CheckWriteRights(user *ChatMember, chatGroup *ChatGroup) bool {
@@ -361,4 +385,200 @@ func CheckReadRights(user *ChatMember, chatGroup *ChatGroup) bool {
 		}
 	}
 	return hasRight
+}
+
+func (db *GoDB) handleChatGroupRoleModification() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		chatID := chi.URLParam(r, "chatID")
+		if chatID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// TODO: Check if calling user is member and has at least one admin role
+		// Check if the role should be deleted
+		doDeleteTmp := r.URL.Query().Get("del")
+		doDelete := false
+		if doDeleteTmp != "" {
+			if doDeleteTmp == "true" {
+				doDelete = true
+			}
+		}
+		// Retrieve POST payload
+		request := &ChatRole{}
+		if err := render.Bind(r, request); err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Validate and sanitize
+		request.Name = strings.ToLower(request.Name)
+		if request.Name == "owner" || request.Name == "member" || request.Name == "_server" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve chat group
+		response, ok := db.Get(chatID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		chatGroup := &ChatGroup{}
+		err := json.Unmarshal(response.Data, chatGroup)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if role is present
+		index := -1
+		for ix, role := range chatGroup.Roles {
+			if role.Name == request.Name {
+				index = ix
+				break
+			}
+		}
+		if doDelete && index == -1 {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		if doDelete {
+			chatGroup.Roles = append(chatGroup.Roles[:index], chatGroup.Roles[index+1:]...)
+		} else {
+			if request.Index < 1.0 {
+				if request.IsAdmin {
+					request.Index = 30_000
+				} else {
+					request.Index = 40_000
+				}
+			}
+			// Did it exist yet?
+			if index == -1 {
+				chatGroup.Roles = append(chatGroup.Roles, *request)
+			} else {
+				chatGroup.Roles[index] = *request
+			}
+		}
+		jsonEntry, err := json.Marshal(chatGroup)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		err = db.Update(response.uUID, jsonEntry, map[string]string{})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+	}
+}
+func (db *GoDB) handleChatMemberRoleModification(chatMemberDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		chatID := chi.URLParam(r, "chatID")
+		if chatID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// TODO: Check if calling user is member and has at least one role higher than the user about to be modified
+		// Check if the role should be deleted
+		doDeleteTmp := r.URL.Query().Get("del")
+		doDelete := false
+		if doDeleteTmp != "" {
+			if doDeleteTmp == "true" {
+				doDelete = true
+			}
+		}
+		// Retrieve POST payload
+		request := &ChatUserRoleModification{}
+		if err := render.Bind(r, request); err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve chat group etc.
+		_, chatMember, _, err := GetChatGroupAndMember(db, chatMemberDB, chatID, request.Username, "")
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if role is present
+		index := -1
+		for ix, role := range chatMember.Roles {
+			if role == request.Role {
+				index = ix
+				break
+			}
+		}
+		if doDelete && index == -1 {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		if doDelete {
+			chatMember.Roles = append(chatMember.Roles[:index], chatMember.Roles[index+1:]...)
+		} else {
+			// Did it exist yet?
+			if index == -1 {
+				chatMember.Roles = append(chatMember.Roles, request.Role)
+			} else {
+				chatMember.Roles[index] = request.Role
+			}
+		}
+		jsonEntry, err := json.Marshal(chatMember)
+		err = chatMemberDB.Update(chatMember.UUID, jsonEntry, map[string]string{
+			"chat-user": fmt.Sprintf("%s-%s", chatID, chatMember.Username)},
+		)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+	}
+}
+
+func (db *GoDB) handleChatGroupGetMembers(chatMemberDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		chatID := chi.URLParam(r, "chatID")
+		if chatID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve chat member
+		query := fmt.Sprintf("^%s-.*$", chatID)
+		resp, err := chatMemberDB.Select(
+			map[string]string{
+				"chat-user": query,
+			}, nil,
+		)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		responseMember := <-resp
+		if len(responseMember) < 1 {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		members := ChatMemberList{
+			ChatMembers: make([]*ChatMember, len(responseMember)),
+		}
+		for i, entry := range responseMember {
+			chatMember := &ChatMember{}
+			err = json.Unmarshal(entry.Data, chatMember)
+			if err == nil {
+				members.ChatMembers[i] = chatMember
+			}
+		}
+		if len(members.ChatMembers) < 1 {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		render.JSON(w, r, members)
+	}
 }

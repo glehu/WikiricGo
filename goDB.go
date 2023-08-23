@@ -79,6 +79,7 @@ type DB interface {
 	Insert(data []byte, indices map[string]string) error
 	Update(uUID string, data []byte, indices map[string]string) error
 	Delete(uUID string) error
+	Get(uUID string) (*EntryResponse, bool)
 	Select(indices map[string]string) (chan *EntryResponse, error)
 
 	// Utility Methods
@@ -265,6 +266,23 @@ func (db *GoDB) Update(uUID string, data []byte, indices map[string]string) erro
 	return nil
 }
 
+func (db *GoDB) Get(uUID string) (*EntryResponse, bool) {
+	index, ok := db.indices["uuid"].index.Get(uUID)
+	if !ok {
+		return nil, false
+	}
+	content, err := db.readFromDB(index.pos, index.len)
+	if err != nil {
+		return nil, false
+	}
+	entryResponse := &EntryResponse{
+		uUID:  uUID,
+		Index: index,
+		Data:  content,
+	}
+	return entryResponse, true
+}
+
 // Select returns entries from the database
 func (db *GoDB) Select(indices map[string]string, options *SelectOptions) (chan []*EntryResponse, error) {
 	indicesClean, err := db.validateIndices(indices, true)
@@ -373,7 +391,7 @@ func (db *GoDB) validateIndices(indices map[string]string, isSelect bool) (map[s
 			indicesClean[key] = value
 		}
 	}
-	if len(indicesClean) < 1 {
+	if isSelect && len(indicesClean) < 1 {
 		return nil, errors.New("no valid index queries provided")
 	}
 	return indicesClean, nil

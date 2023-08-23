@@ -1,5 +1,14 @@
 package main
 
+type ChatMemberList struct {
+	ChatMembers []*ChatMember `json:"members"`
+}
+
+type ChatMemberEntry struct {
+	*ChatMember
+	UUID string
+}
+
 type ChatMember struct {
 	Username             string   `json:"usr"`
 	ChatGroupUUID        string   `json:"parent"`

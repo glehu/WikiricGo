@@ -114,12 +114,12 @@ func (server *ChatServer) handleChatEndpoint(userDB, chatGroupDB, chatMessagesDB
 			)
 			return
 		}
-		canWrite := CheckWriteRights(chatMember, chatGroup)
-		canRead := CheckReadRights(chatMember, chatGroup)
+		canWrite := CheckWriteRights(chatMember.ChatMember, chatGroup.ChatGroup)
+		canRead := CheckReadRights(chatMember.ChatMember, chatGroup.ChatGroup)
 		server.ChatGroupsMu.Lock()
 		sessions, ok := server.ChatGroups.Get(chatIDOriginal)
 		session := &Session{
-			ChatMember: chatMember,
+			ChatMember: chatMember.ChatMember,
 			Conn:       c,
 			Ctx:        ctx,
 			CanWrite:   canWrite,
@@ -217,23 +217,41 @@ func (server *ChatServer) handleIncomingMessage(
 	if !s.CanWrite {
 		return
 	}
+	text := string(resp.Msg)
 	msg := &ChatMessage{
 		ChatGroupUUID: s.ChatMember.ChatGroupUUID,
-		Text:          string(resp.Msg),
+		Text:          text,
 		Username:      s.ChatMember.Username,
 		TimeCreated:   TimeNowIsoString(),
 	}
 	go server.DistributeChatMessageJSON(msg)
-	jsonEntry, err := json.Marshal(msg)
-	if err != nil {
-		return
+	// [c:SC] is a prefix marking the message as pass through only without saving it
+	if len(text) < 6 || text[0:6] != "[c:SC]" {
+		jsonEntry, err := json.Marshal(msg)
+		if err != nil {
+			return
+		}
+		_, _ = server.DB.Insert(jsonEntry, map[string]string{
+			"chatID": s.ChatMember.ChatGroupUUID,
+		})
 	}
-	_, _ = server.DB.Insert(jsonEntry, map[string]string{
-		"chatID": s.ChatMember.ChatGroupUUID,
-	})
 }
 
 func (server *ChatServer) DistributeChatMessageJSON(msg *ChatMessage) {
+	server.ChatGroupsMu.RLock()
+	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
+	if ok {
+		for _, value := range sessions {
+			err := WSSendJSON(value.Conn, value.Ctx, msg)
+			if err != nil {
+				return
+			}
+		}
+	}
+	server.ChatGroupsMu.RUnlock()
+}
+
+func (server *ChatServer) DistributeChatActionMessageJSON(msg *ChatActionMessage) {
 	server.ChatGroupsMu.RLock()
 	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
 	if ok {

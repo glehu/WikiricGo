@@ -32,11 +32,12 @@ func OpenUserDatabase() *GoDB {
 	return db
 }
 
-func (db *GoDB) PublicUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth) {
+func (db *GoDB) PublicUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, fileDB *GoDB) {
 	r.Route("/users/public", func(r chi.Router) {
 		r.Get("/count", db.handleUserCount())
 		r.Post("/signup", db.handleUserRegistration())
 	})
+	fileDB.PublicFileEndpoints(r, tokenAuth)
 }
 
 func (db *GoDB) ProtectedUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth) {
@@ -64,7 +65,7 @@ func (db *GoDB) handleUserRegistration() http.HandlerFunc {
 		// Retrieve POST payload
 		request := &registerRequest{}
 		if err := render.Bind(r, request); err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
 		// Check Parameters

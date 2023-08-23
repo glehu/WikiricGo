@@ -48,10 +48,11 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config) {
 	chatMemberDB := OpenChatMemberDatabase()
 	chatMessagesDB := OpenChatMessageDatabase()
 	chatServer := CreateChatServer(chatMessagesDB)
+	fileDB := OpenFilesDatabase()
 	// Routes
-	setPublicRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, chatServer)
+	setPublicRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB, chatServer)
 	setBasicProtectedRoutes(r, userDB)
-	setJWTProtectedRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, chatServer)
+	setJWTProtectedRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB, chatServer)
 	// Shutdown URL
 	setShutdownURL(r)
 	// Start Server
@@ -136,11 +137,11 @@ func setShutdownURL(r chi.Router) {
 	r.Get("/secret/shutdown", handleShutdown)
 }
 
-func setPublicRoutes(r chi.Router, userDB, chatGroupDB, chatMessagesDB, chatMemberDB *GoDB, chatServer *ChatServer) {
+func setPublicRoutes(r chi.Router, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB *GoDB, chatServer *ChatServer) {
 	r.Get("/sample", sampleMessage)
 	vueJSWikiricEndpoint(r)
 	// Users
-	userDB.PublicUserEndpoints(r, tokenAuth)
+	userDB.PublicUserEndpoints(r, tokenAuth, fileDB)
 	// Chat WS Server
 	chatServer.PublicChatEndpoint(r, tokenAuth, userDB, chatGroupDB, chatMessagesDB, chatMemberDB)
 }
@@ -164,7 +165,7 @@ func setBasicProtectedRoutes(r chi.Router, userDB *GoDB) {
 }
 
 func setJWTProtectedRoutes(
-	r chi.Router, userDB, chatGroupDB, chatMessagesDB, chatMemberDB *GoDB, chatServer *ChatServer,
+	r chi.Router, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB *GoDB, chatServer *ChatServer,
 ) {
 	r.Group(
 		func(r chi.Router) {
@@ -185,6 +186,8 @@ func setJWTProtectedRoutes(
 			chatGroupDB.ProtectedChatGroupEndpoints(r, tokenAuth, userDB, chatMemberDB)
 			// #### Chat Messages
 			chatMessagesDB.ProtectedChatMessagesEndpoints(r, tokenAuth, chatServer, chatGroupDB, chatMemberDB)
+			// #### Files
+			fileDB.ProtectedFileEndpoints(r, tokenAuth, userDB, chatGroupDB, chatMemberDB)
 		},
 	)
 }
