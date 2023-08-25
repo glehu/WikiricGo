@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
 	"net/http"
+	"strings"
 )
 
 type ChatMessage struct {
@@ -19,6 +20,10 @@ type ChatMessage struct {
 	AnalyticsUUID string `json:"ana"` // Views, likes etc. will be stored in a separate database
 }
 
+type ChatMessageReaction struct {
+	Reaction string
+}
+
 type ChatMessageContainer struct {
 	*ChatMessage
 	UUID string
@@ -26,7 +31,7 @@ type ChatMessageContainer struct {
 
 type ChatActionMessage struct {
 	*ChatMessageContainer
-	action string
+	Action string `json:"action"`
 }
 
 func OpenChatMessageDatabase() *GoDB {
@@ -39,12 +44,13 @@ func OpenChatMessageDatabase() *GoDB {
 }
 
 func (db *GoDB) ProtectedChatMessagesEndpoints(
-	r chi.Router, tokenAuth *jwtauth.JWTAuth, chatServer *ChatServer, chatGroupDB, chatMemberDB *GoDB,
+	r chi.Router, tokenAuth *jwtauth.JWTAuth, chatServer *ChatServer, chatGroupDB, chatMemberDB, analyticsDB *GoDB,
 ) {
 	r.Route(
 		"/msg/private", func(r chi.Router) {
 			r.Post("/create", db.handleChatMessageCreate(chatServer, chatGroupDB, chatMemberDB))
 			r.Post("/edit/{msgID}", db.handleChatMessageEdit(chatServer, chatGroupDB, chatMemberDB))
+			r.Post("/react/{msgID}", db.handleChatMessageReaction(chatServer, chatGroupDB, chatMemberDB, analyticsDB))
 			r.Get("/delete/{msgID}", db.handleChatMessageDelete(chatServer, chatGroupDB, chatMemberDB))
 			r.Route("/chat", func(r chi.Router) {
 				r.Get("/get/{chatID}", db.handleChatMessageFromChat(chatServer, chatGroupDB, chatMemberDB))
@@ -65,15 +71,15 @@ func (db *GoDB) handleChatMessageCreate(chatServer *ChatServer, chatGroupDB, cha
 		request := &ChatMessage{}
 		if err := render.Bind(r, request); err != nil {
 			fmt.Println(err)
-			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		// Check if a password was provided in the url query
 		password := r.URL.Query().Get("pw")
 		// Check rights of group member
 		chatGroup, chatMember, _, _ := GetChatGroupAndMember(
-			chatGroupDB, chatMemberDB, request.ChatGroupUUID, user.Username, password,
-		)
+			chatGroupDB, chatMemberDB, nil, nil,
+			request.ChatGroupUUID, user.Username, password, nil)
 		if chatMember == nil {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -122,15 +128,15 @@ func (db *GoDB) handleChatMessageEdit(chatServer *ChatServer, chatGroupDB, chatM
 		request := &ChatMessageContainer{}
 		if err := render.Bind(r, request); err != nil {
 			fmt.Println(err)
-			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		// Check if a password was provided in the url query
 		password := r.URL.Query().Get("pw")
 		// Check rights of group member
 		chatGroup, chatMember, _, _ := GetChatGroupAndMember(
-			chatGroupDB, chatMemberDB, request.ChatGroupUUID, user.Username, password,
-		)
+			chatGroupDB, chatMemberDB, nil, nil,
+			request.ChatGroupUUID, user.Username, password, nil)
 		if chatMember == nil {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -147,7 +153,7 @@ func (db *GoDB) handleChatMessageEdit(chatServer *ChatServer, chatGroupDB, chatM
 		// Distribute action message
 		actionMessage := &ChatActionMessage{
 			ChatMessageContainer: request,
-			action:               "edit",
+			Action:               "edit",
 		}
 		go chatServer.DistributeChatActionMessageJSON(actionMessage)
 		// Store message
@@ -182,6 +188,13 @@ func (a *ChatMessage) Bind(_ *http.Request) error {
 	return nil
 }
 
+func (a *ChatMessageReaction) Bind(_ *http.Request) error {
+	if a.Reaction == "" {
+		return errors.New("missing reaction")
+	}
+	return nil
+}
+
 func (db *GoDB) handleChatMessageFromChat(chatServer *ChatServer, chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -197,8 +210,8 @@ func (db *GoDB) handleChatMessageFromChat(chatServer *ChatServer, chatGroupDB, c
 		// Check if a password was provided in the url query
 		password := r.URL.Query().Get("pw")
 		chatGroup, chatMember, _, err := GetChatGroupAndMember(
-			chatGroupDB, chatMemberDB, chatID, user.Username, password,
-		)
+			chatGroupDB, chatMemberDB, nil, nil,
+			chatID, user.Username, password, nil)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -257,8 +270,8 @@ func (db *GoDB) handleChatMessageDelete(chatServer *ChatServer, chatGroupDB, cha
 			return
 		}
 		// Get message
-		resp, ok := db.Get(msgID)
-		if !ok {
+		resp, lid := db.Get(msgID)
+		if lid == "" {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
@@ -272,8 +285,8 @@ func (db *GoDB) handleChatMessageDelete(chatServer *ChatServer, chatGroupDB, cha
 		password := r.URL.Query().Get("pw")
 		// Check rights of group member
 		chatGroup, chatMember, _, _ := GetChatGroupAndMember(
-			chatGroupDB, chatMemberDB, message.ChatGroupUUID, user.Username, password,
-		)
+			chatGroupDB, chatMemberDB, nil, nil,
+			message.ChatGroupUUID, user.Username, password, nil)
 		if chatMember == nil {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -293,9 +306,145 @@ func (db *GoDB) handleChatMessageDelete(chatServer *ChatServer, chatGroupDB, cha
 		}
 		actionMessage := &ChatActionMessage{
 			ChatMessageContainer: container,
-			action:               "delete",
+			Action:               "delete",
 		}
 		go chatServer.DistributeChatActionMessageJSON(actionMessage)
 		// Delete message
+	}
+}
+
+func (db *GoDB) handleChatMessageReaction(
+	chatServer *ChatServer, chatGroupDB, chatMemberDB, analyticsDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		msgID := chi.URLParam(r, "msgID")
+		if msgID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		chatID := r.URL.Query().Get("src")
+		if chatID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve POST payload
+		request := &ChatMessageReaction{}
+		if err := render.Bind(r, request); err != nil {
+			fmt.Println(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Sanitize
+		request.Reaction = strings.ToLower(request.Reaction)
+		// Check if a password was provided in the url query
+		password := r.URL.Query().Get("pw")
+		// Check rights of group member
+		chatGroup, chatMember, _, _ := GetChatGroupAndMember(
+			chatGroupDB, chatMemberDB, nil, nil, chatID, user.Username, password, nil)
+		if chatMember == nil {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		canWrite := CheckWriteRights(chatMember.ChatMember, chatGroup.ChatGroup)
+		if !canWrite {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Retrieve message and check if there is an Analytics entry available
+		messageBytes, lid := db.Get(msgID)
+		if lid == "" {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		message := &ChatMessage{}
+		err := json.Unmarshal(messageBytes.Data, message)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		var analytics *Analytics
+		analyticsUpdate := false
+		var analyticsBytes *EntryResponse
+		if message.AnalyticsUUID != "" {
+			analyticsBytes, lid = analyticsDB.Get(message.AnalyticsUUID)
+			if lid == "" {
+				analytics = &Analytics{}
+				err = json.Unmarshal(analyticsBytes.Data, analytics)
+				if err != nil {
+					// Could not retrieve analytics -> Create new one
+					analytics = nil
+				} else {
+					analyticsUpdate = true
+				}
+			}
+		}
+		// Create analytics if there are none
+		if analytics == nil {
+			analytics = &Analytics{
+				Views:     0,
+				Reactions: make(map[string][]string, 1),
+				Downloads: 0,
+				Bookmarks: 0,
+			}
+			analytics.Reactions[request.Reaction] = []string{user.Username}
+		} else {
+			// Check if reaction is present already, if yes -> remove (toggle functionality)
+			index := -1
+			rUsers, ok := analytics.Reactions[request.Reaction]
+			if ok && len(rUsers) > 0 {
+				for ix, rUser := range rUsers {
+					if rUser == user.Username {
+						// Found -> Remove
+						index = ix
+						break
+					}
+				}
+				reactions := analytics.Reactions[request.Reaction]
+				if index != -1 {
+					// Delete
+					reactions = append(reactions[:index], reactions[index+1:]...)
+				} else {
+					// Append
+					reactions = append(reactions, user.Username)
+				}
+				analytics.Reactions[request.Reaction] = reactions
+			}
+		}
+		analyticsJson, err := json.Marshal(analytics)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Commit changes
+		if analyticsUpdate && analyticsBytes != nil {
+			// Analytics existed -> Update them
+			err = analyticsDB.Update(analyticsBytes.uUID, analyticsJson, map[string]string{})
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			// Insert analytics while returning its UUID to the message for reference
+			message.AnalyticsUUID, err = analyticsDB.Insert(analyticsJson, map[string]string{})
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			// Update message
+			messageJson, err := json.Marshal(message)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			err = db.Update(messageBytes.uUID, messageJson, map[string]string{})
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+		}
 	}
 }

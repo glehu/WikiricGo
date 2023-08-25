@@ -14,9 +14,10 @@ type Config struct {
 }
 
 func main() {
-	// Create wait group and done channel
+	// Create wait group and done channels
 	wg := sync.WaitGroup{}
-	done := make(chan bool)
+	doneServer := make(chan bool)
+	donePeriodic := make(chan bool)
 	// Setup
 	config, err := getConfig()
 	if err != nil {
@@ -25,10 +26,28 @@ func main() {
 		fmt.Println(":: config.json loaded")
 	}
 	// Databases
-	setupDatabases()
+	userDB := OpenUserDatabase()
+	chatGroupDB := OpenChatGroupDatabase()
+	chatMemberDB := OpenChatMemberDatabase()
+	chatMessagesDB := OpenChatMessageDatabase()
+	fileDB := OpenFilesDatabase()
+	analyticsDB := OpenAnalyticsDatabase()
+	notificationDB := OpenNotificationDatabase()
+	knowledgeDB := OpenKnowledgeDatabase()
+	wisdomDB := OpenWisdomDatabase()
+	// Chat Server
+	chatServer := CreateChatServer(chatMessagesDB)
+	// Connector
+	connector := CreateConnector(notificationDB)
 	// Start Server (with wait group delta)
 	wg.Add(1)
-	go StartServer(done, &wg, config)
+	go StartServer(doneServer, &wg, config,
+		userDB, chatGroupDB, chatMemberDB, chatMessagesDB, fileDB, analyticsDB, notificationDB,
+		knowledgeDB, wisdomDB,
+		chatServer, connector,
+	)
+	// Start periodic actions loop
+	StartPeriodicLoop(donePeriodic)
 	// Wait for all processes to end
 	wg.Wait()
 }
@@ -55,8 +74,4 @@ func getConfig() (Config, error) {
 		config.jwtSecret = "secret"
 	}
 	return config, nil
-}
-
-func setupDatabases() {
-	// TestDB()
 }

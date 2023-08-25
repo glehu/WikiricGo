@@ -25,7 +25,12 @@ var tokenAuth *jwtauth.JWTAuth
 
 var cs chan bool
 
-func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config) {
+func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
+	userDB, chatGroupDB,
+	chatMemberDB, chatMessagesDB, fileDB, analyticsDB,
+	notificationDB, knowledgeDB, wisdomDB *GoDB,
+	chatServer *ChatServer, connector *Connector,
+) {
 	fmt.Println(":: INIT SERVER")
 	cs = _cs
 	// Initialize JWT Authenticator
@@ -42,17 +47,14 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config) {
 		),
 	)
 	r.Use(PaginationMiddleware())
-	// Databases
-	userDB := OpenUserDatabase()
-	chatGroupDB := OpenChatGroupDatabase()
-	chatMemberDB := OpenChatMemberDatabase()
-	chatMessagesDB := OpenChatMessageDatabase()
-	chatServer := CreateChatServer(chatMessagesDB)
-	fileDB := OpenFilesDatabase()
-	// Routes
-	setPublicRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB, chatServer)
+	// Routes -> Public
+	setPublicRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB,
+		notificationDB, chatServer, connector)
+	// -> Basic Auth
 	setBasicProtectedRoutes(r, userDB)
-	setJWTProtectedRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB, chatServer)
+	// -> JWT Bearer Auth
+	setJWTProtectedRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB,
+		analyticsDB, notificationDB, knowledgeDB, wisdomDB, chatServer, connector)
 	// Shutdown URL
 	setShutdownURL(r)
 	// Start Server
@@ -137,13 +139,19 @@ func setShutdownURL(r chi.Router) {
 	r.Get("/secret/shutdown", handleShutdown)
 }
 
-func setPublicRoutes(r chi.Router, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB *GoDB, chatServer *ChatServer) {
+func setPublicRoutes(r chi.Router,
+	userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB, notificationDB *GoDB,
+	chatServer *ChatServer, connector *Connector,
+) {
 	r.Get("/sample", sampleMessage)
 	vueJSWikiricEndpoint(r)
 	// Users
-	userDB.PublicUserEndpoints(r, tokenAuth, fileDB)
+	userDB.PublicUserEndpoints(r, tokenAuth, notificationDB)
 	// Chat WS Server
 	chatServer.PublicChatEndpoint(r, tokenAuth, userDB, chatGroupDB, chatMessagesDB, chatMemberDB)
+	fileDB.PublicFileEndpoints(r, tokenAuth)
+	// Connector WS Server
+	connector.PublicConnectorEndpoint(r, tokenAuth, userDB, chatGroupDB, chatMessagesDB, chatMemberDB)
 }
 
 func setBasicProtectedRoutes(r chi.Router, userDB *GoDB) {
@@ -159,13 +167,15 @@ func setBasicProtectedRoutes(r chi.Router, userDB *GoDB) {
 			)
 			// Protected routes
 			// #### Users
-			userDB.ProtectedUserEndpoints(r, tokenAuth)
+			userDB.BasicProtectedUserEndpoints(r, tokenAuth)
 		},
 	)
 }
 
 func setJWTProtectedRoutes(
-	r chi.Router, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB *GoDB, chatServer *ChatServer,
+	r chi.Router, userDB, chatGroupDB, chatMessagesDB, chatMemberDB,
+	fileDB, analyticsDB, notificationDB, knowledgeDB, wisdomDB *GoDB,
+	chatServer *ChatServer, connector *Connector,
 ) {
 	r.Group(
 		func(r chi.Router) {
@@ -182,12 +192,20 @@ func setJWTProtectedRoutes(
 			)
 			// Protected routes
 			// #### Users
+			userDB.ProtectedUserEndpoints(r, tokenAuth, chatGroupDB, chatMemberDB, notificationDB, connector)
 			// #### Chat Groups
 			chatGroupDB.ProtectedChatGroupEndpoints(r, tokenAuth, userDB, chatMemberDB)
 			// #### Chat Messages
-			chatMessagesDB.ProtectedChatMessagesEndpoints(r, tokenAuth, chatServer, chatGroupDB, chatMemberDB)
+			chatMessagesDB.ProtectedChatMessagesEndpoints(r, tokenAuth, chatServer, chatGroupDB, chatMemberDB, analyticsDB)
 			// #### Files
 			fileDB.ProtectedFileEndpoints(r, tokenAuth, userDB, chatGroupDB, chatMemberDB)
+			// #### Notifications
+			notificationDB.ProtectedNotificationEndpoints(r, tokenAuth)
+			// #### Knowledge
+			knowledgeDB.ProtectedKnowledgeEndpoints(r, tokenAuth, chatGroupDB, chatMemberDB, chatServer)
+			// #### Wisdom
+			wisdomDB.ProtectedWisdomEndpoints(r, tokenAuth,
+				chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, analyticsDB, connector)
 		},
 	)
 }
@@ -324,6 +342,7 @@ func BearerAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 				}
 				// Set user to context to be used for next steps after this middleware
 				ctx := context.WithValue(r.Context(), "user", userFromDB)
+				ctx = context.WithValue(ctx, "userID", response[0].uUID)
 				next.ServeHTTP(w, r.WithContext(ctx))
 			},
 		)

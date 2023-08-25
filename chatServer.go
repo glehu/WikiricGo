@@ -63,7 +63,8 @@ func (server *ChatServer) PublicChatEndpoint(
 	)
 }
 
-func (server *ChatServer) handleChatEndpoint(userDB, chatGroupDB, chatMessagesDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (server *ChatServer) handleChatEndpoint(
+	userDB, chatGroupDB, chatMessagesDB, chatMemberDB *GoDB) http.HandlerFunc {
 	return func(
 		w http.ResponseWriter,
 		r *http.Request,
@@ -106,7 +107,8 @@ func (server *ChatServer) handleChatEndpoint(userDB, chatGroupDB, chatMessagesDB
 		username := usernameTmp.(string)
 		// Check if a password was provided in the url query
 		password := r.URL.Query().Get("pw")
-		chatGroup, chatMember, _, err := GetChatGroupAndMember(chatGroupDB, chatMemberDB, chatID, username, password)
+		chatGroup, chatMember, _, err := GetChatGroupAndMember(
+			chatGroupDB, chatMemberDB, nil, nil, chatID, username, password, r)
 		if chatMember == nil || err != nil {
 			_ = c.Close(
 				http.StatusUnauthorized,
@@ -186,28 +188,37 @@ func (server *ChatServer) checkToken(
 }
 
 func (server *ChatServer) handleChatSession(s *Session) {
-	messages := listenToMessages(
+	messages, closed := ListenToMessages(
 		s.Conn,
 		s.Ctx,
 	)
 	for {
 		select {
-		case resp := <-messages:
-			server.handleIncomingMessage(
-				s,
-				resp,
-			)
-			break
-		case <-s.Ctx.Done():
-			server.ChatGroupsMu.Lock()
-			sessions, ok := server.ChatGroups.Get(s.ChatMember.ChatGroupUUID)
-			if ok {
-				sessions[s.ChatMember.Username] = nil
-			}
-			server.ChatGroupsMu.Unlock()
+		case <-closed:
+			server.dropConnection(s)
 			return
+		case <-s.Ctx.Done():
+			server.dropConnection(s)
+			return
+		case resp := <-messages:
+			if resp != nil {
+				server.handleIncomingMessage(
+					s,
+					resp,
+				)
+			}
 		}
 	}
+}
+
+func (server *ChatServer) dropConnection(s *Session) {
+	server.ChatGroupsMu.Lock()
+	sessions, ok := server.ChatGroups.Get(s.ChatMember.ChatGroupUUID)
+	if ok {
+		sessions[s.ChatMember.Username] = nil
+		server.ChatGroups.Set(s.ChatMember.ChatGroupUUID, sessions)
+	}
+	server.ChatGroupsMu.Unlock()
 }
 
 func (server *ChatServer) handleIncomingMessage(
@@ -242,10 +253,7 @@ func (server *ChatServer) DistributeChatMessageJSON(msg *ChatMessage) {
 	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
 	if ok {
 		for _, value := range sessions {
-			err := WSSendJSON(value.Conn, value.Ctx, msg)
-			if err != nil {
-				return
-			}
+			_ = WSSendJSON(value.Conn, value.Ctx, msg) // TODO: Drop connection?
 		}
 	}
 	server.ChatGroupsMu.RUnlock()
@@ -256,24 +264,25 @@ func (server *ChatServer) DistributeChatActionMessageJSON(msg *ChatActionMessage
 	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
 	if ok {
 		for _, value := range sessions {
-			err := WSSendJSON(value.Conn, value.Ctx, msg)
-			if err != nil {
-				return
-			}
+			_ = WSSendJSON(value.Conn, value.Ctx, msg) // TODO: Drop connection?
 		}
 	}
 	server.ChatGroupsMu.RUnlock()
 }
 
-func listenToMessages(
+func ListenToMessages(
 	c *websocket.Conn,
 	ctx context.Context,
-) chan *MessageResponse {
+) (chan *MessageResponse, chan bool) {
+	// Prepare channels
 	resp := make(chan *MessageResponse)
+	closed := make(chan bool)
+	// Launch goroutine with listening loop
 	go func() {
 		for {
 			typ, msg, err := c.Read(ctx)
 			if err != nil {
+				closed <- true
 				fmt.Println(
 					"ws read error",
 					err,
@@ -286,7 +295,7 @@ func listenToMessages(
 			}
 		}
 	}()
-	return resp
+	return resp, closed
 }
 
 func WSSendJSON(

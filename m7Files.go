@@ -365,13 +365,14 @@ func (db *GoDB) handleFileCreate(userDB, chatGroupDB, chatMemberDB *GoDB) http.H
 		request := &FileSubmission{}
 		if err := render.Bind(r, request); err != nil {
 			fmt.Println(err)
-			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		// Is a chat group referenced?
 		if request.ChatGroupUUID != "" {
 			chatGroup, chatMember, _, err := GetChatGroupAndMember(
-				chatGroupDB, chatMemberDB, request.ChatGroupUUID, user.Username, "")
+				chatGroupDB, chatMemberDB, nil, nil,
+				request.ChatGroupUUID, user.Username, "", nil)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 				return
@@ -406,11 +407,12 @@ func (db *GoDB) handleFileGet() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, ok := db.Get(fileID)
-		if !ok {
+		response, lid := db.Get(fileID)
+		if lid == "" {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
+		defer db.Unlock(fileID, lid)
 		fileMeta := &FileMeta{}
 		err := json.Unmarshal(response.Data, fileMeta)
 		if err != nil {
@@ -437,11 +439,12 @@ func (db *GoDB) handleFileMetaGet(chatGroupDB, chatMemberDB *GoDB) http.HandlerF
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, ok := db.Get(fileID)
-		if !ok {
+		response, lid := db.Get(fileID)
+		if lid == "" {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
+		defer db.Unlock(fileID, lid)
 		fileMeta := &FileMeta{}
 		err := json.Unmarshal(response.Data, fileMeta)
 		if err != nil {
@@ -451,7 +454,8 @@ func (db *GoDB) handleFileMetaGet(chatGroupDB, chatMemberDB *GoDB) http.HandlerF
 		// Is the file protected?
 		if fileMeta.IsPrivate && fileMeta.ChatGroupUUID != "" {
 			chatGroup, chatMember, _, err := GetChatGroupAndMember(
-				chatGroupDB, chatMemberDB, fileMeta.ChatGroupUUID, user.Username, "")
+				chatGroupDB, chatMemberDB, nil, nil,
+				fileMeta.ChatGroupUUID, user.Username, "", nil)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 				return

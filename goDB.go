@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ### CONST ###
@@ -190,6 +191,8 @@ func (db *GoDB) doInsert(uUID string, data []byte, indices map[string]string) er
 
 // Delete removes an entry from the database
 func (db *GoDB) Delete(uUID string) error {
+	// Lock the entry
+	_ = db.Lock(uUID)
 	prevIndex, ok := db.indices["uuid"].index.Get(uUID)
 	if !ok {
 		return nil
@@ -266,21 +269,74 @@ func (db *GoDB) Update(uUID string, data []byte, indices map[string]string) erro
 	return nil
 }
 
-func (db *GoDB) Get(uUID string) (*EntryResponse, bool) {
+// Lock prevents others to get writing access to a single entry
+func (db *GoDB) Lock(uUID string) (lid string) {
+	lck, _ := uuid.NewV7()
+	lid = lck.String()
+	for {
+		ok := db.doLock(uUID, lid)
+		if ok {
+			break
+		} else {
+			ticker := time.NewTicker(time.Millisecond * 15)
+			<-ticker.C
+			ticker.Stop()
+		}
+	}
+	return lid
+}
+
+func (db *GoDB) doLock(uUID, username string) bool {
+	db.ixMutex.Lock()
+	defer db.ixMutex.Unlock()
 	index, ok := db.indices["uuid"].index.Get(uUID)
 	if !ok {
-		return nil, false
+		return true
 	}
+	// Only lock if nobody else locked it
+	if index.value == "" {
+		index.value = username
+		db.indices["uuid"].index.Set(uUID, index)
+		return true
+	}
+	return false
+}
+
+func (db *GoDB) Unlock(uUID, lid string) bool {
+	db.ixMutex.Lock()
+	defer db.ixMutex.Unlock()
+	index, ok := db.indices["uuid"].index.Get(uUID)
+	if !ok {
+		return true
+	}
+	if index.value == "" {
+		return true
+	}
+	if index.value == lid {
+		index.value = ""
+		db.indices["uuid"].index.Set(uUID, index)
+		return true
+	}
+	return false
+}
+
+func (db *GoDB) Get(uUID string) (*EntryResponse, string) {
+	index, ok := db.indices["uuid"].index.Get(uUID)
+	if !ok {
+		return nil, ""
+	}
+	// Lock the entry
+	lid := db.Lock(uUID)
 	content, err := db.readFromDB(index.pos, index.len)
 	if err != nil {
-		return nil, false
+		return nil, ""
 	}
 	entryResponse := &EntryResponse{
 		uUID:  uUID,
 		Index: index,
 		Data:  content,
 	}
-	return entryResponse, true
+	return entryResponse, lid
 }
 
 // Select returns entries from the database
@@ -503,6 +559,9 @@ func (db *GoDB) checkIXFile(index string, level int32) error {
 		}
 		// Do we set or delete this index?
 		if pos >= 0 && length >= 0 {
+			if index == "uuid" {
+				value[0] = ""
+			}
 			indexEntry := &Index{
 				value: value[0],
 				pos:   pos,
@@ -578,9 +637,10 @@ func checkModuleDir(module string, workDir string) {
 func (db *GoDB) writeIndices(uUID string, offset, length int64, indices map[string]string) {
 	// MUTEX LOCK
 	db.ixMutex.Lock()
+	defer db.ixMutex.Unlock()
 	// Write base index (uuid)
 	indexEntry := &Index{
-		value: uUID,
+		value: "", // Locking field will be emptied after Insert/Update - Nice side-effect!
 		pos:   offset,
 		len:   length,
 	}
@@ -597,13 +657,29 @@ func (db *GoDB) writeIndices(uUID string, offset, length int64, indices map[stri
 			if key == "uuid" {
 				continue
 			}
+			if value == "" {
+				// Remove empty indices
+				indexEntry = &Index{
+					value: "",
+					pos:   -1,
+					len:   -1,
+				}
+				db.indices[key].index.Delete(uUID)
+				db.ixChannel <- &IXChannelCommand{
+					index:      key,
+					uUID:       uUID,
+					indexEntry: indexEntry,
+				}
+				continue
+			}
+			// Store index with value
 			indexEntry = &Index{
 				value: value,
 				pos:   offset,
 				len:   length,
 			}
-
 			db.indices[key].index.Set(uUID, indexEntry)
+			// Write index file
 			db.ixChannel <- &IXChannelCommand{
 				index:      key,
 				uUID:       uUID,
@@ -611,6 +687,4 @@ func (db *GoDB) writeIndices(uUID string, offset, length int64, indices map[stri
 			}
 		}
 	}
-	// MUTEX UNLOCK
-	db.ixMutex.Unlock()
 }
