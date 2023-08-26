@@ -102,7 +102,11 @@ func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
 		query := fmt.Sprintf("^%s$", request.Username)
 		resp, err := db.Select(map[string]string{
 			"username": query,
-		}, nil)
+		}, &SelectOptions{
+			MaxResults: 1,
+			Page:       0,
+			Skip:       0,
+		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -217,13 +221,13 @@ func (db *GoDB) handleUserModification() http.HandlerFunc {
 }
 
 func (db *GoDB) changeUserDisplayName(user *User, userUUID string, request *UserModification) error {
-	_ = db.Lock(userUUID)
+	lid := db.Lock(userUUID)
 	user.DisplayName = request.NewValue
 	userBytes, err := json.Marshal(user)
 	if err != nil {
 		return err
 	}
-	err = db.Update(userUUID, userBytes, map[string]string{
+	err = db.Update(userUUID, userBytes, lid, map[string]string{
 		"username": user.Username,
 	})
 	if err != nil {
@@ -242,7 +246,7 @@ func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserMod
 		return errors.New("passwords do not match")
 	}
 	// Change password
-	_ = db.Lock(userUUID)
+	lid := db.Lock(userUUID)
 	// Hash the new password
 	hNew := sha256.New()
 	hNew.Write([]byte(request.NewValue))
@@ -252,7 +256,7 @@ func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserMod
 	if err != nil {
 		return err
 	}
-	err = db.Update(userUUID, userBytes, map[string]string{
+	err = db.Update(userUUID, userBytes, lid, map[string]string{
 		"username": user.Username,
 	})
 	if err != nil {

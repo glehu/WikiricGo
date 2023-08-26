@@ -370,9 +370,9 @@ func (db *GoDB) handleFileCreate(userDB, chatGroupDB, chatMemberDB *GoDB) http.H
 		}
 		// Is a chat group referenced?
 		if request.ChatGroupUUID != "" {
-			chatGroup, chatMember, _, err := GetChatGroupAndMember(
+			chatGroup, chatMember, _, err := ReadChatGroupAndMember(
 				chatGroupDB, chatMemberDB, nil, nil,
-				request.ChatGroupUUID, user.Username, "", nil)
+				request.ChatGroupUUID, user.Username, "", r)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 				return
@@ -453,9 +453,9 @@ func (db *GoDB) handleFileMetaGet(chatGroupDB, chatMemberDB *GoDB) http.HandlerF
 		}
 		// Is the file protected?
 		if fileMeta.IsPrivate && fileMeta.ChatGroupUUID != "" {
-			chatGroup, chatMember, _, err := GetChatGroupAndMember(
+			chatGroup, chatMember, _, err := ReadChatGroupAndMember(
 				chatGroupDB, chatMemberDB, nil, nil,
-				fileMeta.ChatGroupUUID, user.Username, "", nil)
+				fileMeta.ChatGroupUUID, user.Username, "", r)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 				return

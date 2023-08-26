@@ -111,7 +111,7 @@ func testDelete(db *GoDB, uUID string) {
 	time.Sleep(time.Second)
 	start := time.Now()
 	// Delete entry from database
-	err := db.Delete(uUID)
+	err := db.Delete(uUID, "")
 	if err != nil {
 		log.Panic(err)
 	}
@@ -136,7 +136,7 @@ func testUpdate(db *GoDB, uUID string) {
 		log.Panic(":: DEBUG ERROR serializing", err)
 	}
 	// Insert into db
-	err = db.Update(uUID, data, map[string]string{
+	err = db.Update(uUID, data, "", map[string]string{
 		"count": "1337",
 	})
 	if err != nil {

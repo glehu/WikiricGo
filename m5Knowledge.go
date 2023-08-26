@@ -66,9 +66,9 @@ func (db *GoDB) handleKnowledgeCreate(chatGroupDB, chatMemberDB *GoDB, chatServe
 			return
 		}
 		// Check if user has admin rights for the specified chat group
-		_, chatMember, chatGroup, err := GetChatGroupAndMember(
+		_, chatMember, chatGroup, err := ReadChatGroupAndMember(
 			chatGroupDB, chatMemberDB, nil, nil,
-			request.ChatGroupUUID, user.Username, "", nil)
+			request.ChatGroupUUID, user.Username, "", r)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -125,9 +125,9 @@ func (db *GoDB) handleKnowledgeGet(chatGroupDB, chatMemberDB *GoDB) http.Handler
 			return
 		}
 		// Check if user has read rights for the specified chat group
-		_, chatMember, chatGroup, err := GetChatGroupAndMember(
+		_, chatMember, chatGroup, err := ReadChatGroupAndMember(
 			chatGroupDB, chatMemberDB, nil, nil,
-			knowledge.ChatGroupUUID, user.Username, "", nil)
+			knowledge.ChatGroupUUID, user.Username, "", r)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return

@@ -112,9 +112,9 @@ func (db *GoDB) handleNotificationDelete() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
-		db.Unlock(notificationID, lid)
-		err = db.Delete(notificationID)
+		err = db.Delete(notificationID, lid)
 		if err != nil {
+			db.Unlock(notificationID, lid)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
@@ -137,7 +137,7 @@ func (db *GoDB) handleNotificationDelete() http.HandlerFunc {
 					err = json.Unmarshal(notifEntry.Data, notification)
 					if err == nil {
 						if notification.Type != "frequest" {
-							_ = db.Delete(notifEntry.uUID)
+							_ = db.Delete(notifEntry.uUID, "")
 						}
 					}
 				}

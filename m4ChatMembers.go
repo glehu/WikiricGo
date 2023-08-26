@@ -60,7 +60,7 @@ func (member *ChatMember) GetRoleInformation(group *ChatGroup) *ChatRole {
 }
 
 func (db *GoDB) CheckFriendGroupExist(selfUser, friendUser string) (string, error) {
-	query := fmt.Sprintf("^((%s|%s)|(%s|%s))$", selfUser, friendUser, friendUser, selfUser)
+	query := fmt.Sprintf("^((%s\\|%s)|(%s\\|%s))$", selfUser, friendUser, friendUser, selfUser)
 	resp, err := db.Select(map[string]string{
 		"user-friend": query,
 	}, &SelectOptions{

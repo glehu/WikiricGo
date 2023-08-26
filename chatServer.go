@@ -19,6 +19,7 @@ type Session struct {
 	ChatMember *ChatMember
 	Conn       *websocket.Conn
 	Ctx        context.Context
+	R          *http.Request
 	CanWrite   bool
 	CanRead    bool
 }
@@ -69,7 +70,6 @@ func (server *ChatServer) handleChatEndpoint(
 		w http.ResponseWriter,
 		r *http.Request,
 	) {
-		ctx := r.Context()
 		chatID := chi.URLParam(r, "chatID")
 		if chatID == "" {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
@@ -85,10 +85,7 @@ func (server *ChatServer) handleChatEndpoint(
 		if err != nil {
 			return
 		}
-		validToken, token := server.checkToken(
-			c,
-			ctx,
-		)
+		validToken, token, r := server.checkToken(userDB, c, r)
 		if !validToken {
 			_ = c.Close(
 				http.StatusUnauthorized,
@@ -96,6 +93,7 @@ func (server *ChatServer) handleChatEndpoint(
 			)
 			return
 		}
+		ctx := r.Context()
 		usernameTmp, ok := token.Get("u_name")
 		if !ok {
 			_ = c.Close(
@@ -107,7 +105,7 @@ func (server *ChatServer) handleChatEndpoint(
 		username := usernameTmp.(string)
 		// Check if a password was provided in the url query
 		password := r.URL.Query().Get("pw")
-		chatGroup, chatMember, _, err := GetChatGroupAndMember(
+		chatGroup, chatMember, _, err := ReadChatGroupAndMember(
 			chatGroupDB, chatMemberDB, nil, nil, chatID, username, password, r)
 		if chatMember == nil || err != nil {
 			_ = c.Close(
@@ -124,11 +122,13 @@ func (server *ChatServer) handleChatEndpoint(
 			ChatMember: chatMember.ChatMember,
 			Conn:       c,
 			Ctx:        ctx,
+			R:          r,
 			CanWrite:   canWrite,
 			CanRead:    canRead,
 		}
 		if ok {
 			sessions[chatMember.Username] = session
+			server.ChatGroups.Set(chatIDOriginal, sessions)
 		} else {
 			server.ChatGroups.Set(
 				chatIDOriginal,
@@ -145,28 +145,30 @@ func (server *ChatServer) handleChatEndpoint(
 }
 
 func (server *ChatServer) checkToken(
+	userDB *GoDB,
 	c *websocket.Conn,
-	ctx context.Context,
-) (bool, jwt.Token) {
+	r *http.Request,
+) (bool, jwt.Token, *http.Request) {
 	// Listen for message
+	ctx := r.Context()
 	typ, msg, err := c.Read(ctx)
 	if err != nil {
-		return false, nil
+		return false, nil, nil
 	}
 	// Check JWT Token
 	token, err := server.tokenAuth.Decode(string(msg))
 	if err != nil {
-		return false, nil
+		return false, nil, nil
 	}
 	// Check token's expiry date
 	expTmp, ok := token.Get("exp")
 	if ok != true {
-		return false, nil
+		return false, nil, nil
 	}
 	exp := expTmp.(time.Time)
 	expired := exp.Compare(time.Now()) < 0
 	if expired {
-		return false, nil
+		return false, nil, nil
 	}
 	// Does the user exist?
 	// TODO
@@ -182,9 +184,32 @@ func (server *ChatServer) checkToken(
 		[]byte(str),
 	)
 	if err != nil {
-		return false, nil
+		return false, nil, nil
 	}
-	return true, token
+	// Get client user
+	userQuery := fmt.Sprintf("^%s$", userName)
+	resp, err := userDB.Select(
+		map[string]string{
+			"username": userQuery,
+		}, nil,
+	)
+	if err != nil {
+		return false, nil, nil
+	}
+	response := <-resp
+	if len(response) < 1 {
+		return false, nil, nil
+	}
+	userFromDB := &User{}
+	err = json.Unmarshal(response[0].Data, userFromDB)
+	if err != nil {
+		fmt.Println(err)
+		return false, nil, nil
+	}
+	// Set user to context to be used for next steps after this middleware
+	r = r.WithContext(context.WithValue(ctx, "user", userFromDB))
+	r = r.WithContext(context.WithValue(r.Context(), "userID", response[0].uUID))
+	return true, token, r
 }
 
 func (server *ChatServer) handleChatSession(s *Session) {
@@ -235,20 +260,24 @@ func (server *ChatServer) handleIncomingMessage(
 		Username:      s.ChatMember.Username,
 		TimeCreated:   TimeNowIsoString(),
 	}
-	go server.DistributeChatMessageJSON(msg)
 	// [c:SC] is a prefix marking the message as pass through only without saving it
+	uUID := ""
 	if len(text) < 6 || text[0:6] != "[c:SC]" {
 		jsonEntry, err := json.Marshal(msg)
 		if err != nil {
 			return
 		}
-		_, _ = server.DB.Insert(jsonEntry, map[string]string{
+		uUID, _ = server.DB.Insert(jsonEntry, map[string]string{
 			"chatID": s.ChatMember.ChatGroupUUID,
 		})
 	}
+	go server.DistributeChatMessageJSON(&ChatMessageContainer{
+		ChatMessage: msg,
+		UUID:        uUID,
+	})
 }
 
-func (server *ChatServer) DistributeChatMessageJSON(msg *ChatMessage) {
+func (server *ChatServer) DistributeChatMessageJSON(msg *ChatMessageContainer) {
 	server.ChatGroupsMu.RLock()
 	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
 	if ok {

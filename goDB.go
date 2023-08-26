@@ -190,9 +190,14 @@ func (db *GoDB) doInsert(uUID string, data []byte, indices map[string]string) er
 }
 
 // Delete removes an entry from the database
-func (db *GoDB) Delete(uUID string) error {
-	// Lock the entry
-	_ = db.Lock(uUID)
+func (db *GoDB) Delete(uUID, lid string) error {
+	if lid == "" {
+		// Lock entry if it was not locked before
+		lid = db.Lock(uUID)
+		if lid == "" {
+			return errors.New("entry lock failed")
+		}
+	}
 	prevIndex, ok := db.indices["uuid"].index.Get(uUID)
 	if !ok {
 		return nil
@@ -225,7 +230,7 @@ func (db *GoDB) Delete(uUID string) error {
 }
 
 // Update changes an entry in the database
-func (db *GoDB) Update(uUID string, data []byte, indices map[string]string) error {
+func (db *GoDB) Update(uUID string, data []byte, lid string, indices map[string]string) error {
 	indicesClean, err := db.validateIndices(indices, false)
 	if err != nil {
 		return err
@@ -244,7 +249,7 @@ func (db *GoDB) Update(uUID string, data []byte, indices map[string]string) erro
 	}
 	if length > prevIndex.len {
 		// Length exceeded -> Delete, then append to end with same uUID
-		err = db.Delete(uUID)
+		err = db.Delete(uUID, lid)
 		if err != nil {
 			return err
 		}
@@ -255,6 +260,13 @@ func (db *GoDB) Update(uUID string, data []byte, indices map[string]string) erro
 		return nil
 	}
 	// ELSE: Length smaller or same -> Override
+	if lid == "" {
+		// Lock entry if it was not locked before
+		lid = db.Lock(uUID)
+		if lid == "" {
+			return errors.New("entry lock failed")
+		}
+	}
 	// MUTEX LOCK
 	db.dbMutex.Lock()
 	offset := prevIndex.pos
@@ -273,11 +285,16 @@ func (db *GoDB) Update(uUID string, data []byte, indices map[string]string) erro
 func (db *GoDB) Lock(uUID string) (lid string) {
 	lck, _ := uuid.NewV7()
 	lid = lck.String()
+	tries := 0
 	for {
 		ok := db.doLock(uUID, lid)
 		if ok {
 			break
 		} else {
+			tries += 1
+			if tries > 100 {
+				return ""
+			}
 			ticker := time.NewTicker(time.Millisecond * 15)
 			<-ticker.C
 			ticker.Stop()
@@ -291,6 +308,11 @@ func (db *GoDB) doLock(uUID, username string) bool {
 	defer db.ixMutex.Unlock()
 	index, ok := db.indices["uuid"].index.Get(uUID)
 	if !ok {
+		// Return true if entry does not exist
+		return true
+	}
+	if index.value == username {
+		// Return true if entry was already locked by user
 		return true
 	}
 	// Only lock if nobody else locked it
@@ -364,14 +386,18 @@ func (db *GoDB) Select(indices map[string]string, options *SelectOptions) (chan 
 		// Skip an additional maxResults * page results
 		skip += maxResults * page
 	}
-	// Return if all results had been skipped (probably malformed input)
-	if skip >= int64(db.indices["uuid"].index.Len()) {
-		return nil, nil
-	}
 	// Prepare wait group and response channels
 	wg := sync.WaitGroup{}
 	responsesInternal := make(chan *EntryResponse)
 	responsesExternal := make(chan []*EntryResponse)
+	// Return early with no results if everything had been skipped
+	if skip >= int64(db.indices["uuid"].index.Len()) {
+		go func() {
+			responsesExternal <- make([]*EntryResponse, 0)
+			close(responsesExternal)
+		}()
+		return responsesExternal, nil
+	}
 	done := make(chan bool)
 	ctx, cancel := context.WithCancel(context.Background())
 	// Launch index search goroutines
@@ -410,6 +436,9 @@ func (db *GoDB) Select(indices map[string]string, options *SelectOptions) (chan 
 				close(responsesExternal)
 				return
 			case entry := <-responsesInternal:
+				if entry.uUID == "" {
+					continue
+				}
 				if gatherDone {
 					break
 				}
@@ -444,6 +473,11 @@ func (db *GoDB) validateIndices(indices map[string]string, isSelect bool) (map[s
 			continue
 		}
 		if _, present := db.indices[key]; present {
+			// Check if index value exceeds maximum
+			if len(value) > db.DBSettings.ixMaxLength {
+				// Shorten it to the desired length
+				value = value[0:db.DBSettings.ixMaxLength]
+			}
 			indicesClean[key] = value
 		}
 	}
@@ -460,6 +494,7 @@ func (db *GoDB) singleIndexQuery(
 	db.indices[index].ixFileMutex.RLock()
 	// Filter index map
 	var match bool
+	noResults := true
 	db.indices[index].index.Reverse(
 		func(key string, value *Index) bool {
 			select {
@@ -469,12 +504,12 @@ func (db *GoDB) singleIndexQuery(
 				if match = query.MatchString(value.value); match {
 					content, err := db.readFromDB(value.pos, value.len)
 					if err == nil {
-						entryResponse := &EntryResponse{
+						noResults = false
+						responses <- &EntryResponse{
 							uUID:  key,
 							Index: value,
 							Data:  content,
 						}
-						responses <- entryResponse
 					}
 				}
 				return true
@@ -483,6 +518,13 @@ func (db *GoDB) singleIndexQuery(
 	)
 	// MUTEX UNLOCK
 	db.indices[index].ixFileMutex.RUnlock()
+	if noResults {
+		responses <- &EntryResponse{
+			uUID:  "",
+			Index: nil,
+			Data:  nil,
+		}
+	}
 	wg.Done()
 }
 

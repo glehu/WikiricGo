@@ -8,22 +8,60 @@ import (
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
 	"net/http"
+	"regexp"
 	"strings"
+	"time"
 )
 
 type Wisdom struct {
-	Name          string   `json:"t"`
-	Description   string   `json:"desc"`
-	Keywords      string   `json:"keys"`
-	Author        string   `json:"usr"`
-	Type          string   `json:"type"`
-	TimeCreated   string   `json:"ts"`
-	KnowledgeUUID string   `json:"pid"`
-	Categories    []string `json:"cats"`
-	ReferenceUUID string   `json:"ref"` // References another Wisdom e.g. Comment referencing Answer
-	AnalyticsUUID string   `json:"ana"` // Views, likes etc. will be stored in a separate database
-	IsPublic      bool     `json:"pub"`
-	Collaborators []string `json:"coll"`
+	Name                 string   `json:"t"`
+	Description          string   `json:"desc"`
+	Keywords             string   `json:"keys"`
+	Author               string   `json:"usr"`
+	Type                 string   `json:"type"`
+	TimeCreated          string   `json:"ts"`
+	TimeFinished         string   `json:"tsd"`
+	KnowledgeUUID        string   `json:"pid"`
+	Categories           []string `json:"cats"`
+	ReferenceUUID        string   `json:"ref"` // References another Wisdom e.g. Comment referencing Answer
+	AnalyticsUUID        string   `json:"ana"` // Views, likes etc. will be stored in a separate database
+	IsPublic             bool     `json:"pub"`
+	Collaborators        []string `json:"coll"`
+	ThumbnailURL         string   `json:"iurl"`
+	ThumbnailAnimatedURL string   `json:"iurla"`
+	BannerURL            string   `json:"burl"`
+	BannerAnimatedURL    string   `json:"burla"`
+}
+
+type WisdomContainer struct {
+	UUID string
+	*Wisdom
+	*Analytics
+}
+
+type BoxesContainer struct {
+	Boxes []*BoxContainer
+}
+
+type BoxContainer struct {
+	Box   *WisdomContainer
+	Tasks []*WisdomContainer
+}
+
+type QueryResponse struct {
+	TimeSeconds float64            `json:"respTime"`
+	Lessons     []*WisdomContainer `json:"lessons"`
+	Replies     []*WisdomContainer `json:"replies"`
+	Questions   []*WisdomContainer `json:"questions"`
+	Answers     []*WisdomContainer `json:"answers"`
+	Boxes       []*WisdomContainer `json:"boxes"`
+	Tasks       []*WisdomContainer `json:"tasks"`
+	Misc        []*WisdomContainer `json:"misc"`
+}
+
+type WisdomQuery struct {
+	Query string `json:"query"`
+	Type  string `json:"type"`
 }
 
 func OpenWisdomDatabase() *GoDB {
@@ -39,16 +77,25 @@ func (db *GoDB) ProtectedWisdomEndpoints(
 ) {
 	r.Route(
 		"/wisdom/private", func(r chi.Router) {
-			r.Post("/create", db.handleWisdomCreate(chatGroupDB, chatMemberDB, knowledgeDB, notificationDB, connector))
+			r.Post("/create", db.handleWisdomCreate(
+				chatGroupDB, chatMemberDB, knowledgeDB, notificationDB, connector))
+			r.Post("/reply/{wisdomID}", db.handleWisdomReply(
+				chatGroupDB, chatMemberDB, knowledgeDB, notificationDB, connector))
 			r.Post("/react/{wisdomID}", db.handleWisdomReaction(
-				chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB, notificationDB))
-			r.Get("/get/{wisdomID}", db.handleWisdomGet(chatGroupDB, chatMemberDB, knowledgeDB))
-			r.Get("/delete/{wisdomID}", db.handleWisdomDelete(chatGroupDB, chatMemberDB))
+				chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB, notificationDB, connector))
+			r.Post("/query/{knowledgeID}", db.handleWisdomQuery(
+				chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB))
+			r.Get("/get/{wisdomID}", db.handleWisdomGet(
+				chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB))
+			r.Get("/delete/{wisdomID}", db.handleWisdomDelete(
+				chatGroupDB, chatMemberDB, knowledgeDB, notificationDB, analyticsDB, connector))
+			r.Get("/tasks/{knowledgeID}", db.handleWisdomGetTasks(
+				chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB))
 		},
 	)
 }
 
-func (db *GoDB) handleWisdomGet(chatGroupDB, chatMemberDB, knowledgeDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleWisdomGet(chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -74,34 +121,39 @@ func (db *GoDB) handleWisdomGet(chatGroupDB, chatMemberDB, knowledgeDB *GoDB) ht
 			return
 		}
 		// If Wisdom is not public, check member and read right
-		if !wisdom.IsPublic {
-			knowledgeBytes, lidKnowledge := knowledgeDB.Get(wisdom.KnowledgeUUID)
-			if lidKnowledge == "" {
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				return
-			}
-			defer knowledgeDB.Unlock(wisdom.KnowledgeUUID, lidKnowledge)
-			knowledge := &Knowledge{}
-			err = json.Unmarshal(knowledgeBytes.Data, knowledge)
-			if err != nil {
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				return
-			}
-			// Check if user has read rights for the specified chat group
-			_, chatMember, chatGroup, err := GetChatGroupAndMember(
-				chatGroupDB, chatMemberDB, nil, nil,
-				knowledge.ChatGroupUUID, user.Username, "", nil)
-			if err != nil {
-				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
-				return
-			}
-			canRead := CheckReadRights(chatMember.ChatMember, chatGroup.ChatGroup)
-			if !canRead {
-				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
-				return
+		canRead, _ := CheckWisdomAccess(
+			user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		if !canRead {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Is there an analytics entry?
+		analytics := &Analytics{}
+		if wisdom.AnalyticsUUID != "" {
+			anaBytes, lidAna := analyticsDB.Get(wisdom.AnalyticsUUID)
+			if lidAna != "" {
+				err := json.Unmarshal(anaBytes.Data, analytics)
+				if err != nil {
+					analyticsDB.Unlock(wisdom.AnalyticsUUID, lidAna)
+					analytics = &Analytics{}
+				} else {
+					analytics.Views += 1
+					// Asynchronously update view count in database
+					go func() {
+						jsonAna, err := json.Marshal(analytics)
+						if err == nil {
+							_ = analyticsDB.Update(wisdom.AnalyticsUUID, jsonAna, lidAna, map[string]string{})
+						}
+					}()
+				}
 			}
 		}
-		render.JSON(w, r, wisdom)
+		container := &WisdomContainer{
+			UUID:      wisdomID,
+			Wisdom:    wisdom,
+			Analytics: analytics,
+		}
+		render.JSON(w, r, container)
 	}
 }
 
@@ -114,6 +166,13 @@ func (a *Wisdom) Bind(_ *http.Request) error {
 	}
 	if a.Type == "" {
 		return errors.New("missing type")
+	}
+	return nil
+}
+
+func (a *WisdomQuery) Bind(_ *http.Request) error {
+	if a.Query == "" {
+		return errors.New("missing query")
 	}
 	return nil
 }
@@ -134,36 +193,38 @@ func (db *GoDB) handleWisdomCreate(
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		request.Type = strings.ToLower(request.Type)
+		request.Type = strings.TrimSpace(request.Type)
+		if request.Type == "reply" || request.Type == "answer" {
+			http.Error(w, "use reply endpoint for reply or answer",
+				http.StatusBadRequest)
+			return
+		}
+		if request.Type != "lesson" &&
+			request.Type != "question" &&
+			request.Type != "box" &&
+			request.Type != "task" {
+			http.Error(w, "type must be one of lesson or answer or box or task",
+				http.StatusBadRequest)
+			return
+		}
+		if request.Type == "task" {
+			if request.ReferenceUUID == "" {
+				http.Error(w, "refID cannot be empty for tasks",
+					http.StatusBadRequest)
+				return
+			}
+		}
 		// Check member and write right
-		knowledgeBytes, lidKnowledge := knowledgeDB.Get(request.KnowledgeUUID)
-		if lidKnowledge == "" {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-		defer knowledgeDB.Unlock(request.KnowledgeUUID, lidKnowledge)
-		knowledge := &Knowledge{}
-		err := json.Unmarshal(knowledgeBytes.Data, knowledge)
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-		// Check if user has read rights for the specified chat group
-		_, chatMember, chatGroup, err := GetChatGroupAndMember(
-			chatGroupDB, chatMemberDB, nil, nil,
-			knowledge.ChatGroupUUID, user.Username, "", nil)
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
-			return
-		}
-		canWrite := CheckWriteRights(chatMember.ChatMember, chatGroup.ChatGroup)
-		if !canWrite {
+		_, knowledgeAccess := CheckKnowledgeAccess(
+			user, request.KnowledgeUUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		if !knowledgeAccess {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
 		// Sanitize
 		request.Author = user.Username
 		request.TimeCreated = TimeNowIsoString()
-		request.Type = strings.ToLower(request.Type)
 		request.Keywords = strings.ToLower(request.Keywords)
 		if request.Collaborators == nil {
 			request.Collaborators = make([]string, 0)
@@ -178,7 +239,7 @@ func (db *GoDB) handleWisdomCreate(
 			return
 		}
 		uUID, err := db.Insert(jsonEntry, map[string]string{
-			"knowledgeID-type": fmt.Sprintf("%s|%s", knowledgeBytes.uUID, request.Type),
+			"knowledgeID-type": fmt.Sprintf("%s|%s", request.KnowledgeUUID, request.Type),
 			"refID":            request.ReferenceUUID,
 		})
 		// Respond to client
@@ -186,7 +247,9 @@ func (db *GoDB) handleWisdomCreate(
 	}
 }
 
-func (db *GoDB) handleWisdomDelete(chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleWisdomDelete(
+	chatGroupDB, chatMemberDB, knowledgeDB, notificationDB, analyticsDB *GoDB, connector *Connector,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -211,26 +274,30 @@ func (db *GoDB) handleWisdomDelete(chatGroupDB, chatMemberDB *GoDB) http.Handler
 			return
 		}
 		// Check if user has right to delete this Wisdom
-		// User is allowed to delete if:
-		// 		1. User is owner of Wisdom
-		//		2. User is collaborator of Wisdom
-		canDelete := false
-		if wisdom.Author == user.Username {
-			canDelete = true
-		} else {
-			for _, collaborator := range wisdom.Collaborators {
-				if collaborator == user.Username {
-					canDelete = true
-					break
-				}
-			}
-		}
+		_, canDelete := CheckWisdomAccess(user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
 		if canDelete {
-			err := db.Delete(wisdomID)
+			// Is there an Analytics entry?
+			if wisdom.AnalyticsUUID != "" {
+				go func() {
+					_ = analyticsDB.Delete(wisdom.AnalyticsUUID, "")
+				}()
+			}
+			err := db.Delete(wisdomID, lid)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
+			// Create a notification for the author and all collaborators
+			go func() {
+				NotifyWisdomCollaborators(
+					"Wisdom Deleted",
+					fmt.Sprintf("%s deleted %s", user.DisplayName, wisdom.Name),
+					user,
+					wisdom,
+					resp.uUID,
+					notificationDB,
+					connector)
+			}()
 		} else {
 			db.Unlock(wisdomID, lid)
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
@@ -240,7 +307,8 @@ func (db *GoDB) handleWisdomDelete(chatGroupDB, chatMemberDB *GoDB) http.Handler
 }
 
 func (db *GoDB) handleWisdomReaction(
-	chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB, notificationDB *GoDB) http.HandlerFunc {
+	chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB, notificationDB *GoDB, connector *Connector,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -274,38 +342,20 @@ func (db *GoDB) handleWisdomReaction(
 			return
 		}
 		// Check if user has right to react
-		// Check member and write right
-		knowledgeBytes, lidKnowledge := knowledgeDB.Get(wisdom.KnowledgeUUID)
-		if lidKnowledge == "" {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-		defer knowledgeDB.Unlock(wisdom.KnowledgeUUID, lidKnowledge)
-		knowledge := &Knowledge{}
-		err = json.Unmarshal(knowledgeBytes.Data, knowledge)
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-		// Check if user has read rights for the specified chat group
-		_, chatMember, chatGroup, err := GetChatGroupAndMember(
-			chatGroupDB, chatMemberDB, nil, nil,
-			knowledge.ChatGroupUUID, user.Username, "", nil)
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
-			return
-		}
-		canWrite := CheckWriteRights(chatMember.ChatMember, chatGroup.ChatGroup)
-		if !canWrite {
+		// If Wisdom is not public, check member and read right
+		canRead, _ := CheckWisdomAccess(user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		if !canRead {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
 		var analytics *Analytics
 		analyticsUpdate := false
 		var analyticsBytes *EntryResponse
+		lidAna := ""
 		if wisdom.AnalyticsUUID != "" {
-			analyticsBytes, lid = analyticsDB.Get(wisdom.AnalyticsUUID)
-			if lid == "" {
+			analyticsBytes, lidAna = analyticsDB.Get(wisdom.AnalyticsUUID)
+			defer analyticsDB.Unlock(wisdom.AnalyticsUUID, lidAna)
+			if lidAna != "" {
 				analytics = &Analytics{}
 				err = json.Unmarshal(analyticsBytes.Data, analytics)
 				if err != nil {
@@ -317,6 +367,7 @@ func (db *GoDB) handleWisdomReaction(
 			}
 		}
 		// Create analytics if there are none
+		reactionRemoved := false
 		if analytics == nil {
 			analytics = &Analytics{
 				Views:     0,
@@ -341,11 +392,15 @@ func (db *GoDB) handleWisdomReaction(
 				if index != -1 {
 					// Delete
 					reactions = append(reactions[:index], reactions[index+1:]...)
+					reactionRemoved = true
 				} else {
 					// Append
 					reactions = append(reactions, user.Username)
 				}
 				analytics.Reactions[request.Reaction] = reactions
+			} else {
+				// No reaction of this type existed yet
+				analytics.Reactions[request.Reaction] = []string{user.Username}
 			}
 		}
 		analyticsJson, err := json.Marshal(analytics)
@@ -356,7 +411,7 @@ func (db *GoDB) handleWisdomReaction(
 		// Commit changes
 		if analyticsUpdate && analyticsBytes != nil {
 			// Analytics existed -> Update them
-			err = analyticsDB.Update(analyticsBytes.uUID, analyticsJson, map[string]string{})
+			err = analyticsDB.Update(analyticsBytes.uUID, analyticsJson, lidAna, map[string]string{})
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
@@ -374,7 +429,7 @@ func (db *GoDB) handleWisdomReaction(
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
-			err = db.Update(wisdomBytes.uUID, wisdomJson, map[string]string{
+			err = db.Update(wisdomBytes.uUID, wisdomJson, lid, map[string]string{
 				"knowledgeID-type": fmt.Sprintf("%s|%s", wisdom.KnowledgeUUID, wisdom.Type),
 				"refID":            wisdom.ReferenceUUID,
 			})
@@ -383,5 +438,493 @@ func (db *GoDB) handleWisdomReaction(
 				return
 			}
 		}
+		if reactionRemoved {
+			return
+		}
+		// Create a notification for the author and all collaborators
+		NotifyWisdomCollaborators(
+			"Wisdom Reaction",
+			fmt.Sprintf("%s reacted to %s", user.DisplayName, wisdom.Name),
+			user,
+			wisdom,
+			wisdomBytes.uUID,
+			notificationDB,
+			connector)
 	}
+}
+
+func NotifyWisdomCollaborators(title, message string, user *User, wisdom *Wisdom, wisdomID string,
+	notificationDB *GoDB, connector *Connector,
+) {
+	usersToNotify := make([]string, len(wisdom.Collaborators)+1)
+	usersToNotify[0] = wisdom.Author
+	for i, collab := range wisdom.Collaborators {
+		usersToNotify[i+1] = collab
+	}
+	connector.SessionsMu.RLock()
+	defer connector.SessionsMu.RUnlock()
+	for _, collab := range usersToNotify {
+		notification := &Notification{
+			Title:             title,
+			Description:       message,
+			Type:              "info",
+			TimeCreated:       TimeNowIsoString(),
+			RecipientUsername: collab,
+			ClickAction:       "open",
+			ClickModule:       "wisdom",
+			ClickUUID:         fmt.Sprintf("%s", wisdomID),
+		}
+		jsonNotification, err := json.Marshal(notification)
+		if err != nil {
+			continue
+		}
+		notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
+			"username": collab,
+		})
+		if err != nil {
+			continue
+		}
+		// Now send a message via the connector
+		session, ok := connector.Sessions.Get(collab)
+		if !ok {
+			continue
+		}
+		cMSG := &ConnectorMsg{
+			Type:          "[s:NOTIFICATION]",
+			Action:        "info",
+			ReferenceUUID: notificationUUID,
+			Username:      user.DisplayName,
+			Message:       message,
+		}
+		_ = WSSendJSON(session.Conn, session.Ctx, cMSG)
+	}
+}
+
+func CheckWisdomAccess(
+	user *User, wisdom *Wisdom, chatGroupDB, chatMemberDB, knowledgeDB *GoDB, r *http.Request,
+) (canRead, canWrite bool) {
+	// Check if write access is possible
+	canWrite = false
+	if wisdom.Author == user.Username {
+		canWrite = true
+	} else {
+		for _, collaborator := range wisdom.Collaborators {
+			if collaborator == user.Username {
+				canWrite = true
+				break
+			}
+		}
+	}
+	// Public wisdom does not require checking
+	if wisdom.IsPublic {
+		return true, canWrite
+	}
+	knowledgeBytes, lidKnowledge := knowledgeDB.Get(wisdom.KnowledgeUUID)
+	if lidKnowledge == "" {
+		return false, false
+	}
+	defer knowledgeDB.Unlock(wisdom.KnowledgeUUID, lidKnowledge)
+	knowledge := &Knowledge{}
+	err := json.Unmarshal(knowledgeBytes.Data, knowledge)
+	if err != nil {
+		return false, false
+	}
+	// Check if user has read rights for the specified chat group
+	_, chatMember, chatGroup, err := ReadChatGroupAndMember(
+		chatGroupDB, chatMemberDB, nil, nil,
+		knowledge.ChatGroupUUID, user.Username, "", r)
+	if err != nil {
+		return false, false
+	}
+	canRead = CheckReadRights(chatMember.ChatMember, chatGroup.ChatGroup)
+	return canRead, canWrite
+}
+
+func CheckKnowledgeAccess(
+	user *User, knowledgeID string, chatGroupDB, chatMemberDB, knowledgeDB *GoDB, r *http.Request,
+) (canRead bool, canWrite bool) {
+	knowledgeBytes, lidKnowledge := knowledgeDB.Get(knowledgeID)
+	if lidKnowledge == "" {
+		return false, false
+	}
+	defer knowledgeDB.Unlock(knowledgeID, lidKnowledge)
+	knowledge := &Knowledge{}
+	err := json.Unmarshal(knowledgeBytes.Data, knowledge)
+	if err != nil {
+		return false, false
+	}
+	// Check if user has read rights for the specified chat group
+	_, chatMember, chatGroup, err := ReadChatGroupAndMember(
+		chatGroupDB, chatMemberDB, nil, nil,
+		knowledge.ChatGroupUUID, user.Username, "", r)
+	if err != nil {
+		return false, false
+	}
+	canRead = CheckWriteRights(chatMember.ChatMember, chatGroup.ChatGroup)
+	canWrite = CheckWriteRights(chatMember.ChatMember, chatGroup.ChatGroup)
+	return canRead, canWrite
+}
+
+func (db *GoDB) handleWisdomReply(
+	chatGroupDB, chatMemberDB, notificationDB, knowledgeDB *GoDB, connector *Connector,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		// Retrieve POST payload
+		request := &Wisdom{}
+		if err := render.Bind(r, request); err != nil {
+			fmt.Println(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if request.ReferenceUUID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		request.Type = strings.ToLower(request.Type)
+		if request.Type != "reply" && request.Type != "answer" {
+			http.Error(w, "type must be one of reply or answer", http.StatusBadRequest)
+			return
+		}
+		// Check member and write right
+		_, knowledgeAccess := CheckKnowledgeAccess(
+			user, request.KnowledgeUUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		if !knowledgeAccess {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Does the referenced Wisdom exist?
+		respRef, lidRef := db.Get(request.ReferenceUUID)
+		if lidRef == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Does the referenced Wisdom belong to the same Knowledge?
+		wisdomRef := &Wisdom{}
+		err := json.Unmarshal(respRef.Data, wisdomRef)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if wisdomRef.KnowledgeUUID != request.KnowledgeUUID {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Sanitize
+		request.Author = user.Username
+		request.TimeCreated = TimeNowIsoString()
+		request.Keywords = strings.ToLower(request.Keywords)
+		// Add referenced Wisdom's keywords
+		request.Keywords += "," + wisdomRef.Keywords
+		if request.Collaborators == nil {
+			request.Collaborators = make([]string, 0)
+		}
+		if request.Categories == nil {
+			request.Categories = make([]string, 0)
+		}
+		// Store
+		jsonEntry, err := json.Marshal(request)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		uUID, err := db.Insert(jsonEntry, map[string]string{
+			"knowledgeID-type": fmt.Sprintf("%s|%s", request.KnowledgeUUID, request.Type),
+			"refID":            request.ReferenceUUID,
+		})
+		// Respond to client
+		_, _ = fmt.Fprintln(w, uUID)
+		// Create a notification for the author and all collaborators
+		NotifyWisdomCollaborators(
+			"Wisdom Reply",
+			fmt.Sprintf("%s replied to %s", user.DisplayName, wisdomRef.Name),
+			user,
+			wisdomRef,
+			respRef.uUID,
+			notificationDB,
+			connector)
+	}
+}
+
+func (db *GoDB) handleWisdomGetTasks(
+	chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB *GoDB,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		knowledgeID := chi.URLParam(r, "knowledgeID")
+		if knowledgeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		knowledgeEntry, lidKnowledge := knowledgeDB.Get(knowledgeID)
+		if lidKnowledge == "" {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		knowledgeDB.Unlock(knowledgeID, lidKnowledge)
+		knowledge := &Knowledge{}
+		err := json.Unmarshal(knowledgeEntry.Data, knowledge)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check member and write right
+		knowledgeAccess, _ := CheckKnowledgeAccess(
+			user, knowledgeEntry.uUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		if !knowledgeAccess {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Now retrieve all boxes (Wisdom with type box)
+		// Boxes contain tasks which we will retrieve afterwards
+		resp, err := db.Select(map[string]string{
+			"knowledgeID-type": fmt.Sprintf("^%s\\|box$", knowledgeEntry.uUID),
+		}, nil)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		response := <-resp
+		boxes := &BoxesContainer{Boxes: make([]*BoxContainer, 0)}
+		if len(response) < 1 {
+			render.JSON(w, r, boxes)
+			return
+		}
+		var box *Wisdom
+		var analytics *Analytics
+		for _, entry := range response {
+			box = &Wisdom{}
+			err = json.Unmarshal(entry.Data, box)
+			if err != nil {
+				continue
+			}
+			// Load analytics if available
+			analytics = &Analytics{}
+			if box.AnalyticsUUID != "" {
+				anaBytes, lidAna := analyticsDB.Get(box.AnalyticsUUID)
+				if lidAna != "" {
+					analyticsDB.Unlock(box.AnalyticsUUID, lidAna)
+					err = json.Unmarshal(anaBytes.Data, analytics)
+					if err != nil {
+						analytics = &Analytics{}
+					}
+				}
+			}
+			// Append box to boxes
+			boxes.Boxes = append(boxes.Boxes, &BoxContainer{
+				Box: &WisdomContainer{
+					UUID:      entry.uUID,
+					Wisdom:    box,
+					Analytics: analytics,
+				},
+				Tasks: make([]*WisdomContainer, 0),
+			})
+		}
+		// For each box get all tasks (Wisdom with type task) TODO: Make asynchronous
+		var task *Wisdom
+		var taskQuery string
+		for bi, boxCon := range boxes.Boxes {
+			taskQuery = fmt.Sprintf("^%s", boxCon.Box.UUID)
+			respTask, err := db.Select(map[string]string{
+				"refID": taskQuery,
+			}, nil)
+			if err != nil {
+				continue
+			}
+			responseTask := <-respTask
+			if len(responseTask) < 1 {
+				continue
+			}
+			for _, taskEntry := range responseTask {
+				task = &Wisdom{}
+				err = json.Unmarshal(taskEntry.Data, task)
+				if err != nil {
+					continue
+				}
+				// Load analytics if available
+				analytics = &Analytics{}
+				if task.AnalyticsUUID != "" {
+					anaBytes, lidAna := analyticsDB.Get(task.AnalyticsUUID)
+					if lidAna != "" {
+						analyticsDB.Unlock(task.AnalyticsUUID, lidAna)
+						err = json.Unmarshal(anaBytes.Data, analytics)
+						if err != nil {
+							analytics = &Analytics{}
+						}
+					}
+				}
+				boxes.Boxes[bi].Tasks = append(boxes.Boxes[bi].Tasks, &WisdomContainer{
+					UUID:      taskEntry.uUID,
+					Wisdom:    task,
+					Analytics: analytics,
+				})
+			}
+		}
+		// Return to client
+		render.JSON(w, r, boxes)
+	}
+}
+
+func (db *GoDB) handleWisdomQuery(
+	chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB *GoDB,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		timeStart := time.Now()
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		knowledgeID := chi.URLParam(r, "knowledgeID")
+		if knowledgeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		canRead, _ := CheckKnowledgeAccess(user, knowledgeID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		if !canRead {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Retrieve POST payload
+		request := &WisdomQuery{}
+		if err := render.Bind(r, request); err != nil {
+			fmt.Println(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Retrieve all Wisdom entries
+		typeQuery := request.Type
+		if typeQuery == "" {
+			typeQuery = ".+"
+		}
+		ixQuery := fmt.Sprintf("^%s|%s$", knowledgeID, typeQuery)
+		resp, err := db.Select(map[string]string{
+			"knowledgeID-type": ixQuery,
+		}, nil)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		queryResponse := &QueryResponse{
+			TimeSeconds: 0,
+			Lessons:     make([]*WisdomContainer, 0),
+			Replies:     make([]*WisdomContainer, 0),
+			Questions:   make([]*WisdomContainer, 0),
+			Answers:     make([]*WisdomContainer, 0),
+			Boxes:       make([]*WisdomContainer, 0),
+			Tasks:       make([]*WisdomContainer, 0),
+			Misc:        make([]*WisdomContainer, 0),
+		}
+		response := <-resp
+		if len(response) < 1 {
+			render.JSON(w, r, queryResponse)
+			return
+		}
+		var container *WisdomContainer
+		var wisdom *Wisdom
+		var analytics *Analytics
+		var points float64
+		for _, entry := range response {
+			wisdom = &Wisdom{}
+			err = json.Unmarshal(entry.Data, wisdom)
+			if err != nil {
+				continue
+			}
+			points = GetWisdomQueryPoints(wisdom, request)
+			if points <= 0.0 {
+				continue
+			}
+			// Load analytics if available
+			analytics = &Analytics{}
+			if wisdom.AnalyticsUUID != "" {
+				anaBytes, lidAna := analyticsDB.Get(wisdom.AnalyticsUUID)
+				if lidAna != "" {
+					analyticsDB.Unlock(wisdom.AnalyticsUUID, lidAna)
+					err = json.Unmarshal(anaBytes.Data, analytics)
+					if err != nil {
+						analytics = &Analytics{}
+					}
+				}
+			}
+			container = &WisdomContainer{
+				UUID:      entry.uUID,
+				Wisdom:    wisdom,
+				Analytics: analytics,
+			}
+			switch wisdom.Type {
+			case "lesson":
+				queryResponse.Lessons = append(queryResponse.Lessons, container)
+			case "reply":
+				queryResponse.Replies = append(queryResponse.Replies, container)
+			case "question":
+				queryResponse.Questions = append(queryResponse.Questions, container)
+			case "answer":
+				queryResponse.Answers = append(queryResponse.Answers, container)
+			case "box":
+				queryResponse.Boxes = append(queryResponse.Boxes, container)
+			case "task":
+				queryResponse.Tasks = append(queryResponse.Tasks, container)
+			}
+		}
+		duration := time.Since(timeStart)
+		queryResponse.TimeSeconds = duration.Seconds()
+		render.JSON(w, r, queryResponse)
+	}
+}
+
+func GetWisdomQueryPoints(wisdom *Wisdom, query *WisdomQuery) float64 {
+	// Turn query text into a full regex pattern
+	p := GetRegexQuery(query.Query)
+	// Get all matches in selected fields
+	mUser := p.FindAllString(wisdom.Author, -1)
+	mName := p.FindAllString(wisdom.Name, -1)
+	mDesc := p.FindAllString(wisdom.Description, -1)
+	mKeys := p.FindAllString(wisdom.Keywords, -1)
+	if len(mUser) < 1 && len(mName) < 1 && len(mDesc) < 1 && len(mKeys) < 1 {
+		// Return 0 if there were no matches
+		return 0.0
+	}
+	// Calculate points
+	// TODO
+	points := 100.0
+	return points
+}
+
+func GetRegexQuery(query string) *regexp.Regexp {
+	// Remove leading and trailing spaces
+	clean := strings.TrimSpace(query)
+	if clean == "" {
+		return nil
+	}
+	// Replace duplicate spaces with singular spaces
+	spaces := regexp.MustCompile("\\s+")
+	clean = spaces.ReplaceAllString(clean, " ")
+	// Split query into words
+	words := strings.Split(clean, " ")
+	// A single word query would look like this:
+	//  (word(?!.*word))
+	// Where (?!.*word) is used as a negative look behind to ensure no duplicates to be matched
+	// Example:
+	//  word word word
+	//            ^^^^ <- Match
+	builder := &strings.Builder{}
+	for i, word := range words {
+		if i > 0 {
+			builder.WriteString("|")
+		}
+		builder.WriteString("(")
+		builder.WriteString(word)
+		builder.WriteString("(?!.*")
+		builder.WriteString(word)
+		builder.WriteString("))")
+	}
+	return regexp.MustCompile(builder.String())
 }
