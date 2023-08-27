@@ -238,12 +238,17 @@ func (server *ChatServer) handleChatSession(s *Session) {
 
 func (server *ChatServer) dropConnection(s *Session) {
 	server.ChatGroupsMu.Lock()
+	defer server.ChatGroupsMu.Unlock()
 	sessions, ok := server.ChatGroups.Get(s.ChatMember.ChatGroupUUID)
 	if ok {
-		sessions[s.ChatMember.Username] = nil
-		server.ChatGroups.Set(s.ChatMember.ChatGroupUUID, sessions)
+		delete(sessions, s.ChatMember.Username)
+		// Are there any connections left? If not, then delete the chat session
+		if len(sessions) < 1 {
+			server.ChatGroups.Delete(s.ChatMember.ChatGroupUUID)
+		} else {
+			server.ChatGroups.Set(s.ChatMember.ChatGroupUUID, sessions)
+		}
 	}
-	server.ChatGroupsMu.Unlock()
 }
 
 func (server *ChatServer) handleIncomingMessage(

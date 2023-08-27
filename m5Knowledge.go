@@ -35,8 +35,9 @@ func (db *GoDB) ProtectedKnowledgeEndpoints(
 ) {
 	r.Route(
 		"/knowledge/private", func(r chi.Router) {
-			r.Get("/get/{knowledgeID}", db.handleKnowledgeGet(chatGroupDB, chatMemberDB))
 			r.Post("/create", db.handleKnowledgeCreate(chatGroupDB, chatMemberDB, chatServer))
+			r.Post("/cats/mod/{knowledgeID}", db.handleKnowledgeCategoryModification())
+			r.Get("/get/{knowledgeID}", db.handleKnowledgeGet(chatGroupDB, chatMemberDB))
 		},
 	)
 }
@@ -47,6 +48,13 @@ func (a *Knowledge) Bind(_ *http.Request) error {
 	}
 	if a.ChatGroupUUID == "" {
 		return errors.New("missing chatID")
+	}
+	return nil
+}
+
+func (a *Category) Bind(_ *http.Request) error {
+	if a.Name == "" {
+		return errors.New("missing name")
 	}
 	return nil
 }
@@ -138,5 +146,81 @@ func (db *GoDB) handleKnowledgeGet(chatGroupDB, chatMemberDB *GoDB) http.Handler
 			return
 		}
 		render.JSON(w, r, knowledge)
+	}
+}
+
+func (db *GoDB) handleKnowledgeCategoryModification() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		knowledgeID := chi.URLParam(r, "knowledgeID")
+		if knowledgeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Check if the category should be deleted
+		doDeleteTmp := r.URL.Query().Get("del")
+		doDelete := false
+		if doDeleteTmp != "" {
+			if doDeleteTmp == "true" {
+				doDelete = true
+			}
+		}
+		// Retrieve POST payload
+		request := &Category{}
+		if err := render.Bind(r, request); err != nil {
+			fmt.Println(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Retrieve chat group
+		response, lid := db.Get(knowledgeID)
+		if lid == "" {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		defer db.Unlock(knowledgeID, lid)
+		knowledge := &Knowledge{}
+		err := json.Unmarshal(response.Data, knowledge)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if role is present
+		index := -1
+		for ix, role := range knowledge.Categories {
+			if role.Name == request.Name {
+				index = ix
+				break
+			}
+		}
+		if doDelete && index == -1 {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		if doDelete {
+			knowledge.Categories = append(knowledge.Categories[:index], knowledge.Categories[index+1:]...)
+		} else {
+			// Did it exist yet?
+			if index == -1 {
+				knowledge.Categories = append(knowledge.Categories, *request)
+			} else {
+				knowledge.Categories[index] = *request
+			}
+		}
+		jsonEntry, err := json.Marshal(knowledge)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		err = db.Update(response.uUID, jsonEntry, lid, map[string]string{})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
 	}
 }

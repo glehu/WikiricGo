@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +32,7 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
 	notificationDB, knowledgeDB, wisdomDB *GoDB,
 	chatServer *ChatServer, connector *Connector,
 ) {
+	startTime := time.Now()
 	fmt.Println(":: INIT SERVER")
 	cs = _cs
 	// Initialize JWT Authenticator
@@ -46,10 +48,14 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
 			httprate.WithKeyFuncs(httprate.KeyByIP, httprate.KeyByEndpoint),
 		),
 	)
+	// Debug
+	callCounter := &atomic.Int64{}
+	// Pagination Middleware
 	r.Use(PaginationMiddleware())
+	r.Use(CallCounterMiddleware(callCounter))
 	// Routes -> Public
 	setPublicRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB,
-		notificationDB, chatServer, connector)
+		notificationDB, chatServer, connector, callCounter, startTime)
 	// -> Basic Auth
 	setBasicProtectedRoutes(r, userDB)
 	// -> JWT Bearer Auth
@@ -141,9 +147,10 @@ func setShutdownURL(r chi.Router) {
 
 func setPublicRoutes(r chi.Router,
 	userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB, notificationDB *GoDB,
-	chatServer *ChatServer, connector *Connector,
+	chatServer *ChatServer, connector *Connector, callCounter *atomic.Int64, startTime time.Time,
 ) {
 	r.Get("/sample", sampleMessage)
+	r.Get("/debug", handleDebugEndpoint(chatServer, connector, callCounter, startTime))
 	vueJSWikiricEndpoint(r)
 	// Users
 	userDB.PublicUserEndpoints(r, tokenAuth, notificationDB)
@@ -416,5 +423,60 @@ func PaginationMiddleware() func(next http.Handler) http.Handler {
 				next.ServeHTTP(w, r.WithContext(ctx))
 			},
 		)
+	}
+}
+
+func CallCounterMiddleware(c *atomic.Int64) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(
+			func(w http.ResponseWriter, r *http.Request) {
+				go func() {
+					c.Add(1)
+				}()
+				next.ServeHTTP(w, r)
+			})
+	}
+}
+
+func handleDebugEndpoint(
+	cs *ChatServer, c *Connector, callCounter *atomic.Int64, startTime time.Time,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sb := &strings.Builder{}
+		sb.WriteString("*** *** *** *** *** *** *** ***\n")
+		sb.WriteString("*** WIKIRIC  BACKEND  DEBUG ***\n")
+		sb.WriteString("*** *** *** *** *** *** *** ***\n")
+		// Get all open chat sessions + connections
+		chatSessions := 0
+		chatUserSessions := 0
+		cs.ChatGroups.Reverse(
+			func(key string, value map[string]*Session) bool {
+				chatSessions += 1
+				chatUserSessions += len(value)
+				return true
+			},
+		)
+		sb.WriteString("\n[ CHAT ]\n")
+		sb.WriteString(fmt.Sprintf("Chat Sessions: %d\n", chatSessions))
+		sb.WriteString(fmt.Sprintf("User Sessions: %d\n", chatUserSessions))
+		// Get all connector sessions
+		sb.WriteString("\n[ CONNECTOR ]\n")
+		sb.WriteString(fmt.Sprintf("User Sessions: %d\n", c.Sessions.Len()))
+		// Current API call count
+		sb.WriteString("\n[ HTTP ]\n")
+		sb.WriteString(fmt.Sprintf("Request Count: %d\n", callCounter.Load()))
+		// Sys
+		sb.WriteString("\n[ SYSTEM ]\n")
+		lastReboot := startTime.Format(time.RFC3339)
+		lastReboot = strings.Replace(lastReboot, "T", " ", 1)
+		sb.WriteString(fmt.Sprintf("Last Reboot:   %s\n", lastReboot))
+		timeSince := time.Since(startTime)
+		if timeSince.Hours() < 1 {
+			sb.WriteString(fmt.Sprintf("Uptime Mins:   %.2f\n", timeSince.Minutes()))
+		} else {
+			sb.WriteString(fmt.Sprintf("Uptime Hours:  %.2f\n", timeSince.Hours()))
+		}
+		// Return to client
+		_, _ = w.Write([]byte(sb.String()))
 	}
 }

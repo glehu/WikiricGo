@@ -530,6 +530,7 @@ func (db *GoDB) handleChatGroupRoleModification() http.HandlerFunc {
 		}
 	}
 }
+
 func (db *GoDB) handleChatMemberRoleModification(chatMemberDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
