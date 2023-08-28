@@ -41,13 +41,11 @@ func OpenNotificationDatabase() *GoDB {
 func (db *GoDB) ProtectedNotificationEndpoints(
 	r chi.Router, tokenAuth *jwtauth.JWTAuth,
 ) {
-	r.Route(
-		"/notification/private", func(r chi.Router) {
-			r.Get("/read", db.handleNotificationRead())
-			r.Get("/get/{notificationID}", db.handleNotificationGet())
-			r.Get("/delete/{notificationID}", db.handleNotificationDelete())
-		},
-	)
+	r.Route("/notification/private", func(r chi.Router) {
+		r.Get("/read", db.handleNotificationRead())
+		r.Get("/get/{notificationID}", db.handleNotificationGet())
+		r.Get("/delete/{notificationID}", db.handleNotificationDelete())
+	})
 }
 
 func (db *GoDB) handleNotificationGet() http.HandlerFunc {

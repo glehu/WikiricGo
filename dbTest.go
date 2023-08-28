@@ -42,20 +42,20 @@ func testStore(db *GoDB) {
 	fmt.Println(">>> DEBUG DB STORE START")
 	time.Sleep(time.Second)
 	start := time.Now()
+	// Serialize data
+	data, err := json.Marshal(&SampleEntry{
+		Field:       "Sample Contact",
+		Description: "Mr Sample Name",
+		Age:         0,
+		Website:     true,
+		Skills:      map[string]string{"german": "native", "english": "veri nais"},
+	})
+	if err != nil {
+		log.Panic(":: DEBUG ERROR serializing", err)
+	}
 	// Store data in database
-	for i := 1; i <= 1; i++ {
+	for i := 1; i <= 500_000; i++ {
 		count := fmt.Sprintf("%d", i)
-		// Serialize data
-		data, err := json.Marshal(&SampleEntry{
-			Field:       "Sample Contact",
-			Description: "Mr Sample Name " + count,
-			Age:         i,
-			Website:     true,
-			Skills:      map[string]string{"german": "native", "english": "veri nais"},
-		})
-		if err != nil {
-			log.Panic(":: DEBUG ERROR serializing", err)
-		}
 		// Insert into db
 		_, err = db.Insert(data, map[string]string{
 			"count": count,
@@ -78,7 +78,7 @@ func testSelect(db *GoDB) string {
 	start := time.Now()
 	// Retrieve data from database
 	resp, err := db.Select(map[string]string{
-		"count": "^1000000$",
+		"count": "^1337$",
 	}, &SelectOptions{
 		MaxResults: 1,
 		Page:       0,

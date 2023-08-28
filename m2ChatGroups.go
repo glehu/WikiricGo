@@ -79,10 +79,8 @@ func (db *GoDB) ProtectedChatGroupEndpoints(r chi.Router, tokenAuth *jwtauth.JWT
 			r.Post("/roles/mod/{chatID}", db.handleChatMemberRoleModification(chatMemberDB))
 			r.Get("/members/{chatID}", db.handleChatGroupGetMembers(chatMemberDB))
 			r.Get("/friends", db.handleGetFriends(chatMemberDB))
-		},
-		)
-	},
-	)
+		})
+	})
 }
 
 func (db *GoDB) handleChatGroupCreate(userDB, chatMemberDB *GoDB) http.HandlerFunc {
@@ -400,7 +398,10 @@ func ReadChatGroupAndMember(
 			UUID:      dataMain.uUID,
 		}
 	} else {
-		chatGroupMainEntry = nil
+		chatGroupMainEntry = &ChatGroupEntry{
+			ChatGroup: chatGroupOriginal,
+			UUID:      dataOriginal.uUID,
+		}
 	}
 	chatMemberEntry := &ChatMemberEntry{
 		ChatMember: chatMember,

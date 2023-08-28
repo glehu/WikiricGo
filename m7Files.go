@@ -61,8 +61,7 @@ func (db *GoDB) ProtectedFileEndpoints(
 	r.Route("/files/private", func(r chi.Router) {
 		r.Post("/create", db.handleFileCreate(userDB, chatGroupDB, chatMemberDB))
 		r.Get("/meta/{fileID}", db.handleFileMetaGet(chatGroupDB, chatMemberDB))
-	},
-	)
+	})
 }
 
 func OpenFilesDatabase() *GoDB {

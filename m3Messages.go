@@ -26,7 +26,12 @@ type ChatMessageReaction struct {
 
 type ChatMessageContainer struct {
 	*ChatMessage
+	*Analytics
 	UUID string
+}
+
+type ChatMessagesResponse struct {
+	Messages []*ChatMessageContainer `json:"messages"`
 }
 
 type ChatActionMessage struct {
@@ -46,18 +51,15 @@ func OpenChatMessageDatabase() *GoDB {
 func (db *GoDB) ProtectedChatMessagesEndpoints(
 	r chi.Router, tokenAuth *jwtauth.JWTAuth, chatServer *ChatServer, chatGroupDB, chatMemberDB, analyticsDB *GoDB,
 ) {
-	r.Route(
-		"/msg/private", func(r chi.Router) {
-			r.Post("/create", db.handleChatMessageCreate(chatServer, chatGroupDB, chatMemberDB))
-			r.Post("/edit/{msgID}", db.handleChatMessageEdit(chatServer, chatGroupDB, chatMemberDB))
-			r.Post("/react/{msgID}", db.handleChatMessageReaction(chatServer, chatGroupDB, chatMemberDB, analyticsDB))
-			r.Get("/delete/{msgID}", db.handleChatMessageDelete(chatServer, chatGroupDB, chatMemberDB))
-			r.Route("/chat", func(r chi.Router) {
-				r.Get("/get/{chatID}", db.handleChatMessageFromChat(chatServer, chatGroupDB, chatMemberDB))
-			},
-			)
-		},
-	)
+	r.Route("/msg/private", func(r chi.Router) {
+		r.Post("/create", db.handleChatMessageCreate(chatServer, chatGroupDB, chatMemberDB))
+		r.Post("/edit/{msgID}", db.handleChatMessageEdit(chatServer, chatGroupDB, chatMemberDB))
+		r.Post("/react/{msgID}", db.handleChatMessageReaction(chatServer, chatGroupDB, chatMemberDB, analyticsDB))
+		r.Get("/delete/{msgID}", db.handleChatMessageDelete(chatServer, chatGroupDB, chatMemberDB))
+		r.Route("/chat", func(r chi.Router) {
+			r.Get("/get/{chatID}", db.handleChatMessageFromChat(chatServer, chatGroupDB, chatMemberDB, analyticsDB))
+		})
+	})
 }
 
 func (db *GoDB) handleChatMessageCreate(chatServer *ChatServer, chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
@@ -198,7 +200,9 @@ func (a *ChatMessageReaction) Bind(_ *http.Request) error {
 	return nil
 }
 
-func (db *GoDB) handleChatMessageFromChat(chatServer *ChatServer, chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleChatMessageFromChat(
+	chatServer *ChatServer, chatGroupDB, chatMemberDB, analyticsDB *GoDB,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -231,6 +235,9 @@ func (db *GoDB) handleChatMessageFromChat(chatServer *ChatServer, chatGroupDB, c
 		}
 		// Options?
 		options := r.Context().Value("pagination").(*SelectOptions)
+		if options.MaxResults <= 0 {
+			options.MaxResults = 50
+		}
 		// Retrieve messages from this chat group
 		resp, err := db.Select(map[string]string{
 			"chatID": chatID,
@@ -240,20 +247,32 @@ func (db *GoDB) handleChatMessageFromChat(chatServer *ChatServer, chatGroupDB, c
 			return
 		}
 		response := <-resp
+		messages := ChatMessagesResponse{Messages: make([]*ChatMessageContainer, len(response))}
 		if len(response) < 1 {
-			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			render.JSON(w, r, messages)
 			return
 		}
-		messages := make([]*ChatMessageContainer, len(response))
 		for i, result := range response {
 			msg := &ChatMessage{}
 			err = json.Unmarshal(result.Data, msg)
 			if err == nil {
+				analytics := &Analytics{}
+				if msg.AnalyticsUUID != "" {
+					anaBytes, lidAna := analyticsDB.Get(msg.AnalyticsUUID)
+					if lidAna != "" {
+						analyticsDB.Unlock(msg.AnalyticsUUID, lidAna)
+						err = json.Unmarshal(anaBytes.Data, analytics)
+						if err != nil {
+							analytics = &Analytics{}
+						}
+					}
+				}
 				container := &ChatMessageContainer{
 					ChatMessage: msg,
+					Analytics:   analytics,
 					UUID:        result.uUID,
 				}
-				messages[i] = container
+				messages.Messages[i] = container
 			}
 		}
 		render.JSON(w, r, messages)

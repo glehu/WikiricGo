@@ -49,7 +49,8 @@ func (member *ChatMember) GetRoleInformation(group *ChatGroup) *ChatRole {
 		if ix != -1 {
 			// Role found
 			if userRole == nil {
-				userRole = &role
+				tmp := role
+				userRole = &tmp
 			}
 			if role.IsAdmin {
 				userRole.IsAdmin = true

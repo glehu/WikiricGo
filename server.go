@@ -29,7 +29,7 @@ var cs chan bool
 func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
 	userDB, chatGroupDB,
 	chatMemberDB, chatMessagesDB, fileDB, analyticsDB,
-	notificationDB, knowledgeDB, wisdomDB *GoDB,
+	notificationDB, knowledgeDB, wisdomDB, processDB *GoDB,
 	chatServer *ChatServer, connector *Connector,
 ) {
 	startTime := time.Now()
@@ -60,7 +60,7 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
 	setBasicProtectedRoutes(r, userDB)
 	// -> JWT Bearer Auth
 	setJWTProtectedRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB,
-		analyticsDB, notificationDB, knowledgeDB, wisdomDB, chatServer, connector)
+		analyticsDB, notificationDB, knowledgeDB, wisdomDB, processDB, chatServer, connector)
 	// Shutdown URL
 	setShutdownURL(r)
 	// Start Server
@@ -181,7 +181,7 @@ func setBasicProtectedRoutes(r chi.Router, userDB *GoDB) {
 
 func setJWTProtectedRoutes(
 	r chi.Router, userDB, chatGroupDB, chatMessagesDB, chatMemberDB,
-	fileDB, analyticsDB, notificationDB, knowledgeDB, wisdomDB *GoDB,
+	fileDB, analyticsDB, notificationDB, knowledgeDB, wisdomDB, processDB *GoDB,
 	chatServer *ChatServer, connector *Connector,
 ) {
 	r.Group(
@@ -212,6 +212,9 @@ func setJWTProtectedRoutes(
 			knowledgeDB.ProtectedKnowledgeEndpoints(r, tokenAuth, chatGroupDB, chatMemberDB, chatServer)
 			// #### Wisdom
 			wisdomDB.ProtectedWisdomEndpoints(r, tokenAuth,
+				chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, analyticsDB, connector)
+			// #### Processes
+			processDB.ProtectedProcessEndpoints(r, tokenAuth,
 				chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, analyticsDB, connector)
 		},
 	)
@@ -385,8 +388,8 @@ func PaginationMiddleware() func(next http.Handler) http.Handler {
 								page = 0
 							} else {
 								// Sanitize
-								if page < -1 {
-									page = -1
+								if page < 1 {
+									page = 0
 								}
 							}
 						} else {
@@ -406,8 +409,8 @@ func PaginationMiddleware() func(next http.Handler) http.Handler {
 						skip = 0
 					} else {
 						// Sanitize
-						if skip < -1 {
-							skip = -1
+						if skip < 0 {
+							skip = 0
 						}
 					}
 				} else {

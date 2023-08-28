@@ -25,7 +25,9 @@ type Knowledge struct {
 
 func OpenKnowledgeDatabase() *GoDB {
 	db := OpenDB(
-		"knowledge", []string{},
+		"knowledge", []string{
+			"chatID",
+		},
 	)
 	return db
 }
@@ -33,13 +35,12 @@ func OpenKnowledgeDatabase() *GoDB {
 func (db *GoDB) ProtectedKnowledgeEndpoints(
 	r chi.Router, tokenAuth *jwtauth.JWTAuth, chatGroupDB, chatMemberDB *GoDB, chatServer *ChatServer,
 ) {
-	r.Route(
-		"/knowledge/private", func(r chi.Router) {
-			r.Post("/create", db.handleKnowledgeCreate(chatGroupDB, chatMemberDB, chatServer))
-			r.Post("/cats/mod/{knowledgeID}", db.handleKnowledgeCategoryModification())
-			r.Get("/get/{knowledgeID}", db.handleKnowledgeGet(chatGroupDB, chatMemberDB))
-		},
-	)
+	r.Route("/knowledge/private", func(r chi.Router) {
+		r.Post("/create", db.handleKnowledgeCreate(chatGroupDB, chatMemberDB, chatServer))
+		r.Post("/cats/mod/{knowledgeID}", db.handleKnowledgeCategoryModification())
+		r.Get("/get/{knowledgeID}", db.handleKnowledgeGet(chatGroupDB, chatMemberDB))
+		r.Get("/chat/{chatID}", db.handleKnowledgeGetFromChatID(chatGroupDB, chatMemberDB))
+	})
 }
 
 func (a *Knowledge) Bind(_ *http.Request) error {
@@ -98,7 +99,9 @@ func (db *GoDB) handleKnowledgeCreate(chatGroupDB, chatMemberDB *GoDB, chatServe
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		uUID, err := db.Insert(jsonEntry, map[string]string{})
+		uUID, err := db.Insert(jsonEntry, map[string]string{
+			"chatID": request.ChatGroupUUID,
+		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -127,6 +130,59 @@ func (db *GoDB) handleKnowledgeGet(chatGroupDB, chatMemberDB *GoDB) http.Handler
 		defer db.Unlock(knowledgeID, lid)
 		knowledge := &Knowledge{}
 		err := json.Unmarshal(response.Data, knowledge)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if user has read rights for the specified chat group
+		_, chatMember, chatGroup, err := ReadChatGroupAndMember(
+			chatGroupDB, chatMemberDB, nil, nil,
+			knowledge.ChatGroupUUID, user.Username, "", r)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		canRead := CheckReadRights(chatMember.ChatMember, chatGroup.ChatGroup)
+		if !canRead {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		render.JSON(w, r, knowledge)
+	}
+}
+
+func (db *GoDB) handleKnowledgeGetFromChatID(chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		chatID := chi.URLParam(r, "knowledgeID")
+		if chatID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		query := fmt.Sprintf("^%s$", chatID)
+		resp, err := db.Select(map[string]string{
+			"chatID": query,
+		}, &SelectOptions{
+			MaxResults: 1,
+			Page:       0,
+			Skip:       0,
+		})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		response := <-resp
+		if len(response) < 1 {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		knowledge := &Knowledge{}
+		err = json.Unmarshal(response[0].Data, knowledge)
 		if err != nil {
 			fmt.Println(err)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -217,7 +273,9 @@ func (db *GoDB) handleKnowledgeCategoryModification() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(response.uUID, jsonEntry, lid, map[string]string{})
+		err = db.Update(response.uUID, jsonEntry, lid, map[string]string{
+			"chatID": knowledge.ChatGroupUUID,
+		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
