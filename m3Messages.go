@@ -27,7 +27,7 @@ type ChatMessageReaction struct {
 type ChatMessageContainer struct {
 	*ChatMessage
 	*Analytics
-	UUID string
+	UUID string `json:"uid"`
 }
 
 type ChatMessagesResponse struct {

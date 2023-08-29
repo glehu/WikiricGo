@@ -578,7 +578,7 @@ func (db *GoDB) checkIXFile(index string, level int32) error {
 		log.Panic("err during ix file open:", err)
 	}
 	// Create the B-Tree holding all indices
-	bTree := btree.NewMap[string, *Index](3)
+	bTree := btree.NewMap[string, *Index](128)
 	db.indices[index] = IndexMap{index: bTree, ixFile: ixFileTmp, ixFileMutex: &sync.RWMutex{}}
 	// Read available stored indices and set them
 	reader := csv.NewReader(ixFileTmp)

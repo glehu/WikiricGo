@@ -54,7 +54,7 @@ func testStore(db *GoDB) {
 		log.Panic(":: DEBUG ERROR serializing", err)
 	}
 	// Store data in database
-	for i := 1; i <= 500_000; i++ {
+	for i := 1; i <= 10_000; i++ {
 		count := fmt.Sprintf("%d", i)
 		// Insert into db
 		_, err = db.Insert(data, map[string]string{
@@ -78,9 +78,9 @@ func testSelect(db *GoDB) string {
 	start := time.Now()
 	// Retrieve data from database
 	resp, err := db.Select(map[string]string{
-		"count": "^1337$",
+		"count": "1337",
 	}, &SelectOptions{
-		MaxResults: 1,
+		MaxResults: 50,
 		Page:       0,
 		Skip:       0,
 	})

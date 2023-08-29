@@ -22,7 +22,7 @@ type Notification struct {
 
 type NotificationContainer struct {
 	*Notification
-	UUID string
+	UUID string `json:"uid"`
 }
 
 type NotificationsResponse struct {

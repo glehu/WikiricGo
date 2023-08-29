@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/render"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -35,9 +36,10 @@ type Wisdom struct {
 }
 
 type WisdomContainer struct {
-	UUID string
+	UUID string `json:"uid"`
 	*Wisdom
 	*Analytics
+	Accuracy float64 `json:"accuracy"`
 }
 
 type BoxesContainer struct {
@@ -45,8 +47,8 @@ type BoxesContainer struct {
 }
 
 type BoxContainer struct {
-	Box   *WisdomContainer
-	Tasks []*WisdomContainer
+	Box   *WisdomContainer   `json:"box"`
+	Tasks []*WisdomContainer `json:"tasks"`
 }
 
 type QueryResponse struct {
@@ -1066,6 +1068,7 @@ func (db *GoDB) handleWisdomQuery(
 		var wisdom *Wisdom
 		var analytics *Analytics
 		var points int64
+		var accuracy float64
 		b := false
 		for _, entry := range response {
 			wisdom = &Wisdom{}
@@ -1075,7 +1078,7 @@ func (db *GoDB) handleWisdomQuery(
 			}
 			// Flip boolean on each iteration
 			b = !b
-			_, points = GetWisdomQueryPoints(wisdom, request, p, words, b)
+			accuracy, points = GetWisdomQueryPoints(wisdom, request, p, words, b)
 			if points <= 0.0 {
 				continue
 			}
@@ -1095,6 +1098,7 @@ func (db *GoDB) handleWisdomQuery(
 				UUID:      entry.uUID,
 				Wisdom:    wisdom,
 				Analytics: analytics,
+				Accuracy:  accuracy,
 			}
 			switch wisdom.Type {
 			case "lesson":
@@ -1115,6 +1119,56 @@ func (db *GoDB) handleWisdomQuery(
 		}
 		duration := time.Since(timeStart)
 		queryResponse.TimeSeconds = duration.Seconds()
+		// Sort entries by accuracy
+		if len(queryResponse.Lessons) > 1 {
+			sort.SliceStable(
+				queryResponse.Lessons, func(i, j int) bool {
+					return queryResponse.Lessons[i].Accuracy > queryResponse.Lessons[j].Accuracy
+				},
+			)
+		}
+		if len(queryResponse.Replies) > 1 {
+			sort.SliceStable(
+				queryResponse.Replies, func(i, j int) bool {
+					return queryResponse.Replies[i].Accuracy > queryResponse.Replies[j].Accuracy
+				},
+			)
+		}
+		if len(queryResponse.Questions) > 1 {
+			sort.SliceStable(
+				queryResponse.Questions, func(i, j int) bool {
+					return queryResponse.Questions[i].Accuracy > queryResponse.Questions[j].Accuracy
+				},
+			)
+		}
+		if len(queryResponse.Answers) > 1 {
+			sort.SliceStable(
+				queryResponse.Answers, func(i, j int) bool {
+					return queryResponse.Answers[i].Accuracy > queryResponse.Answers[j].Accuracy
+				},
+			)
+		}
+		if len(queryResponse.Boxes) > 1 {
+			sort.SliceStable(
+				queryResponse.Boxes, func(i, j int) bool {
+					return queryResponse.Boxes[i].Accuracy > queryResponse.Boxes[j].Accuracy
+				},
+			)
+		}
+		if len(queryResponse.Tasks) > 1 {
+			sort.SliceStable(
+				queryResponse.Tasks, func(i, j int) bool {
+					return queryResponse.Tasks[i].Accuracy > queryResponse.Tasks[j].Accuracy
+				},
+			)
+		}
+		if len(queryResponse.Misc) > 1 {
+			sort.SliceStable(
+				queryResponse.Misc, func(i, j int) bool {
+					return queryResponse.Misc[i].Accuracy > queryResponse.Misc[j].Accuracy
+				},
+			)
+		}
 		render.JSON(w, r, queryResponse)
 	}
 }

@@ -2,7 +2,7 @@ package main
 
 type Analytics struct {
 	Views     int64               `json:"views"`
-	Reactions map[string][]string `json:"reacts"` // Map of reactions e.g. upvote + usernames
+	Reactions map[string][]string `json:"reacts"` // Map of reactions e.g. upvote (+) with usernames
 	Downloads int64               `json:"downl"`
 	Bookmarks int64               `json:"bookm"`
 }

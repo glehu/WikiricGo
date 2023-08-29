@@ -13,7 +13,7 @@ type ChatMemberList struct {
 
 type ChatMemberEntry struct {
 	*ChatMember
-	UUID string
+	UUID string `json:"uid"`
 }
 
 type ChatMember struct {

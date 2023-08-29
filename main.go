@@ -79,7 +79,9 @@ func getConfig() (Config, error) {
 }
 
 func dbug() {
-	TestDB()
+	TestBadger()
+	os.Exit(0)
+	// TestDB()
 	// wisdom1 := &Wisdom{
 	// 	Description: "I like ice-cream cones. iced cream is what I like. ice!!!",
 	// }
@@ -103,5 +105,4 @@ func dbug() {
 	// fmt.Println("CREAM CONES:  ", decimal.NewFromFloat(accuracy).Round(3).String(), "%", points)
 	// accuracy, points = GetWisdomQueryPoints(wisdom4, query, p, words, false)
 	// fmt.Println("ICC:          ", decimal.NewFromFloat(accuracy).Round(3).String(), "%", points)
-	os.Exit(0)
 }

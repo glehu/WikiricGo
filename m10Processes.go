@@ -36,7 +36,7 @@ type Process struct {
 type ProcessContainer struct {
 	*Process
 	*Analytics
-	UUID string
+	UUID string `json:"uid"`
 }
 
 type ProcessPathContainer struct {
@@ -61,6 +61,8 @@ func (db *GoDB) ProtectedProcessEndpoints(
 ) {
 	r.Route("/process/private", func(r chi.Router) {
 		r.Post("/create", db.handleProcessCreate(
+			chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, connector))
+		r.Post("/edit/{processID}", db.handleProcessEdit(
 			chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, connector))
 		r.Get("/path/{processID}", db.handleProcessGetPath(
 			chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, connector))
@@ -366,6 +368,44 @@ func (db *GoDB) handleProcessCreate(
 		})
 		// Respond to client
 		_, _ = fmt.Fprintln(w, uUID)
+	}
+}
+
+func (db *GoDB) handleProcessEdit(
+	chatGroupDB, chatMemberDB, notificationDB, knowledgeDB *GoDB, connector *Connector,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		processID := chi.URLParam(r, "processID")
+		if processID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		response, lid := db.Get(processID)
+		if lid == "" {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		process := &Process{}
+		err := json.Unmarshal(response.Data, process)
+		if err != nil {
+			db.Unlock(processID, lid)
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check write right
+		_, knowledgeAccess := CheckKnowledgeAccess(
+			user, process.KnowledgeUUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		if !knowledgeAccess {
+			db.Unlock(processID, lid)
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
 	}
 }
 

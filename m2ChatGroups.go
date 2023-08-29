@@ -32,7 +32,7 @@ type SubChatroom struct {
 
 type ChatGroupEntry struct {
 	*ChatGroup
-	UUID string
+	UUID string `json:"uid"`
 }
 
 type ChatGroup struct {
