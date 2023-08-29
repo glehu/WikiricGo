@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"github.com/dgraph-io/badger/v4"
 	"log"
@@ -89,27 +88,4 @@ func TestBadger() {
 		}
 		return nil
 	})
-}
-
-func incrementPrefix(prefix []byte) []byte {
-	result := make([]byte, len(prefix))
-	copy(result, prefix)
-	var l = len(prefix)
-	for l > 0 {
-		if result[l-1] == 0xFF {
-			l -= 1
-		} else {
-			result[l-1] += 1
-			break
-		}
-	}
-	return result[0:l]
-}
-
-func SeekLast(it *badger.Iterator, prefix []byte) {
-	i := incrementPrefix(prefix)
-	it.Seek(i)
-	if it.Valid() && bytes.Equal(i, it.Item().Key()) {
-		it.Next()
-	}
 }

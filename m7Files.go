@@ -406,12 +406,11 @@ func (db *GoDB) handleFileGet() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, lid := db.Get(fileID)
-		if lid == "" {
+		response, ok := db.Read(fileID)
+		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
-		defer db.Unlock(fileID, lid)
 		fileMeta := &FileMeta{}
 		err := json.Unmarshal(response.Data, fileMeta)
 		if err != nil {
@@ -438,12 +437,11 @@ func (db *GoDB) handleFileMetaGet(chatGroupDB, chatMemberDB *GoDB) http.HandlerF
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, lid := db.Get(fileID)
-		if lid == "" {
+		response, ok := db.Read(fileID)
+		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
-		defer db.Unlock(fileID, lid)
 		fileMeta := &FileMeta{}
 		err := json.Unmarshal(response.Data, fileMeta)
 		if err != nil {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dgraph-io/badger/v4"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
@@ -41,7 +42,7 @@ type FriendRequest struct {
 
 func OpenUserDatabase() *GoDB {
 	db := OpenDB("users", []string{
-		"username",
+		"usr",
 	})
 	return db
 }
@@ -69,8 +70,31 @@ func (db *GoDB) ProtectedUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 
 func (db *GoDB) handleUserCount() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintln(w, db.indices["uuid"].index.Len())
+		users := db.getUserCount()
+		if users == -1 {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		_, _ = fmt.Fprintln(w, users)
 	}
+}
+
+func (db *GoDB) getUserCount() int64 {
+	count := 0
+	err := db.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			count += 1
+		}
+		return nil
+	})
+	if err != nil {
+		return -1
+	}
+	return int64(count)
 }
 
 func (db *GoDB) handleUserLogin() http.HandlerFunc {
@@ -99,9 +123,9 @@ func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Check if this user exists already
-		query := fmt.Sprintf("^%s$", request.Username)
+		query := fmt.Sprintf("%s\\|", request.Username)
 		resp, err := db.Select(map[string]string{
-			"username": query,
+			"usr": query,
 		}, &SelectOptions{
 			MaxResults: 1,
 			Page:       0,
@@ -137,7 +161,7 @@ func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
 			return
 		}
 		uUID, err := db.Insert(jsonEntry, map[string]string{
-			"username": request.Username,
+			"usr": request.Username,
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -158,7 +182,7 @@ func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
 		jsonNotification, err := json.Marshal(notification)
 		if err == nil {
 			_, _ = notificationDB.Insert(jsonNotification, map[string]string{
-				"username": request.Username,
+				"usr": request.Username,
 			})
 		}
 	}
@@ -221,14 +245,15 @@ func (db *GoDB) handleUserModification() http.HandlerFunc {
 }
 
 func (db *GoDB) changeUserDisplayName(user *User, userUUID string, request *UserModification) error {
-	lid := db.Lock(userUUID)
+	_, txn := db.Get(userUUID)
+	defer txn.Discard()
 	user.DisplayName = request.NewValue
 	userBytes, err := json.Marshal(user)
 	if err != nil {
 		return err
 	}
-	err = db.Update(userUUID, userBytes, lid, map[string]string{
-		"username": user.Username,
+	err = db.Update(txn, userUUID, userBytes, map[string]string{
+		"usr": user.Username,
 	})
 	if err != nil {
 		return err
@@ -237,6 +262,8 @@ func (db *GoDB) changeUserDisplayName(user *User, userUUID string, request *User
 }
 
 func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserModification) error {
+	_, txn := db.Get(userUUID)
+	defer txn.Discard()
 	hOld := sha256.New()
 	hOld.Write([]byte(request.OldValue))
 	passwordHashOld := fmt.Sprintf("%x", hOld.Sum(nil))
@@ -245,8 +272,6 @@ func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserMod
 	if match != 1 {
 		return errors.New("passwords do not match")
 	}
-	// Change password
-	lid := db.Lock(userUUID)
 	// Hash the new password
 	hNew := sha256.New()
 	hNew.Write([]byte(request.NewValue))
@@ -256,8 +281,8 @@ func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserMod
 	if err != nil {
 		return err
 	}
-	err = db.Update(userUUID, userBytes, lid, map[string]string{
-		"username": user.Username,
+	err = db.Update(txn, userUUID, userBytes, map[string]string{
+		"usr": user.Username,
 	})
 	if err != nil {
 		return err
@@ -266,10 +291,10 @@ func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserMod
 }
 
 func (db *GoDB) GetUserFromUsername(username string) *User {
-	userQuery := fmt.Sprintf("^%s$", username)
+	userQuery := fmt.Sprintf("%s\\|", username)
 	resp, err := db.Select(
 		map[string]string{
-			"username": userQuery,
+			"usr": userQuery,
 		}, nil,
 	)
 	if err != nil {
@@ -378,7 +403,7 @@ func (db *GoDB) handleUserFriendRequest(
 			return
 		}
 		notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
-			"username": request.Username,
+			"usr": request.Username,
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)

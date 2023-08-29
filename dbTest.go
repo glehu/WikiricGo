@@ -42,20 +42,20 @@ func testStore(db *GoDB) {
 	fmt.Println(">>> DEBUG DB STORE START")
 	time.Sleep(time.Second)
 	start := time.Now()
-	// Serialize data
-	data, err := json.Marshal(&SampleEntry{
-		Field:       "Sample Contact",
-		Description: "Mr Sample Name",
-		Age:         0,
-		Website:     true,
-		Skills:      map[string]string{"german": "native", "english": "veri nais"},
-	})
-	if err != nil {
-		log.Panic(":: DEBUG ERROR serializing", err)
-	}
 	// Store data in database
-	for i := 1; i <= 10_000; i++ {
+	for i := 1; i <= 1_000_000; i++ {
 		count := fmt.Sprintf("%d", i)
+		// Serialize data
+		data, err := json.Marshal(&SampleEntry{
+			Field:       "Sample Contact",
+			Description: "Mr Sample Name",
+			Age:         i,
+			Website:     true,
+			Skills:      map[string]string{"german": "native", "english": "veri nais"},
+		})
+		if err != nil {
+			log.Panic(":: DEBUG ERROR serializing", err)
+		}
 		// Insert into db
 		_, err = db.Insert(data, map[string]string{
 			"count": count,
@@ -78,9 +78,9 @@ func testSelect(db *GoDB) string {
 	start := time.Now()
 	// Retrieve data from database
 	resp, err := db.Select(map[string]string{
-		"count": "1337",
+		"count": "1",
 	}, &SelectOptions{
-		MaxResults: 50,
+		MaxResults: 1,
 		Page:       0,
 		Skip:       0,
 	})
@@ -111,7 +111,7 @@ func testDelete(db *GoDB, uUID string) {
 	time.Sleep(time.Second)
 	start := time.Now()
 	// Delete entry from database
-	err := db.Delete(uUID, "")
+	err := db.Delete(uUID)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -124,6 +124,8 @@ func testUpdate(db *GoDB, uUID string) {
 	time.Sleep(time.Second)
 	start := time.Now()
 	// Update entry in database
+	_, txn := db.Get(uUID)
+	defer txn.Discard()
 	// Serialize data
 	data, err := json.Marshal(&SampleEntry{
 		Field:       "Sample Contact",
@@ -136,7 +138,7 @@ func testUpdate(db *GoDB, uUID string) {
 		log.Panic(":: DEBUG ERROR serializing", err)
 	}
 	// Insert into db
-	err = db.Update(uUID, data, "", map[string]string{
+	err = db.Update(txn, uUID, data, map[string]string{
 		"count": "1337",
 	})
 	if err != nil {

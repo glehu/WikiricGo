@@ -122,12 +122,11 @@ func (db *GoDB) handleKnowledgeGet(chatGroupDB, chatMemberDB *GoDB) http.Handler
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, lid := db.Get(knowledgeID)
-		if lid == "" {
+		response, ok := db.Read(knowledgeID)
+		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
-		defer db.Unlock(knowledgeID, lid)
 		knowledge := &Knowledge{}
 		err := json.Unmarshal(response.Data, knowledge)
 		if err != nil {
@@ -164,7 +163,7 @@ func (db *GoDB) handleKnowledgeGetFromChatID(chatGroupDB, chatMemberDB *GoDB) ht
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		query := fmt.Sprintf("^%s$", chatID)
+		query := fmt.Sprintf("%s\\|", chatID)
 		resp, err := db.Select(map[string]string{
 			"chatID": query,
 		}, &SelectOptions{
@@ -233,12 +232,12 @@ func (db *GoDB) handleKnowledgeCategoryModification() http.HandlerFunc {
 			return
 		}
 		// Retrieve chat group
-		response, lid := db.Get(knowledgeID)
-		if lid == "" {
+		response, txn := db.Get(knowledgeID)
+		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
-		defer db.Unlock(knowledgeID, lid)
+		defer txn.Discard()
 		knowledge := &Knowledge{}
 		err := json.Unmarshal(response.Data, knowledge)
 		if err != nil {
@@ -273,7 +272,7 @@ func (db *GoDB) handleKnowledgeCategoryModification() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(response.uUID, jsonEntry, lid, map[string]string{
+		err = db.Update(txn, response.uUID, jsonEntry, map[string]string{
 			"chatID": knowledge.ChatGroupUUID,
 		})
 		if err != nil {

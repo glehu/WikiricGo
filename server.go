@@ -274,10 +274,10 @@ func BasicAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 					return
 				}
 				// Check if user exists in the database then compare passwords
-				query := fmt.Sprintf("^%s$", user)
+				query := fmt.Sprintf("%s\\|", user)
 				resp, err := userDB.Select(
 					map[string]string{
-						"username": query,
+						"usr": query,
 					}, nil,
 				)
 				if err != nil {
@@ -327,10 +327,10 @@ func BearerAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 				// Get client user
 				_, claims, _ := jwtauth.FromContext(r.Context())
 				username := claims["u_name"].(string)
-				userQuery := fmt.Sprintf("^%s$", username)
+				userQuery := fmt.Sprintf("%s\\|", username)
 				resp, err := userDB.Select(
 					map[string]string{
-						"username": userQuery,
+						"usr": userQuery,
 					}, nil,
 				)
 				if err != nil {

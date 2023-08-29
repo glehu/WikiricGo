@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dgraph-io/badger/v4"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
@@ -119,12 +120,11 @@ func (db *GoDB) handleProcessCreate(
 		uUID, err := db.Insert(jsonEntry, map[string]string{
 			"knowledgeID": request.KnowledgeUUID,
 		})
-		rMP, lid := db.Get(uUID)
-		if lid == "" {
+		rMP, txnProc := db.Get(uUID)
+		if txnProc == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		db.Unlock(rMP.uUID, lid)
 		process := &Process{}
 		err = json.Unmarshal(rMP.Data, process)
 		if err != nil {
@@ -140,32 +140,28 @@ func (db *GoDB) handleProcessCreate(
 			if len(process.PreviousUUID) > 0 {
 				// Previous and next nodes -> links need to be rebuilt
 				// Get previous node
-				rP, lP := db.Get(process.PreviousUUID[0])
-				if lP == "" {
+				rP, txnP := db.Get(process.PreviousUUID[0])
+				if txnP == nil {
 					http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 					return
 				}
+				defer txnP.Discard()
 				prev := &Process{}
 				err := json.Unmarshal(rP.Data, prev)
 				if err != nil {
-					db.Unlock(rP.uUID, lP)
-					fmt.Println(err)
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
 				}
 				// Get next node
-				rN, lN := db.Get(process.NextUUID[0])
-				if lN == "" {
-					db.Unlock(rP.uUID, lP)
+				rN, txnN := db.Get(process.NextUUID[0])
+				if txnN == nil {
 					http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 					return
 				}
+				defer txnN.Discard()
 				next := &Process{}
 				err = json.Unmarshal(rN.Data, next)
 				if err != nil {
-					db.Unlock(rP.uUID, lP)
-					db.Unlock(rN.uUID, lN)
-					fmt.Println(err)
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
 				}
@@ -175,28 +171,21 @@ func (db *GoDB) handleProcessCreate(
 				// Update prev
 				jsonEntry, err = json.Marshal(prev)
 				if err != nil {
-					db.Unlock(rP.uUID, lP)
-					db.Unlock(rN.uUID, lN)
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
 				}
-				err = db.Update(rP.uUID, jsonEntry, lP, map[string]string{
+				err = db.Update(txnP, rP.uUID, jsonEntry, map[string]string{
 					"knowledgeID": prev.KnowledgeUUID,
 				})
 				// Update next
 				jsonEntry, err := json.Marshal(next)
 				if err != nil {
-					db.Unlock(rP.uUID, lP)
-					db.Unlock(rN.uUID, lN)
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
 				}
-				err = db.Update(rN.uUID, jsonEntry, lN, map[string]string{
+				_ = db.Update(txnN, rN.uUID, jsonEntry, map[string]string{
 					"knowledgeID": next.KnowledgeUUID,
 				})
-				if err != nil {
-					db.Unlock(rN.uUID, lN)
-				}
 			} else {
 				// Only a next node -> error
 				http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
@@ -211,16 +200,15 @@ func (db *GoDB) handleProcessCreate(
 			} else {
 				// Previous nodes without next nodes -> check if previous node has next nodes
 				// Get previous main node
-				rP, lP := db.Get(process.PreviousUUID[0])
-				if lP == "" {
+				rP, txnP := db.Get(process.PreviousUUID[0])
+				if txnP == nil {
 					http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 					return
 				}
+				defer txnP.Discard()
 				prev := &Process{}
 				err := json.Unmarshal(rP.Data, prev)
 				if err != nil {
-					db.Unlock(rP.uUID, lP)
-					fmt.Println(err)
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
 				}
@@ -234,11 +222,10 @@ func (db *GoDB) handleProcessCreate(
 				prev.NextUUID = append(prev.NextUUID, rMP.uUID)
 				jsonEntry, err = json.Marshal(prev)
 				if err != nil {
-					db.Unlock(rP.uUID, lP)
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
 				}
-				err = db.Update(rP.uUID, jsonEntry, lP, map[string]string{
+				err = db.Update(txnP, rP.uUID, jsonEntry, map[string]string{
 					"knowledgeID": prev.KnowledgeUUID,
 				})
 			}
@@ -261,18 +248,17 @@ func (db *GoDB) handleProcessCreate(
 			// Check main path only
 			var path ProcessPath
 			var p *Process
-			var lid string
+			var ok bool
 			var response *EntryResponse
 			if len(process.PreviousUUID) > 0 {
-				response, lid = db.Get(process.PreviousUUID[0])
+				response, ok = db.Read(process.PreviousUUID[0])
 			} else {
-				response, lid = db.Get(process.NextUUID[0])
+				response, ok = db.Read(process.NextUUID[0])
 			}
-			if lid == "" {
+			if !ok {
 				http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 				return
 			}
-			db.Unlock(response.uUID, lid)
 			p = &Process{}
 			err := json.Unmarshal(response.Data, p)
 			if err != nil {
@@ -287,6 +273,7 @@ func (db *GoDB) handleProcessCreate(
 				process.RowIndex = 20_000.0
 				// Redistribute row index values from 40k onwards
 				v := 40_000.0
+				var txSeg *badger.Txn
 				for _, segment := range path.Processes {
 					segment.Process.RowIndex = v
 					// Increment
@@ -296,7 +283,11 @@ func (db *GoDB) handleProcessCreate(
 					if err != nil {
 						continue
 					}
-					_ = db.Update(segment.Process.UUID, jsonEntry, "", map[string]string{
+					_, txSeg = db.Get(segment.Process.UUID)
+					if txSeg == nil {
+						continue
+					}
+					_ = db.Update(txSeg, segment.Process.UUID, jsonEntry, map[string]string{
 						"knowledgeID": segment.Process.KnowledgeUUID,
 					})
 				}
@@ -309,14 +300,12 @@ func (db *GoDB) handleProcessCreate(
 			// We need to check full path segment
 			var path ProcessPath
 			var p *Process
-			var lid string
 			var response *EntryResponse
-			response, lid = db.Get(process.PreviousUUID[0])
-			if lid == "" {
+			response, ok := db.Read(process.PreviousUUID[0])
+			if !ok {
 				http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 				return
 			}
-			db.Unlock(response.uUID, lid)
 			p = &Process{}
 			err := json.Unmarshal(response.Data, p)
 			if err != nil {
@@ -340,7 +329,11 @@ func (db *GoDB) handleProcessCreate(
 					if err != nil {
 						continue
 					}
-					_ = db.Update(segment.UUID, jsonEntry, "", map[string]string{
+					_, txSeg := db.Get(segment.UUID)
+					if txSeg == nil {
+						continue
+					}
+					_ = db.Update(txSeg, segment.UUID, jsonEntry, map[string]string{
 						"knowledgeID": segment.Process.KnowledgeUUID,
 					})
 				}
@@ -363,7 +356,7 @@ func (db *GoDB) handleProcessCreate(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(rMP.uUID, jsonEntry, "", map[string]string{
+		err = db.Update(txnProc, rMP.uUID, jsonEntry, map[string]string{
 			"knowledgeID": process.KnowledgeUUID,
 		})
 		// Respond to client
@@ -385,16 +378,15 @@ func (db *GoDB) handleProcessEdit(
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, lid := db.Get(processID)
-		if lid == "" {
+		response, txn := db.Get(processID)
+		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
+		defer txn.Discard()
 		process := &Process{}
 		err := json.Unmarshal(response.Data, process)
 		if err != nil {
-			db.Unlock(processID, lid)
-			fmt.Println(err)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
@@ -402,10 +394,10 @@ func (db *GoDB) handleProcessEdit(
 		_, knowledgeAccess := CheckKnowledgeAccess(
 			user, process.KnowledgeUUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
 		if !knowledgeAccess {
-			db.Unlock(processID, lid)
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
+		// TODO
 	}
 }
 
@@ -423,12 +415,11 @@ func (db *GoDB) handleProcessGetPath(
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, lid := db.Get(processID)
-		if lid == "" {
+		response, ok := db.Read(processID)
+		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
-		db.Unlock(processID, lid)
 		process := &Process{}
 		err := json.Unmarshal(response.Data, process)
 		if err != nil {
@@ -476,11 +467,10 @@ func (db *GoDB) getPathOfProcess(
 		for i, nextUUID := range process.NextUUID {
 			// We will skip the first one since it will be the next main node
 			if i > 0 {
-				response, lid := db.Get(nextUUID)
-				if lid == "" {
+				response, ok := db.Read(nextUUID)
+				if !ok {
 					continue
 				}
-				db.Unlock(nextUUID, lid)
 				p := &Process{}
 				err := json.Unmarshal(response.Data, p)
 				if err != nil {
@@ -505,8 +495,8 @@ func (db *GoDB) getPathOfProcess(
 	// Append current segment
 	path.Processes = append(path.Processes, pathSegment)
 	// Continue over the next node's children recursively
-	response, lid := db.Get(process.NextUUID[0])
-	if lid == "" {
+	response, ok := db.Read(process.NextUUID[0])
+	if !ok {
 		if len(path.Processes) > 1 {
 			sort.SliceStable(
 				path.Processes, func(i, j int) bool {
@@ -516,7 +506,6 @@ func (db *GoDB) getPathOfProcess(
 		}
 		return path
 	}
-	db.Unlock(process.NextUUID[0], lid)
 	nextNode := &Process{}
 	err := json.Unmarshal(response.Data, nextNode)
 	if err != nil {

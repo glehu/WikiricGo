@@ -1,21 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"encoding/csv"
 	"errors"
 	"fmt"
+	"github.com/dgraph-io/badger/v4"
 	"github.com/gofrs/uuid"
-	"github.com/tidwall/btree"
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strconv"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // ### CONST ###
@@ -26,23 +23,8 @@ const defaultIxValueMaxLength = 100
 // ### TYPES ###
 
 type EntryResponse struct {
-	uUID  string
-	Index *Index
-	Data  []byte
-}
-
-// Index points to a database entry and is being contained by a named IndexMap
-type Index struct {
-	value string
-	pos   int64
-	len   int64
-}
-
-// IndexMap is a named index map containing Index elements and a pointer to its *os.File
-type IndexMap struct {
-	index       *btree.Map[string, *Index]
-	ixFile      *os.File
-	ixFileMutex *sync.RWMutex
+	uUID string
+	Data []byte
 }
 
 type DBSettings struct {
@@ -50,20 +32,10 @@ type DBSettings struct {
 	ixMaxLength int
 }
 
-type IXChannelCommand struct {
-	index      string
-	uUID       string
-	indexEntry *Index
-}
-
 type GoDB struct {
-	dbFile    *os.File
-	workDir   string
-	module    string
-	indices   map[string]IndexMap
-	dbMutex   *sync.RWMutex
-	ixMutex   *sync.RWMutex
-	ixChannel chan *IXChannelCommand
+	db      *badger.DB
+	workDir string
+	module  string
 	DBSettings
 }
 
@@ -73,85 +45,41 @@ type SelectOptions struct {
 	Skip       int64
 }
 
-// DB Interface
-type DB interface {
-	// Storage Methods
-
-	Insert(data []byte, indices map[string]string) error
-	Update(uUID string, data []byte, indices map[string]string) error
-	Delete(uUID string) error
-	Get(uUID string) (*EntryResponse, bool)
-	Select(indices map[string]string) (chan *EntryResponse, error)
-
-	// Utility Methods
-
-	// CloseDB closes the database file
-	CloseDB() error
-
-	// Internal Methods
-
-	checkIXFile(index string, level int32) error
-	writeIXCache(index string, uUID uuid.UUID, indexEntry *Index) error
-	singleIndexQuery(index, query *regexp.Regexp, responses chan *EntryResponse, wg *sync.WaitGroup)
-	readFromDB(pos int64, len int64) ([]byte, error)
-}
-
 // OpenDB creates a named database (e.g. users), initialized with the provided named indices (e.g. username)
 func OpenDB(module string, indices []string) *GoDB {
 	// Set working directory
 	workDirTmp, _ := os.Getwd()
-	checkModuleDir(module, workDirTmp)
-	// Create DB file if missing
-	databaseFilename, err := checkDBFile(module, workDirTmp)
-	if err != nil {
-		log.Panic("err during db file check:", err)
+	dbPath := checkModuleDir(module, workDirTmp)
+	if dbPath == "" {
+		log.Fatal("FATAL ERROR: Could not create database")
 	}
-	// Set file pointer
-	dbFileTmp, err := os.OpenFile(databaseFilename, os.O_RDWR, 0644)
+	// Create DB files if missing
+	badgerDB, err := badger.Open(badger.DefaultOptions(dbPath))
 	if err != nil {
-		log.Panic("err during db file open:", err)
+		log.Fatal(err)
 	}
 	// Create db struct pointer and return
-	ixChannelTmp := make(chan *IXChannelCommand, 1_000)
 	goDB := &GoDB{
-		dbFile:    dbFileTmp,
-		workDir:   workDirTmp,
-		module:    module,
-		indices:   make(map[string]IndexMap),
-		dbMutex:   &sync.RWMutex{},
-		ixMutex:   &sync.RWMutex{},
-		ixChannel: ixChannelTmp,
+		db:      badgerDB,
+		workDir: workDirTmp,
+		module:  module,
 		DBSettings: DBSettings{
 			ixCapacity:  defaultIxCapacity,
 			ixMaxLength: defaultIxValueMaxLength,
 		},
 	}
-	// Check base index (uuid)
-	err = goDB.checkIXFile("uuid", 0)
-	if err != nil {
-		log.Panic("err during base ix file check", err)
-	}
-	// Check custom index files
-	for _, indexName := range indices {
-		if indexName == "uuid" {
-			continue
-		}
-		err = goDB.checkIXFile(indexName, 0)
-		if err != nil {
-			log.Panic("err during custom ix file check", err)
-		}
-	}
-	go startIXFileWorker(goDB, ixChannelTmp)
 	return goDB
 }
 
-func startIXFileWorker(goDB *GoDB, jobs <-chan *IXChannelCommand) {
-	for job := range jobs {
-		err := goDB.writeIXCache(job.index, job.uUID, job.indexEntry)
-		if err != nil {
-			log.Panic("ix cache write fail:", err)
-		}
+func (db *GoDB) CloseDB() error {
+	if db.db == nil {
+		return nil
 	}
+	err := db.db.Close()
+	if err != nil {
+		fmt.Println(err)
+	}
+	return nil
 }
 
 // ### DB Functions ###
@@ -159,206 +87,131 @@ func startIXFileWorker(goDB *GoDB, jobs <-chan *IXChannelCommand) {
 // Insert adds an entry to the database
 func (db *GoDB) Insert(data []byte, indices map[string]string) (string, error) {
 	indicesClean, _ := db.validateIndices(indices, false)
-	// Generate UUID
+	// Generate UUID for main index entry
 	uUIDTmp, err := uuid.NewV7()
 	if err != nil {
-		log.Panic("err generating uuid", err)
+		return "", nil
 	}
 	uUID := uUIDTmp.String()
-	err = db.doInsert(uUID, data, indicesClean)
-	return uUID, err
+	err = db.doInsert([]byte(uUID), data, indicesClean)
+	if err != nil {
+		return "", err
+	}
+	return uUID, nil
 }
 
-func (db *GoDB) doInsert(uUID string, data []byte, indices map[string]string) error {
-	// MUTEX LOCK
-	db.dbMutex.Lock()
-	// Find end of file position
-	stat, err := db.dbFile.Stat()
-	if err != nil {
-		return errors.New("db file stat failed")
-	}
-	offset := stat.Size()
-	// Write bytes
-	_, err = db.dbFile.WriteAt(data, offset)
-	// MUTEX UNLOCK
-	db.dbMutex.Unlock()
-	if err != nil {
-		return errors.New("db write failed")
-	}
-	db.writeIndices(uUID, offset, int64(len(data)), indices)
-	return nil
-}
-
-// Delete removes an entry from the database
-func (db *GoDB) Delete(uUID, lid string) error {
-	if lid == "" {
-		// Lock entry if it was not locked before
-		lid = db.Lock(uUID)
-		if lid == "" {
-			return errors.New("entry lock failed")
-		}
-	}
-	prevIndex, ok := db.indices["uuid"].index.Get(uUID)
-	if !ok {
-		return nil
-	}
-	emptyBytes := make([]byte, prevIndex.len)
-	// MUTEX LOCK
-	db.dbMutex.Lock()
-	// Write bytes
-	_, err := db.dbFile.WriteAt(emptyBytes, prevIndex.pos)
-	// MUTEX UNLOCK
-	db.dbMutex.Unlock()
-	if err != nil {
-		return errors.New("db write failed")
-	}
-	var indexEntry *Index
-	for key, index := range db.indices {
-		indexEntry = &Index{
-			value: "",
-			pos:   -1,
-			len:   -1,
-		}
-		db.ixChannel <- &IXChannelCommand{
-			index:      key,
-			uUID:       uUID,
-			indexEntry: indexEntry,
-		}
-		index.index.Delete(uUID)
-	}
-	return nil
-}
-
-// Update changes an entry in the database
-func (db *GoDB) Update(uUID string, data []byte, lid string, indices map[string]string) error {
-	indicesClean, err := db.validateIndices(indices, false)
+func (db *GoDB) Update(txn *badger.Txn, uUID string, data []byte, indices map[string]string) error {
+	indicesClean, _ := db.validateIndices(indices, false)
+	err := db.doUpdate(txn, []byte(uUID), data, indicesClean)
 	if err != nil {
 		return err
 	}
-	length := int64(len(data))
-	// Check if new data is smaller or same size as current data
-	// If this is true, then offset will not change,
-	// otherwise we will have to append the new data to the end of the file
-	prevIndex, ok := db.indices["uuid"].index.Get(uUID)
-	if !ok {
-		prevIndex = &Index{
-			value: "",
-			pos:   -1,
-			len:   -1,
-		}
-	}
-	if length > prevIndex.len {
-		// Length exceeded -> Delete, then append to end with same uUID
-		err = db.Delete(uUID, lid)
-		if err != nil {
-			return err
-		}
-		err = db.doInsert(uUID, data, indicesClean)
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-	// ELSE: Length smaller or same -> Override
-	if lid == "" {
-		// Lock entry if it was not locked before
-		lid = db.Lock(uUID)
-		if lid == "" {
-			return errors.New("entry lock failed")
-		}
-	}
-	// MUTEX LOCK
-	db.dbMutex.Lock()
-	offset := prevIndex.pos
-	// Write bytes
-	_, err = db.dbFile.WriteAt(data, offset)
-	// MUTEX UNLOCK
-	db.dbMutex.Unlock()
-	if err != nil {
-		return errors.New("db write failed")
-	}
-	db.writeIndices(uUID, offset, length, indicesClean)
 	return nil
 }
 
-// Lock prevents others to get writing access to a single entry
-func (db *GoDB) Lock(uUID string) (lid string) {
-	lck, _ := uuid.NewV7()
-	lid = lck.String()
-	tries := 0
-	for {
-		ok := db.doLock(uUID, lid)
-		if ok {
-			break
-		} else {
-			tries += 1
-			if tries > 100 {
-				return ""
+func (db *GoDB) doInsert(uUID []byte, data []byte, indices map[string]string) error {
+	err := db.db.Update(func(txn *badger.Txn) error {
+		// Create main index entry
+		err := txn.Set(uUID, data)
+		if err != nil {
+			return err
+		}
+		// Create sub index entries (using the provided indices)
+		// The whole purpose of sub index entries is to point to the main index entry
+		// E.G.:
+		//				   	|      Index      |        Data        |
+		//            | --------------- | ------------------ |
+		// 		Main:	 	|	12345 					|	User1, Sample Name |
+		// 		Sub:		|	usr:User1:12345	|	12345							 |
+		for k, v := range indices {
+			err := txn.Set([]byte(fmt.Sprintf("%s:%s\\|%s", k, v, uUID)), uUID)
+			if err != nil {
+				return err
 			}
-			ticker := time.NewTicker(time.Millisecond * 15)
-			<-ticker.C
-			ticker.Stop()
+		}
+		return nil
+	})
+	return err
+}
+
+func (db *GoDB) doUpdate(txn *badger.Txn, uUID []byte, data []byte, indices map[string]string) error {
+	defer txn.Discard()
+	// Create main index entry
+	err := txn.Set(uUID, data)
+	if err != nil {
+		return err
+	}
+	// Create sub index entries (using the provided indices)
+	// The whole purpose of sub index entries is to point to the main index entry
+	// E.G.:
+	//				   	|      Index      |        Data        |
+	//            | --------------- | ------------------ |
+	// 		Main:	 	|	12345 					|	User1, Sample Name |
+	// 		Sub:		|	usr:User1:12345	|	12345							 |
+	for k, v := range indices {
+		err := txn.Set([]byte(fmt.Sprintf("%s:%s\\|%s", k, v, uUID)), uUID)
+		if err != nil {
+			return err
 		}
 	}
-	return lid
+	err = txn.Commit()
+	return err
 }
 
-func (db *GoDB) doLock(uUID, username string) bool {
-	db.ixMutex.Lock()
-	defer db.ixMutex.Unlock()
-	index, ok := db.indices["uuid"].index.Get(uUID)
-	if !ok {
-		// Return true if entry does not exist
-		return true
+// Delete removes an entry from the database
+func (db *GoDB) Delete(uUID string) error {
+	if uUID == "" {
+		return errors.New("missing uuid")
 	}
-	if index.value == username {
-		// Return true if entry was already locked by user
-		return true
-	}
-	// Only lock if nobody else locked it
-	if index.value == "" {
-		index.value = username
-		db.indices["uuid"].index.Set(uUID, index)
-		return true
-	}
-	return false
+	err := db.db.Update(func(txn *badger.Txn) error {
+		// Delete main index entry
+		err := txn.Delete([]byte(uUID))
+		return err
+	})
+	// TODO: Remove all sub index entries
+	return err
 }
 
-func (db *GoDB) Unlock(uUID, lid string) bool {
-	db.ixMutex.Lock()
-	defer db.ixMutex.Unlock()
-	index, ok := db.indices["uuid"].index.Get(uUID)
-	if !ok {
-		return true
-	}
-	if index.value == "" {
-		return true
-	}
-	if index.value == lid {
-		index.value = ""
-		db.indices["uuid"].index.Set(uUID, index)
-		return true
-	}
-	return false
-}
-
-func (db *GoDB) Get(uUID string) (*EntryResponse, string) {
-	index, ok := db.indices["uuid"].index.Get(uUID)
-	if !ok {
-		return nil, ""
-	}
-	// Lock the entry
-	lid := db.Lock(uUID)
-	content, err := db.readFromDB(index.pos, index.len)
-	if err != nil {
-		return nil, ""
+func (db *GoDB) Get(uUID string) (*EntryResponse, *badger.Txn) {
+	var ixEntry []byte
+	err := db.db.View(func(txn *badger.Txn) error {
+		// Delete main index entry
+		ix, err := txn.Get([]byte(uUID))
+		if err != nil {
+			return err
+		}
+		ixEntry, err = ix.ValueCopy(nil)
+		return nil
+	})
+	if err != nil || len(ixEntry) < 1 {
+		return nil, nil
 	}
 	entryResponse := &EntryResponse{
-		uUID:  uUID,
-		Index: index,
-		Data:  content,
+		uUID: uUID,
+		Data: ixEntry,
 	}
-	return entryResponse, lid
+	return entryResponse, db.db.NewTransaction(true)
+}
+
+func (db *GoDB) Read(uUID string) (*EntryResponse, bool) {
+	var ixEntry []byte
+	err := db.db.View(func(txn *badger.Txn) error {
+		// Delete main index entry
+		ix, err := txn.Get([]byte(uUID))
+		if err != nil {
+			return err
+		}
+		ixEntry, err = ix.ValueCopy(nil)
+		return nil
+	})
+	if err != nil || len(ixEntry) < 1 {
+		return nil, false
+	}
+	entryResponse := &EntryResponse{
+		uUID: uUID,
+		Data: ixEntry,
+	}
+	return entryResponse, true
 }
 
 // Select returns entries from the database
@@ -367,10 +220,11 @@ func (db *GoDB) Select(indices map[string]string, options *SelectOptions) (chan 
 	if err != nil {
 		return nil, err
 	}
-	// Check *SelectOptions
+	// Set default SelectOptions
 	maxResults := int64(-1)
 	page := int64(0)
 	skip := int64(0)
+	// Check *SelectOptions
 	if options != nil {
 		maxResults = options.MaxResults
 		page = options.Page
@@ -390,23 +244,12 @@ func (db *GoDB) Select(indices map[string]string, options *SelectOptions) (chan 
 	wg := sync.WaitGroup{}
 	responsesInternal := make(chan *EntryResponse)
 	responsesExternal := make(chan []*EntryResponse)
-	// Return early with no results if everything had been skipped
-	if skip >= int64(db.indices["uuid"].index.Len()) {
-		go func() {
-			responsesExternal <- make([]*EntryResponse, 0)
-			close(responsesExternal)
-		}()
-		return responsesExternal, nil
-	}
 	done := make(chan bool)
 	ctx, cancel := context.WithCancel(context.Background())
 	// Launch index search goroutines
 	for key, value := range indicesClean {
 		wg.Add(1)
-		query, err := regexp.Compile(value)
-		if err == nil {
-			go db.singleIndexQuery(key, query, responsesInternal, &wg, ctx)
-		}
+		go db.singleIndexQuery(key, value, responsesInternal, &wg, ctx)
 	}
 	// Start goroutine awaiting a cancellation
 	go func() {
@@ -465,6 +308,63 @@ func (db *GoDB) Select(indices map[string]string, options *SelectOptions) (chan 
 	return responsesExternal, nil
 }
 
+func (db *GoDB) singleIndexQuery(
+	index, value string, responses chan *EntryResponse, wg *sync.WaitGroup, ctx context.Context,
+) {
+	noResults := true
+	// Prefix Iteration
+	err := db.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Reverse = true
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		prefix := []byte(fmt.Sprintf("%s:%s", index, value))
+		for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
+			// Listen to the Done-chanel to make sure we're not wasting resources
+			select {
+			case <-ctx.Done():
+				wg.Done()
+				return errors.New("CTX cancel received")
+			default:
+				// Match!
+				item := it.Item()
+				err := item.Value(func(v []byte) error {
+					// Since sub index entries' values point to the main index entry's uuid,
+					// we need to get the main index entry now
+					ix, err := txn.Get(v)
+					if err != nil {
+						return nil
+					}
+					ixEntry, err := ix.ValueCopy(nil)
+					noResults = false
+					responses <- &EntryResponse{
+						uUID: string(v),
+						Data: ixEntry,
+					}
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return
+	}
+	if noResults {
+		responses <- &EntryResponse{
+			uUID: "",
+			Data: nil,
+		}
+	}
+	wg.Done()
+}
+
+// ### Utility ###
+
 func (db *GoDB) validateIndices(indices map[string]string, isSelect bool) (map[string]string, error) {
 	indicesClean := make(map[string]string)
 	for key, value := range indices {
@@ -472,14 +372,12 @@ func (db *GoDB) validateIndices(indices map[string]string, isSelect bool) (map[s
 		if key == "uuid" && !isSelect {
 			continue
 		}
-		if _, present := db.indices[key]; present {
-			// Check if index value exceeds maximum
-			if len(value) > db.DBSettings.ixMaxLength {
-				// Shorten it to the desired length
-				value = value[0:db.DBSettings.ixMaxLength]
-			}
-			indicesClean[key] = value
+		// Check if index value exceeds maximum
+		if len(value) > db.DBSettings.ixMaxLength {
+			// Shorten it to the desired length
+			value = value[0:db.DBSettings.ixMaxLength]
 		}
+		indicesClean[key] = value
 	}
 	if isSelect && len(indicesClean) < 1 {
 		return nil, errors.New("no valid index queries provided")
@@ -487,246 +385,38 @@ func (db *GoDB) validateIndices(indices map[string]string, isSelect bool) (map[s
 	return indicesClean, nil
 }
 
-func (db *GoDB) singleIndexQuery(
-	index string, query *regexp.Regexp, responses chan *EntryResponse, wg *sync.WaitGroup, ctx context.Context,
-) {
-	// MUTEX LOCK
-	db.indices[index].ixFileMutex.RLock()
-	// Filter index map
-	var match bool
-	noResults := true
-	db.indices[index].index.Reverse(
-		func(key string, value *Index) bool {
-			select {
-			case <-ctx.Done():
-				return false
-			default:
-				if match = query.MatchString(value.value); match {
-					content, err := db.readFromDB(value.pos, value.len)
-					if err == nil {
-						noResults = false
-						responses <- &EntryResponse{
-							uUID:  key,
-							Index: value,
-							Data:  content,
-						}
-					}
-				}
-				return true
-			}
-		},
-	)
-	// MUTEX UNLOCK
-	db.indices[index].ixFileMutex.RUnlock()
-	if noResults {
-		responses <- &EntryResponse{
-			uUID:  "",
-			Index: nil,
-			Data:  nil,
-		}
-	}
-	wg.Done()
-}
-
-func (db *GoDB) readFromDB(pos int64, len int64) ([]byte, error) {
-	// MUTEX LOCK
-	db.dbMutex.RLock()
-	// Read from disk
-	_, err := db.dbFile.Seek(pos, 0)
-	if err != nil {
-		return nil, errors.New("err seeking in disk")
-	}
-	content := make([]byte, len)
-	_, err = db.dbFile.Read(content)
-	if err != nil {
-		return nil, errors.New("err reading from disk")
-	}
-	// MUTEX UNLOCK
-	db.dbMutex.RUnlock()
-	// Return content
-	return content, nil
-}
-
-func (db *GoDB) CloseDB() error {
-	if db.dbFile == nil {
-		return nil
-	}
-	err := db.dbFile.Close()
-	if err != nil {
-		return errors.New("db file could not be closed")
-	}
-	for _, value := range db.indices {
-		err = value.ixFile.Close()
-		if err != nil {
-			return errors.New("ix file could not be closed")
-		}
-	}
-	return nil
-}
-
-func (db *GoDB) checkIXFile(index string, level int32) error {
-	filename := filepath.Join(db.workDir, "db", db.module, fmt.Sprintf("%v-%d.ix", index, level))
-	if !FileExists(filename) {
-		err := os.WriteFile(filename, []byte{}, 0666)
-		if err != nil {
-			return errors.New("index file could not be created")
-		}
-	}
-	// Set file pointer
-	ixFileTmp, err := os.OpenFile(filename, os.O_RDWR, 0644)
-	if err != nil {
-		log.Panic("err during ix file open:", err)
-	}
-	// Create the B-Tree holding all indices
-	bTree := btree.NewMap[string, *Index](128)
-	db.indices[index] = IndexMap{index: bTree, ixFile: ixFileTmp, ixFileMutex: &sync.RWMutex{}}
-	// Read available stored indices and set them
-	reader := csv.NewReader(ixFileTmp)
-	store, err := reader.ReadAll()
-	if err != nil {
-		return errors.New("err reading stored indices")
-	}
-	var uUID string
-	var pos, length int64
-	storedCount := 0
-	for _, value := range store {
-		uUID = value[1]
-		pos, err = strconv.ParseInt(value[2], 10, 64)
-		if err != nil {
-			return errors.New("err reading stored index (pos)")
-		}
-		length, err = strconv.ParseInt(value[3], 10, 64)
-		if err != nil {
-			return errors.New("err reading stored index (len)")
-		}
-		// Do we set or delete this index?
-		if pos >= 0 && length >= 0 {
-			if index == "uuid" {
-				value[0] = ""
-			}
-			indexEntry := &Index{
-				value: value[0],
-				pos:   pos,
-				len:   length,
-			}
-			db.indices[index].index.Set(uUID, indexEntry)
-			storedCount++
+func incrementPrefix(prefix []byte) []byte {
+	result := make([]byte, len(prefix))
+	copy(result, prefix)
+	var l = len(prefix)
+	for l > 0 {
+		if result[l-1] == 0xFF {
+			l -= 1
 		} else {
-			db.indices[index].index.Delete(uUID)
-			storedCount--
+			result[l-1] += 1
+			break
 		}
 	}
-	fmt.Printf("DB %s IX %s <- LOAD %d\n", db.module, index, storedCount)
-	return nil
+	return result[0:l]
 }
 
-func (db *GoDB) writeIXCache(index string, uUID string, indexEntry *Index) error {
-	ixCache := fmt.Sprintf(
-		"\"%s\",\"%s\",\"%d\",\"%d\"\n",
-		indexEntry.value,
-		uUID,
-		indexEntry.pos,
-		indexEntry.len,
-	)
-	ixFile := db.indices[index].ixFile
-	ixFileMutex := db.indices[index].ixFileMutex
-	// MUTEX LOCK
-	ixFileMutex.Lock()
-	// Get end of file position
-	stat, err := ixFile.Stat()
-	if err != nil {
-		return errors.New("ix file stat failed")
+func SeekLast(it *badger.Iterator, prefix []byte) {
+	i := incrementPrefix(prefix)
+	it.Seek(i)
+	if it.Valid() && bytes.Equal(i, it.Item().Key()) {
+		it.Next()
 	}
-	offset := stat.Size()
-	// Write index cache to disk
-	_, err = ixFile.WriteAt([]byte(ixCache), offset)
-	// MUTEX UNLOCK
-	ixFileMutex.Unlock()
-	if err != nil {
-		return errors.New("ix file write failed")
-	}
-	return nil
 }
 
-// ### Utility ###
-
-func getDBFile(module string, workDir string) string {
-	return filepath.Join(workDir, "db", module, module+".db")
-}
-
-func checkDBFile(module string, workDir string) (string, error) {
-	filename := getDBFile(module, workDir)
-	if !FileExists(filename) {
-		err := os.WriteFile(filename, []byte{}, 0666)
-		if err != nil {
-			return "", errors.New("db file could not be created")
-		}
-	}
-	return filename, nil
-}
-
-func checkModuleDir(module string, workDir string) {
+func checkModuleDir(module string, workDir string) string {
 	err := os.Mkdir(filepath.Join(workDir, "db"), 0755)
 	if err != nil && !os.IsExist(err) {
-		return
+		return ""
 	}
-	err = os.Mkdir(filepath.Join(workDir, "db", module), 0755)
-	if err != nil {
-		return
+	dbPath := filepath.Join(workDir, "db", module)
+	err = os.Mkdir(dbPath, 0755)
+	if err != nil && !os.IsExist(err) {
+		return ""
 	}
-}
-
-func (db *GoDB) writeIndices(uUID string, offset, length int64, indices map[string]string) {
-	// MUTEX LOCK
-	db.ixMutex.Lock()
-	defer db.ixMutex.Unlock()
-	// Write base index (uuid)
-	indexEntry := &Index{
-		value: "", // Locking field will be emptied after Insert/Update - Nice side-effect!
-		pos:   offset,
-		len:   length,
-	}
-
-	db.indices["uuid"].index.Set(uUID, indexEntry)
-	db.ixChannel <- &IXChannelCommand{
-		index:      "uuid",
-		uUID:       uUID,
-		indexEntry: indexEntry,
-	}
-	// Write custom indices
-	if len(indices) > 0 {
-		for key, value := range indices {
-			if key == "uuid" {
-				continue
-			}
-			if value == "" {
-				// Remove empty indices
-				indexEntry = &Index{
-					value: "",
-					pos:   -1,
-					len:   -1,
-				}
-				db.indices[key].index.Delete(uUID)
-				db.ixChannel <- &IXChannelCommand{
-					index:      key,
-					uUID:       uUID,
-					indexEntry: indexEntry,
-				}
-				continue
-			}
-			// Store index with value
-			indexEntry = &Index{
-				value: value,
-				pos:   offset,
-				len:   length,
-			}
-			db.indices[key].index.Set(uUID, indexEntry)
-			// Write index file
-			db.ixChannel <- &IXChannelCommand{
-				index:      key,
-				uUID:       uUID,
-				indexEntry: indexEntry,
-			}
-		}
-	}
+	return dbPath
 }

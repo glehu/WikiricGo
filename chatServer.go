@@ -187,10 +187,10 @@ func (server *ChatServer) checkToken(
 		return false, nil, nil
 	}
 	// Get client user
-	userQuery := fmt.Sprintf("^%s$", userName)
+	userQuery := fmt.Sprintf("%s\\|", userName)
 	resp, err := userDB.Select(
 		map[string]string{
-			"username": userQuery,
+			"usr": userQuery,
 		}, nil,
 	)
 	if err != nil {

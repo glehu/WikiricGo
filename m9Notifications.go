@@ -32,7 +32,7 @@ type NotificationsResponse struct {
 func OpenNotificationDatabase() *GoDB {
 	db := OpenDB(
 		"notifications", []string{
-			"username",
+			"usr",
 		},
 	)
 	return db
@@ -61,8 +61,8 @@ func (db *GoDB) handleNotificationGet() http.HandlerFunc {
 			return
 		}
 		// Get notification
-		resp, lid := db.Get(notificationID)
-		if lid == "" {
+		resp, ok := db.Read(notificationID)
+		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
@@ -94,11 +94,12 @@ func (db *GoDB) handleNotificationDelete() http.HandlerFunc {
 			return
 		}
 		// Get notification
-		resp, lid := db.Get(notificationID)
-		if lid == "" {
+		resp, txn := db.Get(notificationID)
+		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
+		defer txn.Discard()
 		notification := &Notification{}
 		err := json.Unmarshal(resp.Data, notification)
 		if err != nil {
@@ -110,18 +111,17 @@ func (db *GoDB) handleNotificationDelete() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
-		err = db.Delete(notificationID, lid)
+		err = db.Delete(notificationID)
 		if err != nil {
-			db.Unlock(notificationID, lid)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 		// Do we need to delete other notifications as well?
 		tidyQuery := r.URL.Query().Get("tidy")
 		if tidyQuery != "" {
-			query := fmt.Sprintf("^%s$", user.Username)
+			query := fmt.Sprintf("%s\\|", user.Username)
 			resp, err := db.Select(map[string]string{
-				"username": query,
+				"usr": query,
 			}, nil)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -135,7 +135,7 @@ func (db *GoDB) handleNotificationDelete() http.HandlerFunc {
 					err = json.Unmarshal(notifEntry.Data, notification)
 					if err == nil {
 						if notification.Type != "frequest" {
-							_ = db.Delete(notifEntry.uUID, "")
+							_ = db.Delete(notifEntry.uUID)
 						}
 					}
 				}
@@ -151,9 +151,9 @@ func (db *GoDB) handleNotificationRead() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
 		}
-		query := fmt.Sprintf("^%s$", user.Username)
+		query := fmt.Sprintf("%s\\|", user.Username)
 		resp, err := db.Select(map[string]string{
-			"username": query,
+			"usr": query,
 		}, nil)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)

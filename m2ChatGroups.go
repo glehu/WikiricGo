@@ -176,7 +176,7 @@ func (db *GoDB) handleChatGroupCreate(userDB, chatMemberDB *GoDB) http.HandlerFu
 		}
 		_, err = chatMemberDB.Insert(
 			newMember, map[string]string{
-				"chat-user": fmt.Sprintf("%s|%s", uUID, user.Username),
+				"chat-usr": fmt.Sprintf("%s\\|%s", uUID, user.Username),
 			},
 		)
 		if err != nil {
@@ -217,12 +217,11 @@ func (db *GoDB) handleChatGroupGet() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, lid := db.Get(chatID)
-		if lid == "" {
+		response, ok := db.Read(chatID)
+		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
-		defer db.Unlock(chatID, lid)
 		chatGroup := &ChatGroup{}
 		err := json.Unmarshal(response.Data, chatGroup)
 		if err != nil {
@@ -248,11 +247,10 @@ func ReadChatGroupAndMember(
 		return nil, nil, nil, errors.New("no user provided")
 	}
 	// Check if chat group exists
-	dataOriginal, lid := chatGroupDB.Get(chatID)
-	if lid == "" {
+	dataOriginal, ok := chatGroupDB.Read(chatID)
+	if !ok {
 		return nil, nil, nil, errors.New("err chat group nonexistent")
 	}
-	defer chatGroupDB.Unlock(chatID, lid)
 	// Retrieve chat group from database
 	chatGroupOriginal := &ChatGroup{}
 	err := json.Unmarshal(
@@ -268,12 +266,10 @@ func ReadChatGroupAndMember(
 	var dataMain *EntryResponse
 	if chatGroupOriginal.ParentUUID != "" {
 		chatID = chatGroupOriginal.ParentUUID
-		lid2 := ""
-		dataMain, lid2 = chatGroupDB.Get(chatID)
-		if lid2 == "" {
+		dataMain, ok = chatGroupDB.Read(chatID)
+		if !ok {
 			return nil, nil, nil, errors.New("err provided main chat group nonexistent")
 		}
-		defer chatGroupDB.Unlock(chatID, lid2)
 		// Retrieve chat group from database
 		chatGroupMain = &ChatGroup{}
 		err = json.Unmarshal(
@@ -289,7 +285,7 @@ func ReadChatGroupAndMember(
 	}
 	// Retrieve chat member
 	query := fmt.Sprintf(
-		"^%s\\|%s$",
+		"%s\\|%s",
 		chatID,
 		username,
 	)
@@ -301,7 +297,7 @@ func ReadChatGroupAndMember(
 	}
 	resp, err := chatMemberDB.Select(
 		map[string]string{
-			"chat-user": query,
+			"chat-usr": query,
 		}, options,
 	)
 	if err != nil {
@@ -331,8 +327,8 @@ func ReadChatGroupAndMember(
 				// DM group
 				roles = []string{"owner", "member"}
 				indices = map[string]string{
-					"chat-user":   fmt.Sprintf("%s|%s", chatID, username),
-					"user-friend": fmt.Sprintf("%s|%s", username, refUsername),
+					"chat-usr":    fmt.Sprintf("%s\\|%s", chatID, username),
+					"user-friend": fmt.Sprintf("%s\\|%s", username, refUsername),
 				}
 				go func() {
 					err = notifyFriendRequestAccept(refUsername, user.DisplayName, notificationDB, connector, chatID, password)
@@ -346,7 +342,7 @@ func ReadChatGroupAndMember(
 			// No DM group
 			roles = []string{"member"}
 			indices = map[string]string{
-				"chat-user": fmt.Sprintf("%s|%s", chatID, username),
+				"chat-usr": fmt.Sprintf("%s\\|%s", chatID, username),
 			}
 			go func() {
 				container := &ChatGroupEntry{
@@ -477,12 +473,12 @@ func (db *GoDB) handleChatGroupRoleModification() http.HandlerFunc {
 			return
 		}
 		// Retrieve chat group
-		response, lid := db.Get(chatID)
-		if lid == "" {
+		response, txn := db.Get(chatID)
+		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
-		defer db.Unlock(chatID, lid)
+		defer txn.Discard()
 		chatGroup := &ChatGroup{}
 		err := json.Unmarshal(response.Data, chatGroup)
 		if err != nil {
@@ -524,7 +520,7 @@ func (db *GoDB) handleChatGroupRoleModification() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(response.uUID, jsonEntry, lid, map[string]string{})
+		err = db.Update(txn, response.uUID, jsonEntry, map[string]string{})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -589,9 +585,11 @@ func (db *GoDB) handleChatMemberRoleModification(chatMemberDB *GoDB) http.Handle
 				chatMember.Roles[index] = request.Role
 			}
 		}
+		_, txn := chatMemberDB.Get(chatMember.UUID)
+		defer txn.Discard()
 		jsonEntry, err := json.Marshal(chatMember)
-		err = chatMemberDB.Update(chatMember.UUID, jsonEntry, "", map[string]string{
-			"chat-user": fmt.Sprintf("%s|%s", chatID, chatMember.Username)},
+		err = chatMemberDB.Update(txn, chatMember.UUID, jsonEntry, map[string]string{
+			"chat-usr": fmt.Sprintf("%s\\|%s", chatID, chatMember.Username)},
 		)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -608,10 +606,10 @@ func (db *GoDB) handleChatGroupGetMembers(chatMemberDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Retrieve chat member
-		query := fmt.Sprintf("^%s|.+$", chatID)
+		query := fmt.Sprintf("%s\\|", chatID)
 		resp, err := chatMemberDB.Select(
 			map[string]string{
-				"chat-user": query,
+				"chat-usr": query,
 			}, nil,
 		)
 		if err != nil {
@@ -659,7 +657,7 @@ func notifyFriendRequestAccept(refUsername, selfName string,
 		return err
 	}
 	notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
-		"username": refUsername,
+		"usr": refUsername,
 	})
 	if err != nil {
 		return err
@@ -685,8 +683,8 @@ func notifyFriendRequestAccept(refUsername, selfName string,
 func notifyJoin(selfName string, chatMemberDB, notificationDB *GoDB, connector *Connector, chatGroup *ChatGroupEntry,
 ) error {
 	// Retrieve all members of this chat group
-	query := fmt.Sprintf("^%s|.+$", chatGroup.UUID)
-	resp, err := chatMemberDB.Select(map[string]string{"chat-user": query}, nil)
+	query := fmt.Sprintf("%s\\|", chatGroup.UUID)
+	resp, err := chatMemberDB.Select(map[string]string{"chat-usr": query}, nil)
 	if err != nil {
 		return err
 	}
@@ -720,7 +718,7 @@ func notifyJoin(selfName string, chatMemberDB, notificationDB *GoDB, connector *
 			continue
 		}
 		notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
-			"username": chatMember.Username,
+			"usr": chatMember.Username,
 		})
 		if err != nil {
 			continue
@@ -753,7 +751,7 @@ func (db *GoDB) handleGetFriends(chatMemberDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Retrieve friends
-		query := fmt.Sprintf("^((%s\\|.+)|(.+\\|%s))$", user.Username, user.Username)
+		query := fmt.Sprintf("((%s\\|.+)|(.+\\|%s))\\|", user.Username, user.Username)
 		resp, err := chatMemberDB.Select(map[string]string{"user-friend": query}, nil)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)

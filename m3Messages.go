@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dgraph-io/badger/v4"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
@@ -151,6 +152,9 @@ func (db *GoDB) handleChatMessageEdit(chatServer *ChatServer, chatGroupDB, chatM
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
+		// Get message
+		_, txn := db.Get(request.UUID)
+		defer txn.Discard()
 		// Initialize message
 		request.TimeCreated = TimeNowIsoString()
 		request.Username = user.Username
@@ -168,10 +172,9 @@ func (db *GoDB) handleChatMessageEdit(chatServer *ChatServer, chatGroupDB, chatM
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(
-			request.UUID, jsonMessage, "", map[string]string{
-				"chatID": request.ChatGroupUUID,
-			},
+		err = db.Update(txn, request.UUID, jsonMessage, map[string]string{
+			"chatID": request.ChatGroupUUID,
+		},
 		)
 		if err != nil {
 			fmt.Println(err)
@@ -258,9 +261,8 @@ func (db *GoDB) handleChatMessageFromChat(
 			if err == nil {
 				analytics := &Analytics{}
 				if msg.AnalyticsUUID != "" {
-					anaBytes, lidAna := analyticsDB.Get(msg.AnalyticsUUID)
-					if lidAna != "" {
-						analyticsDB.Unlock(msg.AnalyticsUUID, lidAna)
+					anaBytes, ok := analyticsDB.Read(msg.AnalyticsUUID)
+					if ok {
 						err = json.Unmarshal(anaBytes.Data, analytics)
 						if err != nil {
 							analytics = &Analytics{}
@@ -292,11 +294,12 @@ func (db *GoDB) handleChatMessageDelete(chatServer *ChatServer, chatGroupDB, cha
 			return
 		}
 		// Get message
-		resp, lid := db.Get(msgID)
-		if lid == "" {
+		resp, txn := db.Get(msgID)
+		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
+		defer txn.Discard()
 		message := &ChatMessage{}
 		err := json.Unmarshal(resp.Data, message)
 		if err != nil {
@@ -336,7 +339,8 @@ func (db *GoDB) handleChatMessageDelete(chatServer *ChatServer, chatGroupDB, cha
 		}
 		go chatServer.DistributeChatActionMessageJSON(actionMessage)
 		// Delete message
-		err = db.Delete(msgID, lid)
+		txn.Discard()
+		err = db.Delete(msgID)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -386,26 +390,26 @@ func (db *GoDB) handleChatMessageReaction(
 			return
 		}
 		// Retrieve message and check if there is an Analytics entry available
-		messageBytes, lidMsg := db.Get(msgID)
-		defer db.Unlock(msgID, lidMsg)
-		if lidMsg == "" {
+		messageBytes, txnMsg := db.Get(msgID)
+		if txnMsg == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
+		defer txnMsg.Discard()
 		message := &ChatMessage{}
 		err := json.Unmarshal(messageBytes.Data, message)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		var analytics *Analytics
 		analyticsUpdate := false
+		var analytics *Analytics
 		var analyticsBytes *EntryResponse
-		lidAna := ""
+		var txn *badger.Txn
 		if message.AnalyticsUUID != "" {
-			analyticsBytes, lidAna = analyticsDB.Get(message.AnalyticsUUID)
-			defer analyticsDB.Unlock(message.AnalyticsUUID, lidAna)
-			if lidAna != "" {
+			analyticsBytes, txn = analyticsDB.Get(message.AnalyticsUUID)
+			if txn != nil {
+				defer txn.Discard()
 				analytics = &Analytics{}
 				err = json.Unmarshal(analyticsBytes.Data, analytics)
 				if err != nil {
@@ -478,7 +482,7 @@ func (db *GoDB) handleChatMessageReaction(
 		// Commit changes
 		if analyticsUpdate && analyticsBytes != nil {
 			// Analytics existed -> Update them
-			err = analyticsDB.Update(analyticsBytes.uUID, analyticsJson, lidAna, map[string]string{})
+			err = analyticsDB.Update(txn, analyticsBytes.uUID, analyticsJson, map[string]string{})
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
@@ -496,7 +500,7 @@ func (db *GoDB) handleChatMessageReaction(
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
-			err = db.Update(messageBytes.uUID, messageJson, lidMsg, map[string]string{})
+			err = db.Update(txnMsg, messageBytes.uUID, messageJson, map[string]string{})
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
