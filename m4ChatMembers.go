@@ -29,9 +29,7 @@ type ChatMember struct {
 }
 
 func OpenChatMemberDatabase() *GoDB {
-	db := OpenDB("chatMembers", []string{
-		"chat-usr", "user-friend",
-	})
+	db := OpenDB("chatMembers")
 	return db
 }
 

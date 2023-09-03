@@ -75,9 +75,7 @@ type QueryWord struct {
 }
 
 func OpenWisdomDatabase() *GoDB {
-	db := OpenDB("wisdom", []string{
-		"knowledgeID-type", "refID",
-	})
+	db := OpenDB("wisdom")
 	return db
 }
 

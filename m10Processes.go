@@ -50,9 +50,7 @@ type ProcessPath struct {
 }
 
 func OpenProcessDatabase() *GoDB {
-	db := OpenDB("processes", []string{
-		"knowledgeID",
-	})
+	db := OpenDB("processes")
 	return db
 }
 

@@ -65,9 +65,7 @@ func (db *GoDB) ProtectedFileEndpoints(
 }
 
 func OpenFilesDatabase() *GoDB {
-	db := OpenDB(
-		"files", []string{},
-	)
+	db := OpenDB("files")
 	return db
 }
 

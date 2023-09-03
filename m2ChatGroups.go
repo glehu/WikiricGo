@@ -63,7 +63,7 @@ type FriendGroup struct {
 }
 
 func OpenChatGroupDatabase() *GoDB {
-	db := OpenDB("chatGroups", []string{})
+	db := OpenDB("chatGroups")
 	return db
 }
 

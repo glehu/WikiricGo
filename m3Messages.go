@@ -41,11 +41,7 @@ type ChatActionMessage struct {
 }
 
 func OpenChatMessageDatabase() *GoDB {
-	db := OpenDB(
-		"chatMessages", []string{
-			"chatID",
-		},
-	)
+	db := OpenDB("chatMessages")
 	return db
 }
 

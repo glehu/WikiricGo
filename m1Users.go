@@ -41,9 +41,7 @@ type FriendRequest struct {
 }
 
 func OpenUserDatabase() *GoDB {
-	db := OpenDB("users", []string{
-		"usr",
-	})
+	db := OpenDB("users")
 	return db
 }
 

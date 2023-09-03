@@ -17,7 +17,7 @@ type SampleEntry struct {
 }
 
 func TestDB() {
-	db := OpenDB("debug", []string{"count"})
+	db := OpenDB("debug")
 	defer func() {
 		err := db.CloseDB()
 		if err != nil {

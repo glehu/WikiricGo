@@ -46,7 +46,7 @@ type SelectOptions struct {
 }
 
 // OpenDB creates a named database (e.g. users), initialized with the provided named indices (e.g. username)
-func OpenDB(module string, indices []string) *GoDB {
+func OpenDB(module string) *GoDB {
 	// Set working directory
 	workDirTmp, _ := os.Getwd()
 	dbPath := checkModuleDir(module, workDirTmp)
@@ -58,6 +58,11 @@ func OpenDB(module string, indices []string) *GoDB {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// TODO: Find a suitable spot for value log garbage collection
+	// err = badgerDB.RunValueLogGC(0.5)
+	// if err != nil {
+	// 	return nil
+	// }
 	// Create db struct pointer and return
 	goDB := &GoDB{
 		db:      badgerDB,
@@ -122,7 +127,7 @@ func (db *GoDB) doInsert(uUID []byte, data []byte, indices map[string]string) er
 		//				   	|      Index      |        Data        |
 		//            | --------------- | ------------------ |
 		// 		Main:	 	|	12345 					|	User1, Sample Name |
-		// 		Sub:		|	usr:User1:12345	|	12345							 |
+		// 		Sub:		|	usr:User1|12345	|	12345							 |
 		for k, v := range indices {
 			err := txn.Set([]byte(fmt.Sprintf("%s:%s\\|%s", k, v, uUID)), uUID)
 			if err != nil {
@@ -147,7 +152,7 @@ func (db *GoDB) doUpdate(txn *badger.Txn, uUID []byte, data []byte, indices map[
 	//				   	|      Index      |        Data        |
 	//            | --------------- | ------------------ |
 	// 		Main:	 	|	12345 					|	User1, Sample Name |
-	// 		Sub:		|	usr:User1:12345	|	12345							 |
+	// 		Sub:		|	usr:User1|12345	|	12345							 |
 	for k, v := range indices {
 		err := txn.Set([]byte(fmt.Sprintf("%s:%s\\|%s", k, v, uUID)), uUID)
 		if err != nil {
@@ -168,7 +173,7 @@ func (db *GoDB) Delete(uUID string) error {
 		err := txn.Delete([]byte(uUID))
 		return err
 	})
-	// TODO: Remove all sub index entries
+	// Delete sub index entries by first gathering them
 	return err
 }
 

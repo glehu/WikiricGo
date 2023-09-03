@@ -8,6 +8,6 @@ type Analytics struct {
 }
 
 func OpenAnalyticsDatabase() *GoDB {
-	db := OpenDB("analytics", []string{})
+	db := OpenDB("analytics")
 	return db
 }

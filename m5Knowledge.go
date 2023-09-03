@@ -24,11 +24,7 @@ type Knowledge struct {
 }
 
 func OpenKnowledgeDatabase() *GoDB {
-	db := OpenDB(
-		"knowledge", []string{
-			"chatID",
-		},
-	)
+	db := OpenDB("knowledge")
 	return db
 }
 

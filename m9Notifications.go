@@ -30,11 +30,7 @@ type NotificationsResponse struct {
 }
 
 func OpenNotificationDatabase() *GoDB {
-	db := OpenDB(
-		"notifications", []string{
-			"usr",
-		},
-	)
+	db := OpenDB("notifications")
 	return db
 }
 
