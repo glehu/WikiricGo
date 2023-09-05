@@ -53,6 +53,7 @@ func (db *GoDB) ProtectedChatMessagesEndpoints(
 		r.Post("/edit/{msgID}", db.handleChatMessageEdit(chatServer, chatGroupDB, chatMemberDB))
 		r.Post("/react/{msgID}", db.handleChatMessageReaction(chatServer, chatGroupDB, chatMemberDB, analyticsDB))
 		r.Get("/delete/{msgID}", db.handleChatMessageDelete(chatServer, chatGroupDB, chatMemberDB))
+		// Chat Related Route
 		r.Route("/chat", func(r chi.Router) {
 			r.Get("/get/{chatID}", db.handleChatMessageFromChat(chatServer, chatGroupDB, chatMemberDB, analyticsDB))
 		})

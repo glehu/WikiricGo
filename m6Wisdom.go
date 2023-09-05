@@ -590,7 +590,7 @@ func (db *GoDB) handleWisdomReaction(
 		}
 		// Commit changes
 		if analyticsUpdate && analyticsBytes != nil {
-			txnWis.Discard()
+			txnWis.Discard() // Discard wisdom transaction since we're not updating it in this branch anymore
 			// Analytics existed -> Update them
 			err = analyticsDB.Update(txn, analyticsBytes.uUID, analyticsJson, map[string]string{})
 			if err != nil {

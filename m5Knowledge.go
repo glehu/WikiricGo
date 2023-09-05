@@ -154,7 +154,7 @@ func (db *GoDB) handleKnowledgeGetFromChatID(chatGroupDB, chatMemberDB *GoDB) ht
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
 		}
-		chatID := chi.URLParam(r, "knowledgeID")
+		chatID := chi.URLParam(r, "chatID")
 		if chatID == "" {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
