@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"firebase.google.com/go/messaging"
 	"fmt"
+	"github.com/dgraph-io/badger/v4"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/lestrrat-go/jwx/v2/jwt"
@@ -12,23 +14,27 @@ import (
 	"net/http"
 	"nhooyr.io/websocket"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type Session struct {
-	ChatMember *ChatMember
-	Conn       *websocket.Conn
-	Ctx        context.Context
-	R          *http.Request
-	CanWrite   bool
-	CanRead    bool
+	ChatMember   *ChatMember
+	Conn         *websocket.Conn
+	Ctx          context.Context
+	R            *http.Request
+	CanWrite     bool
+	CanRead      bool
+	ChatName     string
+	ChatParentID string
 }
 
 type ChatServer struct {
-	ChatGroupsMu *sync.RWMutex
-	ChatGroups   *btree.Map[string, map[string]*Session] // Key = ChatGroupUUID Value = Map of [Username]Sessions
-	tokenAuth    *jwtauth.JWTAuth
-	DB           *GoDB
+	ChatGroupsMu        *sync.RWMutex
+	ChatGroups          *btree.Map[string, map[string]*Session]
+	tokenAuth           *jwtauth.JWTAuth
+	DB                  *GoDB
+	NotificationCounter *atomic.Int64
 }
 
 type MessageResponse struct {
@@ -36,36 +42,47 @@ type MessageResponse struct {
 	Msg []byte
 }
 
+type EditMessage struct {
+	MessageID string `json:"uid"`
+	Text      string `json:"text"`
+}
+
+type ReactionMessage struct {
+	MessageID string `json:"uid"`
+	Reaction  string `json:"type"`
+}
+
 func CreateChatServer(db *GoDB) *ChatServer {
 	server := &ChatServer{
-		ChatGroupsMu: &sync.RWMutex{},
-		ChatGroups:   btree.NewMap[string, map[string]*Session](3),
-		DB:           db,
+		ChatGroupsMu:        &sync.RWMutex{},
+		ChatGroups:          btree.NewMap[string, map[string]*Session](3),
+		DB:                  db,
+		NotificationCounter: &atomic.Int64{},
 	}
 	return server
 }
 
 // PublicChatEndpoint will manage all websocket connections
 func (server *ChatServer) PublicChatEndpoint(
-	r chi.Router,
-	tokenAuth *jwtauth.JWTAuth,
-	userDB, chatGroupDB, chatMessagesDB, chatMemberDB *GoDB,
+	r chi.Router, tokenAuth *jwtauth.JWTAuth,
+	userDB, chatGroupDB, chatMessagesDB, chatMemberDB, notificationDB, analyticsDB *GoDB,
+	connector *Connector, fcmClient *messaging.Client,
 ) {
 	server.tokenAuth = tokenAuth
 	// Route
 	r.HandleFunc(
 		"/ws/chat/{chatID}",
 		server.handleChatEndpoint(
-			userDB,
-			chatGroupDB,
-			chatMessagesDB,
-			chatMemberDB,
+			userDB, chatGroupDB, chatMessagesDB, chatMemberDB, notificationDB, analyticsDB,
+			connector, fcmClient,
 		),
 	)
 }
 
 func (server *ChatServer) handleChatEndpoint(
-	userDB, chatGroupDB, chatMessagesDB, chatMemberDB *GoDB) http.HandlerFunc {
+	userDB, chatGroupDB, chatMessagesDB, chatMemberDB, notificationDB, analyticsDB *GoDB,
+	connector *Connector, fcmClient *messaging.Client,
+) http.HandlerFunc {
 	return func(
 		w http.ResponseWriter,
 		r *http.Request,
@@ -80,7 +97,7 @@ func (server *ChatServer) handleChatEndpoint(
 		c, err := websocket.Accept(
 			w,
 			r,
-			nil,
+			&websocket.AcceptOptions{InsecureSkipVerify: true}, // DEBUG
 		)
 		if err != nil {
 			return
@@ -106,25 +123,37 @@ func (server *ChatServer) handleChatEndpoint(
 		// Check if a password was provided in the url query
 		password := r.URL.Query().Get("pw")
 		chatGroup, chatMember, _, err := ReadChatGroupAndMember(
-			chatGroupDB, chatMemberDB, nil, nil, chatID, username, password, r)
+			chatGroupDB, chatMemberDB, notificationDB, connector, chatID, username, password, r)
 		if chatMember == nil || err != nil {
 			_ = c.Close(
-				http.StatusUnauthorized,
-				http.StatusText(http.StatusUnauthorized),
+				http.StatusForbidden,
+				http.StatusText(http.StatusForbidden),
 			)
 			return
 		}
 		canWrite := CheckWriteRights(chatMember.ChatMember, chatGroup.ChatGroup)
 		canRead := CheckReadRights(chatMember.ChatMember, chatGroup.ChatGroup)
+		// Say hi! Send write and read rights over the websocket connection
+		str := fmt.Sprintf("[s:wlcm];%t;%t", canWrite, canRead)
+		err = c.Write(
+			ctx,
+			1, // 1=Text
+			[]byte(str),
+		)
+		if err != nil {
+			return
+		}
 		server.ChatGroupsMu.Lock()
 		sessions, ok := server.ChatGroups.Get(chatIDOriginal)
 		session := &Session{
-			ChatMember: chatMember.ChatMember,
-			Conn:       c,
-			Ctx:        ctx,
-			R:          r,
-			CanWrite:   canWrite,
-			CanRead:    canRead,
+			ChatMember:   chatMember.ChatMember,
+			Conn:         c,
+			Ctx:          ctx,
+			R:            r,
+			CanWrite:     canWrite,
+			CanRead:      canRead,
+			ChatName:     chatGroup.Name,
+			ChatParentID: chatGroup.ParentUUID,
 		}
 		if ok {
 			sessions[chatMember.Username] = session
@@ -140,7 +169,7 @@ func (server *ChatServer) handleChatEndpoint(
 		server.ChatGroupsMu.Unlock()
 		// Replace chatID with original chatID to preserve access to sub chat groups
 		chatMember.ChatGroupUUID = chatIDOriginal
-		server.handleChatSession(session)
+		server.handleChatSession(session, chatGroupDB, chatMemberDB, chatMessagesDB, analyticsDB, fcmClient)
 	}
 }
 
@@ -151,7 +180,7 @@ func (server *ChatServer) checkToken(
 ) (bool, jwt.Token, *http.Request) {
 	// Listen for message
 	ctx := r.Context()
-	typ, msg, err := c.Read(ctx)
+	_, msg, err := c.Read(ctx)
 	if err != nil {
 		return false, nil, nil
 	}
@@ -171,23 +200,9 @@ func (server *ChatServer) checkToken(
 		return false, nil, nil
 	}
 	// Does the user exist?
-	// TODO
 	userName, _ := token.Get("u_name")
-	// Say hi!
-	str := fmt.Sprintf(
-		"wlcm %s!",
-		userName,
-	)
-	err = c.Write(
-		ctx,
-		typ,
-		[]byte(str),
-	)
-	if err != nil {
-		return false, nil, nil
-	}
 	// Get client user
-	userQuery := fmt.Sprintf("%s\\|", userName)
+	userQuery := FIndex(fmt.Sprintf("%s", userName))
 	resp, err := userDB.Select(
 		map[string]string{
 			"usr": userQuery,
@@ -212,7 +227,9 @@ func (server *ChatServer) checkToken(
 	return true, token, r
 }
 
-func (server *ChatServer) handleChatSession(s *Session) {
+func (server *ChatServer) handleChatSession(s *Session,
+	chatGroupDB, chatMemberDB, chatMessagesDB, analyticsDB *GoDB, fcmClient *messaging.Client,
+) {
 	messages, closed := ListenToMessages(
 		s.Conn,
 		s.Ctx,
@@ -230,6 +247,7 @@ func (server *ChatServer) handleChatSession(s *Session) {
 				server.handleIncomingMessage(
 					s,
 					resp,
+					chatGroupDB, chatMemberDB, chatMessagesDB, analyticsDB, fcmClient,
 				)
 			}
 		}
@@ -254,6 +272,8 @@ func (server *ChatServer) dropConnection(s *Session) {
 func (server *ChatServer) handleIncomingMessage(
 	s *Session,
 	resp *MessageResponse,
+	chatGroupDB, chatMemberDB, chatMessagesDB, analyticsDB *GoDB,
+	fcmClient *messaging.Client,
 ) {
 	if !s.CanWrite {
 		return
@@ -265,9 +285,25 @@ func (server *ChatServer) handleIncomingMessage(
 		Username:      s.ChatMember.Username,
 		TimeCreated:   TimeNowIsoString(),
 	}
-	// [c:SC] is a prefix marking the message as pass through only without saving it
 	uUID := ""
-	if len(text) < 6 || text[0:6] != "[c:SC]" {
+	skipSave := false
+	skipDist := false
+	// [c:SC] is a prefix marking the message as pass through only without saving it
+	if len(text) >= 6 && text[0:6] == "[c:SC]" {
+		skipSave = true
+	}
+	// Command messages will also not be saved
+	if len(text) >= 13 && text[0:13] == "[c:EDIT<JSON]" {
+		skipSave = true
+		skipDist = true
+		server.handleEditMessage(s, text[13:], chatMessagesDB)
+	}
+	if len(text) >= 14 && text[0:14] == "[c:REACT<JSON]" {
+		skipSave = true
+		skipDist = true
+		server.handleReactMessage(s, text[14:], chatMessagesDB, analyticsDB)
+	}
+	if !skipSave {
 		jsonEntry, err := json.Marshal(msg)
 		if err != nil {
 			return
@@ -275,33 +311,37 @@ func (server *ChatServer) handleIncomingMessage(
 		uUID, _ = server.DB.Insert(jsonEntry, map[string]string{
 			"chatID": s.ChatMember.ChatGroupUUID,
 		})
+		// Send notification
+		go server.DistributeFCMMessage(s, msg, fcmClient, chatGroupDB, chatMemberDB)
 	}
-	go server.DistributeChatMessageJSON(&ChatMessageContainer{
-		ChatMessage: msg,
-		UUID:        uUID,
-	})
+	if !skipDist {
+		go server.DistributeChatMessageJSON(&ChatMessageContainer{
+			ChatMessage: msg,
+			UUID:        uUID,
+		})
+	}
 }
 
 func (server *ChatServer) DistributeChatMessageJSON(msg *ChatMessageContainer) {
 	server.ChatGroupsMu.RLock()
+	defer server.ChatGroupsMu.RUnlock()
 	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
 	if ok {
 		for _, value := range sessions {
 			_ = WSSendJSON(value.Conn, value.Ctx, msg) // TODO: Drop connection?
 		}
 	}
-	server.ChatGroupsMu.RUnlock()
 }
 
 func (server *ChatServer) DistributeChatActionMessageJSON(msg *ChatActionMessage) {
 	server.ChatGroupsMu.RLock()
+	defer server.ChatGroupsMu.RUnlock()
 	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
 	if ok {
 		for _, value := range sessions {
 			_ = WSSendJSON(value.Conn, value.Ctx, msg) // TODO: Drop connection?
 		}
 	}
-	server.ChatGroupsMu.RUnlock()
 }
 
 func ListenToMessages(
@@ -317,10 +357,6 @@ func ListenToMessages(
 			typ, msg, err := c.Read(ctx)
 			if err != nil {
 				closed <- true
-				fmt.Println(
-					"ws read error",
-					err,
-				)
 				return
 			}
 			resp <- &MessageResponse{
@@ -352,4 +388,271 @@ func WSSendJSON(
 		return err
 	}
 	return nil
+}
+
+func (server *ChatServer) handleEditMessage(s *Session, text string, chatMessagesDB *GoDB) {
+	editMessage := &EditMessage{}
+	err := json.Unmarshal([]byte(text), editMessage)
+	if err != nil {
+		return
+	}
+	// Get message
+	resp, txn := chatMessagesDB.Get(editMessage.MessageID)
+	defer txn.Discard()
+	request := &ChatMessage{}
+	err = json.Unmarshal(resp.Data, request)
+	if err != nil {
+		return
+	}
+	// Initialize message
+	request.Username = s.ChatMember.Username
+	request.Text = editMessage.Text
+	request.WasEdited = true // Edited!
+	// Distribute action message
+	actionMessage := &ChatActionMessage{
+		ChatMessageContainer: &ChatMessageContainer{
+			ChatMessage: request,
+			Analytics:   nil,
+			UUID:        resp.uUID,
+		},
+		Action: "edit",
+	}
+	go server.DistributeChatActionMessageJSON(actionMessage)
+	// Are we editing or actually deleting?
+	if editMessage.Text == "" {
+		// Delete message
+		txn.Discard()
+		err = chatMessagesDB.Delete(editMessage.MessageID, []string{"chatID"})
+		if err != nil {
+			return
+		}
+	} else {
+		// Store message
+		jsonMessage, err := json.Marshal(request)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		err = chatMessagesDB.Update(txn, resp.uUID, jsonMessage, map[string]string{
+			"chatID": request.ChatGroupUUID,
+		})
+	}
+}
+
+func (server *ChatServer) handleReactMessage(s *Session, text string, chatMessagesDB, analyticsDB *GoDB) {
+	editMessage := &ReactionMessage{}
+	err := json.Unmarshal([]byte(text), editMessage)
+	if err != nil {
+		return
+	}
+	// Get message
+	messageBytes, txnMsg := chatMessagesDB.Get(editMessage.MessageID)
+	defer txnMsg.Discard()
+	message := &ChatMessage{}
+	err = json.Unmarshal(messageBytes.Data, message)
+	if err != nil {
+		return
+	}
+	analyticsUpdate := false
+	var analytics *Analytics
+	var analyticsBytes *EntryResponse
+	var txn *badger.Txn
+	if message.AnalyticsUUID != "" {
+		analyticsBytes, txn = analyticsDB.Get(message.AnalyticsUUID)
+		if txn != nil {
+			defer txn.Discard()
+			analytics = &Analytics{}
+			err = json.Unmarshal(analyticsBytes.Data, analytics)
+			if err != nil {
+				// Could not retrieve analytics -> Create new one
+				analytics = nil
+			} else {
+				analyticsUpdate = true
+			}
+		}
+	}
+	// Create analytics if there are none
+	reactionRemoved := false
+	if analytics == nil {
+		analytics = &Analytics{
+			Views:     0,
+			Reactions: make([]Reaction, 1),
+			Downloads: 0,
+			Bookmarks: 0,
+		}
+		// analytics.Reactions[editMessage.Reaction] = []string{s.ChatMember.Username}
+		analytics.Reactions[0] = Reaction{
+			Type:      editMessage.Reaction,
+			Usernames: []string{s.ChatMember.Username},
+		}
+	} else {
+		// Check if reaction is present already, if yes -> remove (toggle functionality)
+		indexReaction := -1
+		indexUser := -1
+		for i, r := range analytics.Reactions {
+			if r.Type == editMessage.Reaction {
+				indexReaction = i
+				// Find user
+				for ix, rUser := range r.Usernames {
+					if rUser == s.ChatMember.Username {
+						// Found -> Remove
+						indexUser = ix
+						break
+					}
+				}
+				break
+			}
+		}
+		if indexReaction != -1 {
+			reactions := analytics.Reactions[indexReaction]
+			if indexUser != -1 {
+				// Delete
+				reactions.Usernames = append(reactions.Usernames[:indexUser], reactions.Usernames[indexUser+1:]...)
+				reactionRemoved = true
+			} else {
+				// Append
+				reactions.Usernames = append(reactions.Usernames, s.ChatMember.Username)
+			}
+			analytics.Reactions[indexReaction] = reactions
+		} else {
+			// No reaction of this type existed yet
+			// analytics.Reactions[editMessage.Reaction] = []string{s.ChatMember.Username}
+			analytics.Reactions = append(analytics.Reactions, Reaction{
+				Type:      editMessage.Reaction,
+				Usernames: []string{s.ChatMember.Username},
+			})
+		}
+	}
+	// Distribute action message
+	actionMsg := &ChatMessage{}
+	actionMsg.Username = s.ChatMember.Username // User that reacted
+	actionMsg.Text = editMessage.Reaction      // Reaction as msg
+	actionMsg.TimeCreated = ""
+	actionMsg.WasEdited = reactionRemoved // Edit=true if reaction existed before thus was removed
+	actionMsg.ChatGroupUUID = message.ChatGroupUUID
+	container := &ChatMessageContainer{
+		ChatMessage: actionMsg,
+		UUID:        messageBytes.uUID,
+	}
+	actionMessage := &ChatActionMessage{
+		ChatMessageContainer: container,
+		Action:               "react",
+	}
+	go server.DistributeChatActionMessageJSON(actionMessage)
+	// Save
+	analyticsJson, err := json.Marshal(analytics)
+	if err != nil {
+		return
+	}
+	// Commit changes
+	if analyticsUpdate && analyticsBytes != nil {
+		// Analytics existed -> Update them
+		err = analyticsDB.Update(txn, analyticsBytes.uUID, analyticsJson, map[string]string{})
+		if err != nil {
+			return
+		}
+	} else {
+		// Insert analytics while returning its UUID to the message for reference
+		message.AnalyticsUUID, err = analyticsDB.Insert(analyticsJson, map[string]string{})
+		if err != nil {
+			return
+		}
+		// Update message
+		messageJson, err := json.Marshal(message)
+		if err != nil {
+			return
+		}
+		err = chatMessagesDB.Update(txnMsg, messageBytes.uUID, messageJson, map[string]string{})
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (server *ChatServer) DistributeFCMMessage(s *Session, msg *ChatMessage, fcmClient *messaging.Client,
+	chatGroupDB, chatMemberDB *GoDB,
+) {
+	if fcmClient == nil {
+		return
+	}
+	// Retrieve members of main chatroom
+	// Check if we're targeting a sub chat since only main chat rooms have members technically
+	mainChatGroup, ok := chatGroupDB.GetMainChatGroup(msg.ChatGroupUUID)
+	if !ok {
+		return
+	}
+	// Retrieve chat members
+	query := FIndex(mainChatGroup.UUID)
+	resp, err := chatMemberDB.Select(
+		map[string]string{
+			"chat-usr": query,
+		}, nil,
+	)
+	if err != nil {
+		return
+	}
+	responseMember := <-resp
+	if len(responseMember) < 1 {
+		return
+	}
+	// Retrieve connected users (we may not notify those under specific circumstances)
+	server.ChatGroupsMu.RLock()
+	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
+	server.ChatGroupsMu.RUnlock()
+	if !ok {
+		return
+	}
+	// Check what members we are going to notify
+	var chatMember *ChatMember
+	tokens := make([]string, 0)
+	i := 0
+	for _, value := range responseMember {
+		chatMember = &ChatMember{}
+		err = json.Unmarshal(value.Data, chatMember)
+		// Skip if json unmarshal failed, members has no FCM subscription or if we're looking at the sender
+		if err != nil || chatMember.FCMToken == "" || chatMember.Username == msg.Username {
+			continue
+		}
+		// Is this member currently connected to this chat group?
+		if sessions[chatMember.Username] != nil {
+			// TODO: Check if this member is inactive (maybe?)
+			continue
+		}
+		// Append token as we are going to notify this member
+		tokens = append(tokens, chatMember.FCMToken)
+		i += 1
+		if i >= 500 {
+			// FCM only allows up to 500 recipients
+			break
+		}
+	}
+	if i < 1 {
+		return
+	}
+	// Set notification link data
+	destinationID := msg.ChatGroupUUID
+	subchatID := ""
+	if s.ChatParentID != "" {
+		// If the message is targeting a subchat, set its parent as the destination instead
+		// The subchat will be referenced, too, but the starting point will be the parent
+		destinationID = s.ChatParentID
+		subchatID = msg.ChatGroupUUID
+	}
+	_, _ = fcmClient.SendMulticast(context.Background(), &messaging.MulticastMessage{
+		Notification: &messaging.Notification{
+			Title: s.ChatName,
+			Body:  fmt.Sprintf("%s has sent a message!", s.ChatMember.DisplayName),
+		},
+		Data: map[string]string{
+			"dlType":      "clarifier",
+			"dlDest":      fmt.Sprintf("/apps/clarifier/wss/%s", destinationID),
+			"subchatGUID": subchatID,
+		},
+		Webpush: &messaging.WebpushConfig{
+			FcmOptions: &messaging.WebpushFcmOptions{
+				Link: fmt.Sprintf("/apps/clarifier/wss/%s", destinationID),
+			},
+		},
+		Tokens: tokens,
+	})
 }

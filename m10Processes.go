@@ -9,8 +9,11 @@ import (
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
 	"net/http"
+	"regexp"
 	"slices"
 	"sort"
+	"strings"
+	"time"
 )
 
 type Process struct {
@@ -18,6 +21,7 @@ type Process struct {
 	Description          string   `json:"desc"`
 	Author               string   `json:"usr"`
 	Categories           []string `json:"cats"`
+	Keywords             string   `json:"keys"`
 	RowIndex             float64  `json:"row"`
 	PreviousUUID         []string `json:"prev"`
 	NextUUID             []string `json:"next"`
@@ -38,16 +42,17 @@ type Process struct {
 type ProcessContainer struct {
 	*Process
 	*Analytics
-	UUID string `json:"uid"`
+	UUID     string  `json:"uid"`
+	Accuracy float64 `json:"accuracy"`
 }
 
 type ProcessPathContainer struct {
-	Process  *ProcessContainer
-	Children []*ProcessContainer
+	Process  *ProcessContainer   `json:"process"`
+	Children []*ProcessContainer `json:"children"`
 }
 
 type ProcessPath struct {
-	Processes []*ProcessPathContainer
+	Processes []*ProcessPathContainer `json:"path"`
 }
 
 type ProcessModification struct {
@@ -56,6 +61,11 @@ type ProcessModification struct {
 	FromUUID string  `json:"fromId"`
 	ToUUID   string  `json:"toId"`
 	RowIndex float64 `json:"row"`
+}
+
+type ProcessQueryResponse struct {
+	TimeSeconds float64             `json:"respTime"`
+	Processes   []*ProcessContainer `json:"processes"`
 }
 
 func OpenProcessDatabase() *GoDB {
@@ -68,10 +78,18 @@ func (db *GoDB) ProtectedProcessEndpoints(
 	chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, analyticsDB *GoDB, connector *Connector,
 ) {
 	r.Route("/process/private", func(r chi.Router) {
+		// ############
+		// ### POST ###
+		// ############
 		r.Post("/create", db.handleProcessCreate(
 			chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, connector))
 		r.Post("/edit/{processID}", db.handleProcessEdit(
 			chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, connector))
+		r.Post("/query/{knowledgeID}", db.handleProcessQuery(
+			chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB))
+		// ###########
+		// ### GET ###
+		// ###########
 		r.Get("/path/{processID}", db.handleProcessGetPath(
 			chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, connector))
 		r.Get("/delete/{processID}", db.handleProcessDelete(
@@ -80,9 +98,6 @@ func (db *GoDB) ProtectedProcessEndpoints(
 }
 
 func (p *Process) Bind(_ *http.Request) error {
-	if p.Name == "" {
-		return errors.New("missing name")
-	}
 	if p.KnowledgeUUID == "" {
 		return errors.New("missing knowledge id")
 	}
@@ -149,12 +164,11 @@ func (db *GoDB) handleProcessCreate(
 		uUID, err := db.Insert(jsonEntry, map[string]string{
 			"knowledgeID": request.KnowledgeUUID,
 		})
-		resp, txn := db.Get(uUID)
-		if txn == nil {
+		resp, ok := db.Read(uUID)
+		if !ok {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		defer txn.Discard()
 		process := &Process{}
 		err = json.Unmarshal(resp.Data, process)
 		if err != nil {
@@ -168,6 +182,7 @@ func (db *GoDB) handleProcessCreate(
 			return
 		}
 		// Update
+		resp, txn := db.Get(uUID)
 		err = process.update(db, txn, resp.uUID)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -334,9 +349,18 @@ func (db *GoDB) rearrangeProcesses(process *Process, rMP *EntryResponse) error {
 				})
 			}
 		} else if position == 1 {
-			// Attach node to the end
-			lastProcess := path.Processes[len(path.Processes)-1].Process
-			process.RowIndex = lastProcess.RowIndex + 20_000.0
+			// Attach task to the end of all other process nodes
+			highestRow := 0.0
+			for _, pEntry := range path.Processes {
+				// Do not check process being edited here since we already did that
+				if pEntry.Process.UUID == rMP.uUID {
+					continue
+				}
+				if pEntry.Process.RowIndex > highestRow {
+					highestRow = pEntry.Process.RowIndex
+				}
+			}
+			process.RowIndex = highestRow + 20_000.0
 		} else if position == 0 {
 			// TODO: Check if row index and row index differences are ok
 		}
@@ -386,8 +410,17 @@ func (db *GoDB) rearrangeProcesses(process *Process, rMP *EntryResponse) error {
 		} else if position == 1 {
 			// Attach node to the end
 			if len(path.Processes[0].Children) > 0 {
-				lastSegment := path.Processes[0].Children[len(path.Processes[0].Children)-1]
-				process.RowIndex = lastSegment.RowIndex + 20_000.0
+				highestRow := 0.0
+				for _, pEntry := range path.Processes[0].Children {
+					// Do not check process being edited here since we already did that
+					if pEntry.UUID == rMP.uUID {
+						continue
+					}
+					if pEntry.RowIndex > highestRow {
+						highestRow = pEntry.RowIndex
+					}
+				}
+				process.RowIndex = highestRow + 20_000.0
 			} else {
 				process.RowIndex = 20_000.0
 			}
@@ -415,12 +448,11 @@ func (db *GoDB) handleProcessEdit(
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, txn := db.Get(processID)
-		if txn == nil {
+		response, ok := db.Read(processID)
+		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
-		defer txn.Discard()
 		process := &Process{}
 		err := json.Unmarshal(response.Data, process)
 		if err != nil {
@@ -455,11 +487,180 @@ func (db *GoDB) handleProcessEdit(
 				return
 			}
 			// Exit without an error if links did not change (maybe a mistake was made)
-			if request.FromUUID == process.PreviousUUID[0] && request.ToUUID == process.NextUUID[0] {
+			if len(process.PreviousUUID) > 0 && request.FromUUID == process.PreviousUUID[0] &&
+				len(process.NextUUID) > 0 && request.ToUUID == process.NextUUID[0] {
 				return
 			}
-			process.PreviousUUID[0] = request.FromUUID
-			process.NextUUID[0] = request.ToUUID
+			// Update links
+			if request.FromUUID != "" {
+				// Check if targeted previous node has a next node
+				// If it doesn't we will check if the current process is supposed to be a sub node
+				// If the current process is a sub node, we will create an empty process to be the next main node
+				respPrev, txnPrev := db.Get(request.FromUUID)
+				if txnPrev == nil {
+					http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+					return
+				}
+				pPrev := &Process{}
+				err := json.Unmarshal(respPrev.Data, pPrev)
+				if err != nil {
+					txnPrev.Discard()
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+				if len(pPrev.NextUUID) < 1 {
+					mode := r.URL.Query().Get("mode")
+					if mode == "sub" {
+						// Create an empty process to be the next main node, enabling the current process to be a sub node
+						jsonEntry, err := json.Marshal(&Process{
+							Author:        process.Author,
+							Categories:    make([]string, 0),
+							PreviousUUID:  make([]string, 0),
+							NextUUID:      make([]string, 0),
+							TimeCreated:   TimeNowIsoString(),
+							IsPublic:      process.IsPublic,
+							KnowledgeUUID: process.KnowledgeUUID,
+							IsRootNode:    false,
+							Collaborators: make([]string, 0),
+							RowIndex:      pPrev.RowIndex + 20_000,
+						})
+						if err != nil {
+							http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+							return
+						}
+						uUID, err := db.Insert(jsonEntry, map[string]string{
+							"knowledgeID": process.KnowledgeUUID,
+						})
+						pPrev.NextUUID = append(pPrev.NextUUID, uUID)
+						jsonEntry, err = json.Marshal(pPrev)
+						if err != nil {
+							http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+							return
+						}
+						err = db.Update(txnPrev, respPrev.uUID, jsonEntry, map[string]string{
+							"knowledgeID": pPrev.KnowledgeUUID,
+						})
+					}
+				}
+				// Check if previous node needs to be dereferenced
+				if len(process.PreviousUUID) > 0 {
+					// Remove link in previous node since it changed now
+					respPrev, txnPrev = db.Get(process.PreviousUUID[0])
+					if txnPrev == nil {
+						http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+						return
+					}
+					defer txnPrev.Discard()
+					pPrev = &Process{}
+					err = json.Unmarshal(respPrev.Data, pPrev)
+					if err != nil {
+						http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+						return
+					}
+					didChange := false
+					for ix, id := range pPrev.NextUUID {
+						if id == processID {
+							if ix == 0 {
+								// We're about to remove a main node, so check if the next main node can be connected
+								if len(process.NextUUID) > 0 {
+									// We have a main node to be used as a replacement
+									pPrev.NextUUID[0] = process.NextUUID[0]
+									didChange = true
+									break
+								} else {
+									// Delete instead of replacing it
+									pPrev.NextUUID = append(pPrev.NextUUID[:ix], pPrev.NextUUID[ix+1:]...)
+								}
+							} else {
+								// We're safe! :D No main node to be removed
+								pPrev.NextUUID = append(pPrev.NextUUID[:ix], pPrev.NextUUID[ix+1:]...)
+								didChange = true
+								break
+							}
+						}
+					}
+					if didChange {
+						jsonEntry, err := json.Marshal(pPrev)
+						if err != nil {
+							http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+							return
+						}
+						err = db.Update(txnPrev, respPrev.uUID, jsonEntry, map[string]string{
+							"knowledgeID": pPrev.KnowledgeUUID,
+						})
+					} else {
+						txnPrev.Discard()
+					}
+					// Update new link
+					process.PreviousUUID[0] = request.FromUUID
+				} else {
+					process.PreviousUUID = append(process.PreviousUUID, request.FromUUID)
+				}
+			} else {
+				if len(process.PreviousUUID) > 0 {
+					process.PreviousUUID[0] = ""
+				}
+			}
+			if request.ToUUID != "" {
+				if len(process.NextUUID) > 0 {
+					// Remove link in next node since it changed now
+					respNext, txnNext := db.Get(process.NextUUID[0])
+					if txnNext == nil {
+						http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+						return
+					}
+					defer txnNext.Discard()
+					pNext := &Process{}
+					err = json.Unmarshal(respNext.Data, pNext)
+					if err != nil {
+						http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+						return
+					}
+					didChange := false
+					for ix, id := range pNext.PreviousUUID {
+						if id == processID {
+							if ix == 0 {
+								// We're about to remove a main node, so check if the next main node can be connected
+								if len(process.PreviousUUID) > 0 {
+									// We have a main node to be used as a replacement
+									pNext.PreviousUUID[0] = process.PreviousUUID[0]
+									didChange = true
+									break
+								} else {
+									// Delete instead of replacing it
+									pNext.PreviousUUID = append(pNext.PreviousUUID[:ix], pNext.PreviousUUID[ix+1:]...)
+								}
+							} else {
+								// We're safe! :D No main node to be removed
+								pNext.PreviousUUID = append(pNext.PreviousUUID[:ix], pNext.PreviousUUID[ix+1:]...)
+								didChange = true
+								break
+							}
+						}
+					}
+					if didChange {
+						jsonEntry, err := json.Marshal(pNext)
+						if err != nil {
+							http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+							return
+						}
+						err = db.Update(txnNext, respNext.uUID, jsonEntry, map[string]string{
+							"knowledgeID": pNext.KnowledgeUUID,
+						})
+					} else {
+						txnNext.Discard()
+					}
+					// Update new link
+					process.NextUUID[0] = request.ToUUID
+				} else {
+					process.NextUUID = append(process.NextUUID, request.ToUUID)
+				}
+			} else {
+				if len(process.NextUUID) > 0 {
+					process.NextUUID[0] = ""
+				}
+			}
+			// Update row index
 			process.RowIndex = request.RowIndex
 			// Check if rows need to be recalculated
 			err = db.rearrangeProcesses(process, response)
@@ -467,8 +668,17 @@ func (db *GoDB) handleProcessEdit(
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
+		} else if request.Field == "title" {
+			process.Name = request.NewValue
+		} else if request.Field == "desc" {
+			process.Description = request.NewValue
 		}
 		// Update
+		_, txn := db.Get(processID)
+		if txn == nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
 		jsonEntry, err := json.Marshal(process)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -477,6 +687,10 @@ func (db *GoDB) handleProcessEdit(
 		err = db.Update(txn, processID, jsonEntry, map[string]string{
 			"knowledgeID": process.KnowledgeUUID,
 		})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
 	}
 }
 
@@ -653,6 +867,12 @@ func (db *GoDB) handleProcessDelete(
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
+		// Delete process node
+		err = db.Delete(processID, []string{"knowledgeID"})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
 		// Do we need to relink process nodes?
 		if len(process.NextUUID) > 0 {
 			// Is there a node before this one?
@@ -748,7 +968,25 @@ func (db *GoDB) handleProcessDelete(
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
 				}
-				prev.NextUUID[0] = ""
+				for ix, id := range prev.NextUUID {
+					if id == processID {
+						if ix == 0 {
+							// We're about to remove a main node, so check if the next main node can be connected
+							if len(process.NextUUID) > 0 {
+								// We have a main node to be used as a replacement
+								prev.NextUUID[0] = process.NextUUID[0]
+								break
+							} else {
+								// Delete instead of replacing it
+								prev.NextUUID = append(prev.NextUUID[:ix], prev.NextUUID[ix+1:]...)
+							}
+						} else {
+							// We're safe! :D No main node to be removed
+							prev.NextUUID = append(prev.NextUUID[:ix], prev.NextUUID[ix+1:]...)
+							break
+						}
+					}
+				}
 				// Commit changes (Prev)
 				jsonEntry, err := json.Marshal(prev)
 				if err != nil {
@@ -761,4 +999,178 @@ func (db *GoDB) handleProcessDelete(
 			}
 		}
 	}
+}
+
+func (db *GoDB) handleProcessQuery(
+	chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB *GoDB,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		timeStart := time.Now()
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		knowledgeID := chi.URLParam(r, "knowledgeID")
+		if knowledgeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		canRead, _ := CheckKnowledgeAccess(user, knowledgeID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		if !canRead {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Retrieve POST payload
+		request := &WisdomQuery{}
+		if err := render.Bind(r, request); err != nil {
+			fmt.Println(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Retrieve all processes
+		resp, err := db.Select(map[string]string{
+			"knowledgeID": knowledgeID,
+		}, nil)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		queryResponse := &ProcessQueryResponse{
+			TimeSeconds: 0,
+			Processes:   make([]*ProcessContainer, 0),
+		}
+		response := <-resp
+		if len(response) < 1 {
+			render.JSON(w, r, queryResponse)
+			return
+		}
+		// Turn query text into a full regex pattern
+		words, p := GetRegexQuery(request.Query)
+		var process *Process
+		var analytics *Analytics
+		var points int64
+		var accuracy float64
+		b := false
+		for _, entry := range response {
+			process = &Process{}
+			err = json.Unmarshal(entry.Data, process)
+			if err != nil {
+				continue
+			}
+			// Flip boolean on each iteration
+			b = !b
+			accuracy, points = GetProcessQueryPoints(process, request, p, words, b)
+			if points <= 0.0 {
+				continue
+			}
+			// Load analytics if available
+			analytics = &Analytics{}
+			if process.AnalyticsUUID != "" {
+				anaBytes, okAna := analyticsDB.Read(process.AnalyticsUUID)
+				if okAna {
+					err = json.Unmarshal(anaBytes.Data, analytics)
+					if err != nil {
+						analytics = &Analytics{}
+					}
+				}
+			}
+			queryResponse.Processes = append(queryResponse.Processes, &ProcessContainer{
+				UUID:      entry.uUID,
+				Process:   process,
+				Analytics: analytics,
+				Accuracy:  accuracy,
+			})
+		}
+		// Sort entries by accuracy
+		if len(queryResponse.Processes) > 1 {
+			sort.SliceStable(
+				queryResponse.Processes, func(i, j int) bool {
+					return queryResponse.Processes[i].Accuracy > queryResponse.Processes[j].Accuracy
+				},
+			)
+		}
+		duration := time.Since(timeStart)
+		queryResponse.TimeSeconds = duration.Seconds()
+		render.JSON(w, r, queryResponse)
+	}
+}
+
+func GetProcessQueryPoints(
+	process *Process, query *WisdomQuery, p *regexp.Regexp, words map[string]*QueryWord, b bool,
+) (float64, int64) {
+	// Get all matches in selected fields
+	var mUser, mName, mDesc, mKeys []string
+	if query.Fields == "" || strings.Contains(query.Fields, "usr") {
+		mUser = p.FindAllString(process.Author, -1)
+	}
+	if query.Fields == "" || strings.Contains(query.Fields, "title") {
+		mName = p.FindAllString(process.Name, -1)
+	}
+	if query.Fields == "" || strings.Contains(query.Fields, "desc") {
+		mDesc = p.FindAllString(process.Description, -1)
+	}
+	if query.Fields == "" || strings.Contains(query.Fields, "keys") {
+		mKeys = p.FindAllString(process.Keywords, -1)
+	}
+	if len(mUser) < 1 && len(mName) < 1 && len(mDesc) < 1 && len(mKeys) < 1 {
+		// Return 0 if there were no matches
+		return 0.0, 0
+	}
+	// Clean up
+	for _, word := range words {
+		word.B = !b
+	}
+	// Calculate points
+	points := int64(0)
+	pointsMax := len(words)
+	accuracy := 0.0
+	for _, word := range mUser {
+		if words[strings.ToLower(word)] != nil {
+			words[strings.ToLower(word)].B = b
+		} else {
+			words[strings.ToLower(word)] = &QueryWord{
+				B:      b,
+				Points: 1,
+			}
+		}
+	}
+	for _, word := range mName {
+		if words[strings.ToLower(word)] != nil {
+			words[strings.ToLower(word)].B = b
+		} else {
+			words[strings.ToLower(word)] = &QueryWord{
+				B:      b,
+				Points: 1,
+			}
+		}
+	}
+	for _, word := range mDesc {
+		if words[strings.ToLower(word)] != nil {
+			words[strings.ToLower(word)].B = b
+		} else {
+			words[strings.ToLower(word)] = &QueryWord{
+				B:      b,
+				Points: 1,
+			}
+		}
+	}
+	for _, word := range mKeys {
+		if words[strings.ToLower(word)] != nil {
+			words[strings.ToLower(word)].B = b
+		} else {
+			words[strings.ToLower(word)] = &QueryWord{
+				B:      b,
+				Points: 1,
+			}
+		}
+	}
+	// How many words were matched?
+	for _, word := range words {
+		if word.B == b {
+			points += word.Points
+		}
+	}
+	accuracy = float64(points) / float64(pointsMax)
+	return accuracy, points
 }

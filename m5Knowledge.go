@@ -23,6 +23,11 @@ type Knowledge struct {
 	Categories    []Category `json:"cats"`
 }
 
+type KnowledgeEntry struct {
+	*Knowledge
+	UUID string `json:"uid"`
+}
+
 func OpenKnowledgeDatabase() *GoDB {
 	db := OpenDB("knowledge")
 	return db
@@ -32,8 +37,14 @@ func (db *GoDB) ProtectedKnowledgeEndpoints(
 	r chi.Router, tokenAuth *jwtauth.JWTAuth, chatGroupDB, chatMemberDB *GoDB, chatServer *ChatServer,
 ) {
 	r.Route("/knowledge/private", func(r chi.Router) {
+		// ############
+		// ### POST ###
+		// ############
 		r.Post("/create", db.handleKnowledgeCreate(chatGroupDB, chatMemberDB, chatServer))
 		r.Post("/cats/mod/{knowledgeID}", db.handleKnowledgeCategoryModification())
+		// ###########
+		// ### GET ###
+		// ###########
 		r.Get("/get/{knowledgeID}", db.handleKnowledgeGet(chatGroupDB, chatMemberDB))
 		r.Get("/chat/{chatID}", db.handleKnowledgeGetFromChatID(chatGroupDB, chatMemberDB))
 	})
@@ -143,7 +154,10 @@ func (db *GoDB) handleKnowledgeGet(chatGroupDB, chatMemberDB *GoDB) http.Handler
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
-		render.JSON(w, r, knowledge)
+		render.JSON(w, r, &KnowledgeEntry{
+			Knowledge: knowledge,
+			UUID:      response.uUID,
+		})
 	}
 }
 
@@ -159,7 +173,7 @@ func (db *GoDB) handleKnowledgeGetFromChatID(chatGroupDB, chatMemberDB *GoDB) ht
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		query := fmt.Sprintf("%s\\|", chatID)
+		query := FIndex(chatID)
 		resp, err := db.Select(map[string]string{
 			"chatID": query,
 		}, &SelectOptions{
@@ -196,7 +210,10 @@ func (db *GoDB) handleKnowledgeGetFromChatID(chatGroupDB, chatMemberDB *GoDB) ht
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
-		render.JSON(w, r, knowledge)
+		render.JSON(w, r, &KnowledgeEntry{
+			Knowledge: knowledge,
+			UUID:      response[0].uUID,
+		})
 	}
 }
 

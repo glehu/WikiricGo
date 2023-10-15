@@ -5,10 +5,14 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
+	"firebase.google.com/go/messaging"
 	"fmt"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
 	"github.com/go-chi/httprate"
 	"github.com/go-chi/jwtauth/v5"
+	"github.com/gofrs/uuid"
 	"log"
 	"net/http"
 	"os"
@@ -27,10 +31,8 @@ var tokenAuth *jwtauth.JWTAuth
 var cs chan bool
 
 func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
-	userDB, chatGroupDB,
-	chatMemberDB, chatMessagesDB, fileDB, analyticsDB,
-	notificationDB, knowledgeDB, wisdomDB, processDB *GoDB,
-	chatServer *ChatServer, connector *Connector,
+	dbList *Databases, chatServer *ChatServer, connector *Connector,
+	fcmClient *messaging.Client, emailClient *EmailClient,
 ) {
 	startTime := time.Now()
 	fmt.Println(":: INIT SERVER")
@@ -48,33 +50,48 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
 			httprate.WithKeyFuncs(httprate.KeyByIP, httprate.KeyByEndpoint),
 		),
 	)
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"https://*", "http://*"},
+		AllowedMethods:   []string{"GET", "POST", "DELETE", "OPTIONS", "HEAD"},
+		AllowedHeaders:   []string{"*"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300, // Maximum value not ignored by any of major browsers
+	}))
 	// Debug
 	callCounter := &atomic.Int64{}
 	// Pagination Middleware
 	r.Use(PaginationMiddleware())
 	r.Use(CallCounterMiddleware(callCounter))
 	// Routes -> Public
-	setPublicRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB,
-		notificationDB, chatServer, connector, callCounter, startTime)
-	// -> Basic Auth
-	setBasicProtectedRoutes(r, userDB)
-	// -> JWT Bearer Auth
-	setJWTProtectedRoutes(r, userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB,
-		analyticsDB, notificationDB, knowledgeDB, wisdomDB, processDB, chatServer, connector)
-	// Shutdown URL
-	setShutdownURL(r)
+	setPublicRoutes(r, dbList, chatServer, connector, callCounter, startTime, fcmClient, emailClient)
+	// Routes -> Basic Auth
+	setBasicProtectedRoutes(r, dbList.Map["users"])
+	// Routes -> JWT Bearer Auth
+	setJWTProtectedRoutes(r, dbList, chatServer, connector)
+	// PWA (Progressive Web App)
+	vueJSWikiricEndpoint(r)
+	// Shutdown URL with random access token
+	shutdownURL, err := uuid.NewV4()
+	if err != nil {
+		log.Fatal("FATAL ERROR GENERATING SHUTDOWN URL TOKEN")
+	}
+	setShutdownURL(r, shutdownURL.String())
 	// Start Server
 	go func() {
 		var err error
 		if !isSecure {
-			fmt.Println(":: SERVE HTTP 8080")
-			err = http.ListenAndServe(":8080", r)
+			url := fmt.Sprintf("%s:%s", config.Host, config.Port)
+			fmt.Println(":: SERVE HTTP ", url)
+			err = http.ListenAndServe(url, r)
 		} else {
-			fmt.Println(":: SERVE HTTPS 443")
 			workDir, _ := os.Getwd()
 			pathFullchain := filepath.Join(workDir, "fullchain.pem")
 			pathPrivateKey := filepath.Join(workDir, "privkey.pem")
-			err = http.ListenAndServeTLS(":443", pathFullchain, pathPrivateKey, r)
+			url := fmt.Sprintf("%s:%s", config.Host, config.PortTLS)
+			fmt.Println(":: SERVE HTTPS ", url)
+			err = http.ListenAndServeTLS(url,
+				pathFullchain, pathPrivateKey, r)
 		}
 		if err != nil {
 			fmt.Println(":: SERVER ERROR", err)
@@ -90,27 +107,28 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
 }
 
 func setupJWTAuth(config Config) {
-	tokenAuth = jwtauth.New("HS256", []byte(config.jwtSecret), nil)
+	tokenAuth = jwtauth.New("HS256", []byte(config.JwtSecret), nil)
 	generateDebugToken()
 }
 
-func generateToken(user *User) string {
+func generateToken(user *User) (string, int64) {
 	claims := map[string]interface{}{
 		"u_name": user.Username,
 	}
-	jwtauth.SetExpiryIn(claims, time.Minute*30)
+	expiresIn := 1 * time.Hour
+	jwtauth.SetExpiryIn(claims, expiresIn)
 	_, tokenString, err := tokenAuth.Encode(claims)
 	if err != nil {
 		log.Panicf("err generating jwt token for %s", user.Username)
 	}
-	return tokenString
+	return tokenString, expiresIn.Milliseconds()
 }
 
 func generateDebugToken() {
 	claims := map[string]interface{}{
 		"u_name": "debug_usr",
 	}
-	jwtauth.SetExpiryIn(claims, time.Minute*30)
+	jwtauth.SetExpiryIn(claims, 1*time.Hour)
 	_, tokenString, _ := tokenAuth.Encode(claims)
 	decoded, _ := tokenAuth.Decode(tokenString)
 	userName, _ := decoded.Get("_name")
@@ -141,24 +159,34 @@ func FileExists(filename string) bool {
 	return !info.IsDir()
 }
 
-func setShutdownURL(r chi.Router) {
-	r.Get("/secret/shutdown", handleShutdown)
+func setShutdownURL(r chi.Router, url string) {
+	r.Get(fmt.Sprintf("/shutdown/%s", url), handleShutdown)
 }
 
-func setPublicRoutes(r chi.Router,
-	userDB, chatGroupDB, chatMessagesDB, chatMemberDB, fileDB, notificationDB *GoDB,
+func setPublicRoutes(r chi.Router, dbList *Databases,
 	chatServer *ChatServer, connector *Connector, callCounter *atomic.Int64, startTime time.Time,
+	fcmClient *messaging.Client, emailClient *EmailClient,
 ) {
 	r.Get("/sample", sampleMessage)
-	r.Get("/debug", handleDebugEndpoint(chatServer, connector, callCounter, startTime))
-	vueJSWikiricEndpoint(r)
-	// Users
-	userDB.PublicUserEndpoints(r, tokenAuth, notificationDB)
-	// Chat WS Server
-	chatServer.PublicChatEndpoint(r, tokenAuth, userDB, chatGroupDB, chatMessagesDB, chatMemberDB)
-	fileDB.PublicFileEndpoints(r, tokenAuth)
-	// Connector WS Server
-	connector.PublicConnectorEndpoint(r, tokenAuth, userDB, chatGroupDB, chatMessagesDB, chatMemberDB)
+	r.Get("/debug", handleDebugEndpoint(dbList, chatServer, connector, callCounter, startTime))
+	// #### Users
+	dbList.Map["users"].PublicUserEndpoints(r, tokenAuth, dbList.Map["notifications"])
+	// #### Chat WS Server
+	chatServer.PublicChatEndpoint(r, tokenAuth,
+		dbList.Map["users"], dbList.Map["chats"], dbList.Map["msg"],
+		dbList.Map["members"], dbList.Map["notifications"], dbList.Map["analytics"],
+		connector, fcmClient)
+	// #### Files
+	dbList.Map["files"].PublicFileEndpoints(r, tokenAuth)
+	// #### Connector WS Server
+	connector.PublicConnectorEndpoint(r, tokenAuth,
+		dbList.Map["users"], dbList.Map["chats"], dbList.Map["msg"], dbList.Map["members"])
+	// #### Stores
+	dbList.Map["stores"].PublicStoreEndpoints(r, tokenAuth,
+		dbList.Map["items"], dbList.Map["orders"], dbList.Map["notifications"], dbList.Map["analytics"],
+		connector, emailClient)
+	// #### Items
+	dbList.Map["items"].PublicItemsEndpoints(r, tokenAuth, dbList.Map["stores"], dbList.Map["analytics"])
 }
 
 func setBasicProtectedRoutes(r chi.Router, userDB *GoDB) {
@@ -180,16 +208,14 @@ func setBasicProtectedRoutes(r chi.Router, userDB *GoDB) {
 }
 
 func setJWTProtectedRoutes(
-	r chi.Router, userDB, chatGroupDB, chatMessagesDB, chatMemberDB,
-	fileDB, analyticsDB, notificationDB, knowledgeDB, wisdomDB, processDB *GoDB,
-	chatServer *ChatServer, connector *Connector,
+	r chi.Router, dbList *Databases, chatServer *ChatServer, connector *Connector,
 ) {
 	r.Group(
 		func(r chi.Router) {
 			// Seek, verify and validate JWT tokens
 			r.Use(jwtauth.Verifier(tokenAuth))
 			r.Use(jwtauth.Authenticator)
-			r.Use(BearerAuth(userDB))
+			r.Use(BearerAuth(dbList.Map["users"]))
 			// Debug/Testing Route
 			r.Get(
 				"/jwt", func(w http.ResponseWriter, r *http.Request) {
@@ -199,23 +225,42 @@ func setJWTProtectedRoutes(
 			)
 			// Protected routes
 			// #### Users
-			userDB.ProtectedUserEndpoints(r, tokenAuth, chatGroupDB, chatMemberDB, notificationDB, connector)
+			dbList.Map["users"].ProtectedUserEndpoints(r, tokenAuth,
+				dbList.Map["chats"], dbList.Map["members"], dbList.Map["notifications"], connector)
 			// #### Chat Groups
-			chatGroupDB.ProtectedChatGroupEndpoints(r, tokenAuth, userDB, chatMemberDB)
+			dbList.Map["chats"].ProtectedChatGroupEndpoints(r, tokenAuth,
+				dbList.Map["users"], dbList.Map["chats"], dbList.Map["members"], dbList.Map["files"], chatServer)
 			// #### Chat Messages
-			chatMessagesDB.ProtectedChatMessagesEndpoints(r, tokenAuth, chatServer, chatGroupDB, chatMemberDB, analyticsDB)
+			dbList.Map["msg"].ProtectedChatMessagesEndpoints(r, tokenAuth, chatServer,
+				dbList.Map["chats"], dbList.Map["members"], dbList.Map["analytics"])
 			// #### Files
-			fileDB.ProtectedFileEndpoints(r, tokenAuth, userDB, chatGroupDB, chatMemberDB)
+			dbList.Map["files"].ProtectedFileEndpoints(r, tokenAuth,
+				dbList.Map["users"], dbList.Map["chats"], dbList.Map["members"])
 			// #### Notifications
-			notificationDB.ProtectedNotificationEndpoints(r, tokenAuth)
+			dbList.Map["notifications"].ProtectedNotificationEndpoints(r, tokenAuth)
 			// #### Knowledge
-			knowledgeDB.ProtectedKnowledgeEndpoints(r, tokenAuth, chatGroupDB, chatMemberDB, chatServer)
+			dbList.Map["knowledge"].ProtectedKnowledgeEndpoints(r, tokenAuth,
+				dbList.Map["chats"], dbList.Map["members"], chatServer)
 			// #### Wisdom
-			wisdomDB.ProtectedWisdomEndpoints(r, tokenAuth,
-				chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, analyticsDB, connector)
+			dbList.Map["wisdom"].ProtectedWisdomEndpoints(r, tokenAuth,
+				dbList.Map["chats"], dbList.Map["members"], dbList.Map["notifications"],
+				dbList.Map["knowledge"], dbList.Map["analytics"], dbList.Map["periodic"], connector)
 			// #### Processes
-			processDB.ProtectedProcessEndpoints(r, tokenAuth,
-				chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, analyticsDB, connector)
+			dbList.Map["process"].ProtectedProcessEndpoints(r, tokenAuth,
+				dbList.Map["chats"], dbList.Map["members"], dbList.Map["notifications"],
+				dbList.Map["knowledge"], dbList.Map["analytics"], connector)
+			// #### Periodic Actions
+			dbList.Map["periodic"].ProtectedPeriodicActionsEndpoints(r, tokenAuth, dbList, connector)
+			// #### Stores
+			dbList.Map["stores"].ProtectedStoreEndpoints(r, tokenAuth,
+				dbList.Map["users"], dbList.Map["notifications"], dbList.Map["files"], connector)
+			// #### Items
+			dbList.Map["items"].ProtectedItemEndpoints(r, tokenAuth,
+				dbList.Map["stores"], dbList.Map["users"], dbList.Map["notifications"],
+				dbList.Map["analytics"], dbList.Map["files"])
+			// #### Orders
+			dbList.Map["orders"].ProtectedOrdersEndpoints(r, tokenAuth,
+				dbList.Map["users"], dbList.Map["notifications"], dbList.Map["stores"], connector)
 		},
 	)
 }
@@ -238,29 +283,14 @@ func sampleMessage(w http.ResponseWriter, req *http.Request) {
 // vueJSWikiricEndpoint serves the wikiric vueJS PWA website
 func vueJSWikiricEndpoint(r chi.Router) {
 	workDir, _ := os.Getwd()
-	filesDir := http.Dir(filepath.Join(workDir, "vue", "dist"))
-	FileServer(r, "/", filesDir)
-}
-
-// FileServer conveniently sets up a http.FileServer handler to serve
-// static files from a http.FileSystem.
-func FileServer(r chi.Router, path string, root http.FileSystem) {
-	if strings.ContainsAny(path, "{}*") {
-		panic("FileServer does not permit any URL parameters.")
-	}
-	if path != "/" && path[len(path)-1] != '/' {
-		r.Get(path, http.RedirectHandler(path+"/", 301).ServeHTTP)
-		path += "/"
-	}
-	path += "*"
-	r.Get(
-		path, func(w http.ResponseWriter, r *http.Request) {
-			rctx := chi.RouteContext(r.Context())
-			pathPrefix := strings.TrimSuffix(rctx.RoutePattern(), "/*")
-			fs := http.StripPrefix(pathPrefix, http.FileServer(root))
-			fs.ServeHTTP(w, r)
-		},
-	)
+	filesDir := filepath.Join(workDir, "vue", "dist")
+	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+		if _, err := os.Stat(filesDir + r.URL.Path); errors.Is(err, os.ErrNotExist) {
+			http.ServeFile(w, r, filepath.Join(filesDir, "index.html"))
+		} else {
+			http.ServeFile(w, r, filesDir+r.URL.Path)
+		}
+	})
 }
 
 func BasicAuth(userDB *GoDB) func(next http.Handler) http.Handler {
@@ -274,7 +304,7 @@ func BasicAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 					return
 				}
 				// Check if user exists in the database then compare passwords
-				query := fmt.Sprintf("%s\\|", user)
+				query := FIndex(user)
 				resp, err := userDB.Select(
 					map[string]string{
 						"usr": query,
@@ -286,6 +316,7 @@ func BasicAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 				}
 				response := <-resp
 				if len(response) < 1 {
+					fmt.Printf("LOGIN for %s failed: user does not exist\n", user)
 					basicAuthFailed(w)
 					return
 				}
@@ -303,6 +334,7 @@ func BasicAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 				userPass := fmt.Sprintf("%x", h.Sum(nil))
 				// Compare both passwords
 				if subtle.ConstantTimeCompare([]byte(userPass), []byte(credPass)) != 1 {
+					fmt.Printf("LOGIN for %s failed: password does not match\n", user)
 					basicAuthFailed(w)
 					return
 				}
@@ -327,7 +359,7 @@ func BearerAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 				// Get client user
 				_, claims, _ := jwtauth.FromContext(r.Context())
 				username := claims["u_name"].(string)
-				userQuery := fmt.Sprintf("%s\\|", username)
+				userQuery := FIndex(username)
 				resp, err := userDB.Select(
 					map[string]string{
 						"usr": userQuery,
@@ -442,7 +474,7 @@ func CallCounterMiddleware(c *atomic.Int64) func(next http.Handler) http.Handler
 }
 
 func handleDebugEndpoint(
-	cs *ChatServer, c *Connector, callCounter *atomic.Int64, startTime time.Time,
+	dbList *Databases, cs *ChatServer, c *Connector, callCounter *atomic.Int64, startTime time.Time,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sb := &strings.Builder{}
@@ -478,6 +510,20 @@ func handleDebugEndpoint(
 			sb.WriteString(fmt.Sprintf("Uptime Mins:   %.2f\n", timeSince.Minutes()))
 		} else {
 			sb.WriteString(fmt.Sprintf("Uptime Hours:  %.2f\n", timeSince.Hours()))
+		}
+		// DB
+		sb.WriteString("\n[ DATABASES ]\n")
+		sb.WriteString("LSM  = (Indices) Log-Structured-Merge-Tree\n")
+		sb.WriteString("VLOG = (Entries) Value-Log\n\n")
+		var lsm, vlog int64
+		var lsmF, vlogF float64
+		for key, value := range dbList.Map {
+			lsm, vlog = value.db.Size()
+			lsmF = float64(lsm)
+			vlogF = float64(vlog)
+			lsmF = lsmF / 1_000_000
+			vlogF = vlogF / 1_000_000
+			sb.WriteString(fmt.Sprintf("DB <%s>\n\t\tLSM  %f MB\n\t\tVLOG %f MB\n", key, lsmF, vlogF))
 		}
 		// Return to client
 		_, _ = w.Write([]byte(sb.String()))

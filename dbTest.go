@@ -111,7 +111,7 @@ func testDelete(db *GoDB, uUID string) {
 	time.Sleep(time.Second)
 	start := time.Now()
 	// Delete entry from database
-	err := db.Delete(uUID)
+	err := db.Delete(uUID, []string{"count"})
 	if err != nil {
 		log.Panic(err)
 	}

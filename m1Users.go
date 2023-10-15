@@ -12,13 +12,24 @@ import (
 	"github.com/go-chi/render"
 	"github.com/gofrs/uuid"
 	"net/http"
+	"strings"
 )
 
 type User struct {
-	Username    string `json:"usr"`
-	DisplayName string `json:"name"`
-	Email       string `json:"email"`
-	PassHash    string `json:"pwhash"`
+	Username    string       `json:"usr"`
+	DisplayName string       `json:"name"`
+	Email       string       `json:"email"`
+	PassHash    string       `json:"pwhash"`
+	Badges      []*UserBadge `json:"badges"`
+	DateCreated string       `json:"ts"`
+}
+
+type UserBadge struct {
+	Name        string `json:"t"`
+	Description string `json:"desc"`
+	Experience  int64  `json:"xp"`
+	Date        string `json:"ts"`
+	BadgeID     string `json:"id"`
 }
 
 type RegisterRequest struct {
@@ -40,6 +51,27 @@ type FriendRequest struct {
 	Message  string `json:"msg"`
 }
 
+type LoginResponse struct {
+	HttpCode    int16  `json:"httpCode"`
+	Token       string `json:"token"`
+	ExpiresInMs int64  `json:"expiresInMs"`
+	Username    string `json:"username"`
+	DisplayName string `json:"displayName"`
+}
+
+type UserStatusRequest struct {
+	Usernames []string `json:"usernames"`
+}
+
+type UserStatusResponse struct {
+	Users []*UserStatus `json:"users"`
+}
+
+type UserStatus struct {
+	Username string `json:"usr"`
+	Status   string `json:"status"`
+}
+
 func OpenUserDatabase() *GoDB {
 	db := OpenDB("users")
 	return db
@@ -47,13 +79,22 @@ func OpenUserDatabase() *GoDB {
 
 func (db *GoDB) PublicUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, notificationDB *GoDB) {
 	r.Route("/users/public", func(r chi.Router) {
-		r.Get("/count", db.handleUserCount())
+		// ############
+		// ### POST ###
+		// ############
 		r.Post("/signup", db.handleUserRegistration(notificationDB))
+		// ###########
+		// ### GET ###
+		// ###########
+		r.Get("/count", db.handleUserCount())
 	})
 }
 
 func (db *GoDB) BasicProtectedUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth) {
 	r.Route("/auth/private", func(r chi.Router) {
+		// ###########
+		// ### GET ###
+		// ###########
 		r.Get("/signin", db.handleUserLogin())
 	})
 }
@@ -61,8 +102,16 @@ func (db *GoDB) BasicProtectedUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWT
 func (db *GoDB) ProtectedUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 	chatGroupDB, chatMemberDB, notificationDB *GoDB, connector *Connector) {
 	r.Route("/users/private", func(r chi.Router) {
+		// ############
+		// ### POST ###
+		// ############
 		r.Post("/mod", db.handleUserModification())
 		r.Post("/befriend", db.handleUserFriendRequest(chatGroupDB, chatMemberDB, notificationDB, connector))
+		r.Post("/status", db.handleUserGetStatus(connector))
+		// ###########
+		// ### GET ###
+		// ###########
+		r.Get("/state", handleUserSetState(connector))
 	})
 }
 
@@ -92,14 +141,22 @@ func (db *GoDB) getUserCount() int64 {
 	if err != nil {
 		return -1
 	}
-	return int64(count)
+	countHalved := float64(count) / 2.0
+	return int64(countHalved)
 }
 
 func (db *GoDB) handleUserLogin() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
-		token := generateToken(user)
-		_, _ = fmt.Fprintln(w, token)
+		token, expiresInMs := generateToken(user)
+		response := &LoginResponse{
+			HttpCode:    200,
+			Token:       token,
+			ExpiresInMs: expiresInMs,
+			Username:    user.Username,
+			DisplayName: user.DisplayName,
+		}
+		render.JSON(w, r, response)
 	}
 }
 
@@ -113,15 +170,19 @@ func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
 		}
 		// Check Parameters
 		if request.Username == "" {
-			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			http.Error(w, "missing username", http.StatusBadRequest)
 			return
 		}
 		if request.Password == "" {
-			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			http.Error(w, "missing password", http.StatusBadRequest)
+			return
+		}
+		if strings.Contains(request.Username, ";") {
+			http.Error(w, "illegal character in username", http.StatusBadRequest)
 			return
 		}
 		// Check if this user exists already
-		query := fmt.Sprintf("%s\\|", request.Username)
+		query := FIndex(request.Username)
 		resp, err := db.Select(map[string]string{
 			"usr": query,
 		}, &SelectOptions{
@@ -152,6 +213,7 @@ func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
 			DisplayName: request.DisplayName,
 			Email:       request.Email,
 			PassHash:    passwordHash,
+			DateCreated: TimeNowIsoString(),
 		}
 		jsonEntry, err := json.Marshal(newUser)
 		if err != nil {
@@ -159,7 +221,7 @@ func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
 			return
 		}
 		uUID, err := db.Insert(jsonEntry, map[string]string{
-			"usr": request.Username,
+			"usr": FIndex(request.Username),
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -180,7 +242,7 @@ func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
 		jsonNotification, err := json.Marshal(notification)
 		if err == nil {
 			_, _ = notificationDB.Insert(jsonNotification, map[string]string{
-				"usr": request.Username,
+				"usr": FIndex(request.Username),
 			})
 		}
 	}
@@ -203,6 +265,13 @@ func (a *UserModification) Bind(_ *http.Request) error {
 func (a *FriendRequest) Bind(_ *http.Request) error {
 	if a.Username == "" {
 		return errors.New("missing username")
+	}
+	return nil
+}
+
+func (a *UserStatusRequest) Bind(_ *http.Request) error {
+	if a.Usernames == nil {
+		return errors.New("missing usernames")
 	}
 	return nil
 }
@@ -230,7 +299,6 @@ func (db *GoDB) handleUserModification() http.HandlerFunc {
 		if request.Type == "edit" {
 			if request.Field == "name" {
 				err = db.changeUserDisplayName(user, userUUID, request)
-
 			} else if request.Field == "pw" {
 				err = db.changeUserPassword(user, userUUID, request)
 			}
@@ -289,7 +357,7 @@ func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserMod
 }
 
 func (db *GoDB) GetUserFromUsername(username string) *User {
-	userQuery := fmt.Sprintf("%s\\|", username)
+	userQuery := FIndex(username)
 	resp, err := db.Select(
 		map[string]string{
 			"usr": userQuery,
@@ -349,8 +417,8 @@ func (db *GoDB) handleUserFriendRequest(
 			Type:        "dm",
 			Description: "",
 			TimeCreated: TimeNowIsoString(),
-			RulesRead:   []string{"members"},
-			RulesWrite:  []string{"members"},
+			RulesRead:   []string{"member"},
+			RulesWrite:  []string{"member"},
 			Roles: []ChatRole{
 				{
 					Name:     "owner",
@@ -384,10 +452,17 @@ func (db *GoDB) handleUserFriendRequest(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
+		var friendRequestMsg string
+		if request.Message == "" {
+			friendRequestMsg = fmt.Sprintf("%s sent you a friend request!", user.DisplayName)
+		} else {
+			friendRequestMsg = fmt.Sprintf(
+				"%s sent you a friend request with a message:\n\n%s", user.DisplayName, request.Message)
+		}
 		// Now send the friend request to the remote user by creating a notification
 		notification := &Notification{
 			Title:             "Friend Request",
-			Description:       fmt.Sprintf("%s sent you a friend request!", user.DisplayName),
+			Description:       friendRequestMsg,
 			Type:              "frequest",
 			TimeCreated:       TimeNowIsoString(),
 			RecipientUsername: request.Username,
@@ -419,8 +494,69 @@ func (db *GoDB) handleUserFriendRequest(
 			Action:        "frequest",
 			ReferenceUUID: notificationUUID,
 			Username:      user.DisplayName,
-			Message:       fmt.Sprintf("%s sent you a friend request!", user.DisplayName),
+			Message:       friendRequestMsg,
 		}
 		_ = WSSendJSON(session.Conn, session.Ctx, cMSG)
+	}
+}
+
+func (db *GoDB) handleUserGetStatus(connector *Connector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		// Retrieve POST payload
+		request := &UserStatusRequest{}
+		if err := render.Bind(r, request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		activeUsers := &UserStatusResponse{Users: make([]*UserStatus, 0)}
+		connector.SessionsMu.RLock()
+		defer connector.SessionsMu.RUnlock()
+		for _, username := range request.Usernames {
+			usr, ok := connector.Sessions.Get(username)
+			if ok {
+				activeUsers.Users = append(activeUsers.Users, &UserStatus{
+					Username: username,
+					Status:   usr.Status,
+				})
+			} else {
+				activeUsers.Users = append(activeUsers.Users, &UserStatus{
+					Username: username,
+					Status:   "offline",
+				})
+			}
+		}
+		render.JSON(w, r, activeUsers)
+	}
+}
+
+func handleUserSetState(connector *Connector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		status := r.URL.Query().Get("status")
+		if status == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		connector.SessionsMu.RLock()
+		usr, ok := connector.Sessions.Get(user.Username)
+		if !ok {
+			connector.SessionsMu.RUnlock()
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		usr.Status = status
+		connector.SessionsMu.RUnlock()
+		connector.SessionsMu.Lock()
+		connector.Sessions.Set(user.Username, usr)
+		connector.SessionsMu.Unlock()
 	}
 }

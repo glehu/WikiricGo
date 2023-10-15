@@ -1,3 +1,5 @@
 {
-  "jwtSecret": "75439fh329f4h92gh542"
+  "jwtSecret": "75439fh329f4h92gh542",
+  "ip": "localhost",
+  "port": "9999"
 }

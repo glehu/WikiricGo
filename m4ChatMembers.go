@@ -26,6 +26,8 @@ type ChatMember struct {
 	ThumbnailAnimatedURL string   `json:"iurla"`
 	BannerURL            string   `json:"burl"`
 	BannerAnimatedURL    string   `json:"burla"`
+	FCMToken             string   `json:"fcm"`
+	DateCreated          string   `json:"ts"`
 }
 
 func OpenChatMemberDatabase() *GoDB {
@@ -59,7 +61,7 @@ func (member *ChatMember) GetRoleInformation(group *ChatGroup) *ChatRole {
 }
 
 func (db *GoDB) CheckFriendGroupExist(selfUser, friendUser string) (string, error) {
-	query := fmt.Sprintf("((%s\\|%s)|(%s\\|%s))\\|", selfUser, friendUser, friendUser, selfUser)
+	query := fmt.Sprintf("%s;%s", selfUser, friendUser)
 	resp, err := db.Select(map[string]string{
 		"user-friend": query,
 	}, &SelectOptions{

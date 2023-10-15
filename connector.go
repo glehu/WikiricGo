@@ -15,14 +15,15 @@ import (
 )
 
 type CSession struct {
-	User *User
-	Conn *websocket.Conn
-	Ctx  context.Context
+	User   *User
+	Conn   *websocket.Conn
+	Ctx    context.Context
+	Status string
 }
 
 type Connector struct {
 	SessionsMu     *sync.RWMutex
-	Sessions       *btree.Map[string, *CSession] // Key = ChatGroupUUID Value = Map of [Username]Sessions
+	Sessions       *btree.Map[string, *CSession] // Key = Username Value = CSession
 	tokenAuth      *jwtauth.JWTAuth
 	notificationDB *GoDB
 }
@@ -74,7 +75,7 @@ func (connector *Connector) handleConnectorEndpoint(
 		c, err := websocket.Accept(
 			w,
 			r,
-			nil,
+			&websocket.AcceptOptions{InsecureSkipVerify: true}, // DEBUG
 		)
 		if err != nil {
 			return
@@ -110,13 +111,14 @@ func (connector *Connector) handleConnectorEndpoint(
 		}
 		// Add session to connector sessions
 		connector.SessionsMu.Lock()
-		defer connector.SessionsMu.Unlock()
 		session := &CSession{
-			User: user,
-			Conn: c,
-			Ctx:  ctx,
+			User:   user,
+			Conn:   c,
+			Ctx:    ctx,
+			Status: "online",
 		}
 		connector.Sessions.Set(username, session)
+		connector.SessionsMu.Unlock()
 		// Handle connection
 		connector.handleChatSession(session)
 	}
@@ -209,6 +211,16 @@ func (connector *Connector) handleIncomingMessage(
 	}
 	// Forward?
 	if cMsg.Type == CForward {
-
+		connector.SessionsMu.RLock()
+		defer connector.SessionsMu.RUnlock()
+		user, ok := connector.Sessions.Get(cMsg.Username)
+		if !ok {
+			return
+		}
+		_ = user.Conn.Write(
+			user.Ctx,
+			resp.Typ,
+			resp.Msg,
+		)
 	}
 }

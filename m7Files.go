@@ -14,6 +14,7 @@ import (
 	"github.com/shopspring/decimal"
 	"golang.org/x/image/draw"
 	"image"
+	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"net/http"
@@ -34,8 +35,8 @@ const (
 type FileSubmission struct {
 	DataBase64    string `json:"base64"`
 	Filename      string `json:"name"`
-	ChatGroupUUID string `json:"chatId"`
-	IsPrivate     bool   `json:"isPrivate"`
+	ChatGroupUUID string `json:"pid"`
+	IsPrivate     bool   `json:"priv"`
 }
 
 type FileMeta struct {
@@ -49,8 +50,20 @@ type FileMeta struct {
 	IsPrivate     bool    `json:"priv"`
 }
 
+type FileMetaEntry struct {
+	*FileMeta
+	UUID string `json:"uid"`
+}
+
+type FileList struct {
+	Files []*FileMetaEntry `json:"files"`
+}
+
 func (db *GoDB) PublicFileEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth) {
 	r.Route("/files/public", func(r chi.Router) {
+		// ###########
+		// ### GET ###
+		// ###########
 		r.Get("/get/{fileID}", db.handleFileGet())
 	})
 }
@@ -59,8 +72,16 @@ func (db *GoDB) ProtectedFileEndpoints(
 	r chi.Router, tokenAuth *jwtauth.JWTAuth, userDB, chatGroupDB, chatMemberDB *GoDB,
 ) {
 	r.Route("/files/private", func(r chi.Router) {
+		// ############
+		// ### POST ###
+		// ############
 		r.Post("/create", db.handleFileCreate(userDB, chatGroupDB, chatMemberDB))
+		// ###########
+		// ### GET ###
+		// ###########
 		r.Get("/meta/{fileID}", db.handleFileMetaGet(chatGroupDB, chatMemberDB))
+		r.Get("/chat/{chatID}", db.handleFilesGetFromChat(chatGroupDB, chatMemberDB))
+		r.Get("/delete/{fileID}", db.handleFileDelete())
 	})
 }
 
@@ -224,7 +245,21 @@ func checkArchiveDir(userDir string) error {
 	return nil
 }
 
-func (db *GoDB) SaveBase64AsFile(user *User, request *FileSubmission, fileSizeMB float64) (string, error) {
+func (db *GoDB) SaveBase64AsFile(
+	user *User, request *FileSubmission, fileSizeMB float64,
+) (string, error) {
+	return db.saveBase64AsFile(user, request, fileSizeMB, "")
+}
+
+func (db *GoDB) SaveBase64AsPredefinedFile(
+	user *User, request *FileSubmission, fileExt string, fileSizeMB float64,
+) (string, error) {
+	return db.saveBase64AsFile(user, request, fileSizeMB, fileExt)
+}
+
+func (db *GoDB) saveBase64AsFile(
+	user *User, request *FileSubmission, fileSizeMB float64, fileExtOverride string,
+) (string, error) {
 	data, fileExt, fileType, mimeType := GetBase64FileInformation(request.DataBase64)
 	dec, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
@@ -238,6 +273,8 @@ func (db *GoDB) SaveBase64AsFile(user *User, request *FileSubmission, fileSizeMB
 			img, err = png.Decode(r)
 		} else if fileExt == ".jpg" {
 			img, err = jpeg.Decode(r)
+		} else if fileExt == ".gif" {
+			img, err = gif.Decode(r)
 		}
 		if err != nil {
 			return "", err
@@ -245,7 +282,11 @@ func (db *GoDB) SaveBase64AsFile(user *User, request *FileSubmission, fileSizeMB
 		// We have the image now -> Check if resize is necessary
 		bounds := img.Bounds()
 		scaleX, scaleY, scaled := getScaledDimensions(bounds.Max.X, bounds.Max.Y, 1920, 1080)
-		if scaled {
+		if scaled || fileExtOverride != "" {
+			// Are we overriding the file extension?
+			if fileExtOverride != "" {
+				fileExt = fileExtOverride
+			}
 			// Scaled -> Resize necessary
 			dst := image.NewRGBA(image.Rect(0, 0, scaleX, scaleY))
 			draw.NearestNeighbor.Scale(dst, dst.Rect, img, img.Bounds(), draw.Over, nil)
@@ -256,12 +297,18 @@ func (db *GoDB) SaveBase64AsFile(user *User, request *FileSubmission, fileSizeMB
 				err = png.Encode(resizedBytes, dst)
 			} else if fileExt == ".jpg" {
 				err = jpeg.Encode(resizedBytes, dst, nil)
+			} else if fileExt == ".gif" {
+				err = gif.Encode(resizedBytes, dst, nil)
 			}
 			if err != nil {
 				return "", err
 			}
 			dec = b.Bytes()
 		}
+	}
+	// Are we overriding the file extension?
+	if fileExtOverride != "" {
+		fileExt = fileExtOverride
 	}
 	// Sanitize the filename and build full path
 	filename := ExtractFilename(request.Filename)
@@ -273,6 +320,9 @@ func (db *GoDB) SaveBase64AsFile(user *User, request *FileSubmission, fileSizeMB
 	// We will use a UUID for the internal file name
 	// to avoid having to search for duplicate names
 	uUIDFile, err := uuid.NewV7()
+	if filename == "" {
+		filename = uUIDFile.String()
+	}
 	if err != nil {
 		return "", err
 	}
@@ -312,7 +362,7 @@ func (db *GoDB) SaveBase64AsFile(user *User, request *FileSubmission, fileSizeMB
 	if err != nil {
 		return "", err
 	}
-	uUID, err := db.Insert(jsonEntry, map[string]string{})
+	uUID, err := db.Insert(jsonEntry, map[string]string{"chatID": request.ChatGroupUUID})
 	return uUID, nil
 }
 
@@ -418,7 +468,6 @@ func (db *GoDB) handleFileGet() http.HandlerFunc {
 		}
 		w.Header().Set("Content-Disposition",
 			fmt.Sprintf("attachment; filename=\"%s\"", fileMeta.Filename))
-		w.WriteHeader(http.StatusOK)
 		http.ServeFile(w, r, fileMeta.Path)
 	}
 }
@@ -464,6 +513,113 @@ func (db *GoDB) handleFileMetaGet(chatGroupDB, chatMemberDB *GoDB) http.HandlerF
 		// Sanitize
 		fileMeta.Path = fmt.Sprintf("files/public/get/%s", response.uUID)
 		// Respond
-		render.JSON(w, r, fileMeta)
+		render.JSON(w, r, &FileMetaEntry{
+			FileMeta: fileMeta,
+			UUID:     response.uUID,
+		})
+	}
+}
+
+func (db *GoDB) handleFilesGetFromChat(chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		chatID := chi.URLParam(r, "chatID")
+		if chatID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		response, ok := chatGroupDB.Read(chatID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		chat := &ChatGroup{}
+		err := json.Unmarshal(response.Data, chat)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Is the file protected?
+		chatGroup, chatMember, _, err := ReadChatGroupAndMember(
+			chatGroupDB, chatMemberDB, nil, nil,
+			chatID, user.Username, "", r)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		canRead := CheckReadRights(chatMember.ChatMember, chatGroup.ChatGroup)
+		if !canRead {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		files := &FileList{Files: make([]*FileMetaEntry, 0)}
+		// Retrieve all files
+		respFiles, err := db.Select(map[string]string{"chatID": chatID}, nil)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		responseFiles := <-respFiles
+		if len(responseFiles) < 1 {
+			// Respond
+			render.JSON(w, r, files)
+			return
+		}
+		for _, entry := range responseFiles {
+			file := &FileMeta{}
+			err = json.Unmarshal(entry.Data, file)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			// Sanitize
+			file.Path = fmt.Sprintf("files/public/get/%s", entry.uUID)
+			files.Files = append(files.Files, &FileMetaEntry{
+				FileMeta: file,
+				UUID:     entry.uUID,
+			})
+		}
+		// Respond
+		render.JSON(w, r, files)
+	}
+}
+
+func (db *GoDB) handleFileDelete() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		fileID := chi.URLParam(r, "fileID")
+		if fileID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		response, ok := db.Read(fileID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		fileMeta := &FileMeta{}
+		err := json.Unmarshal(response.Data, fileMeta)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if fileMeta.Username != user.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		err = db.Delete(fileID, []string{"chatID"})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		_ = os.Remove(fileMeta.Path)
 	}
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
@@ -38,9 +37,13 @@ func (db *GoDB) ProtectedNotificationEndpoints(
 	r chi.Router, tokenAuth *jwtauth.JWTAuth,
 ) {
 	r.Route("/notification/private", func(r chi.Router) {
+		// ###########
+		// ### GET ###
+		// ###########
 		r.Get("/read", db.handleNotificationRead())
 		r.Get("/get/{notificationID}", db.handleNotificationGet())
 		r.Get("/delete/{notificationID}", db.handleNotificationDelete())
+		r.Get("/tidy", db.handleNotificationTidy())
 	})
 }
 
@@ -107,35 +110,10 @@ func (db *GoDB) handleNotificationDelete() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
-		err = db.Delete(notificationID)
+		err = db.Delete(notificationID, []string{"usr"})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
-		}
-		// Do we need to delete other notifications as well?
-		tidyQuery := r.URL.Query().Get("tidy")
-		if tidyQuery != "" {
-			query := fmt.Sprintf("%s\\|", user.Username)
-			resp, err := db.Select(map[string]string{
-				"usr": query,
-			}, nil)
-			if err != nil {
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				return
-			}
-			response := <-resp
-			if len(response) > 0 {
-				// Delete unimportant notifications
-				for _, notifEntry := range response {
-					notification = &Notification{}
-					err = json.Unmarshal(notifEntry.Data, notification)
-					if err == nil {
-						if notification.Type != "frequest" {
-							_ = db.Delete(notifEntry.uUID)
-						}
-					}
-				}
-			}
 		}
 	}
 }
@@ -147,7 +125,7 @@ func (db *GoDB) handleNotificationRead() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
 		}
-		query := fmt.Sprintf("%s\\|", user.Username)
+		query := FIndex(user.Username)
 		resp, err := db.Select(map[string]string{
 			"usr": query,
 		}, nil)
@@ -173,5 +151,36 @@ func (db *GoDB) handleNotificationRead() http.HandlerFunc {
 			}
 		}
 		render.JSON(w, r, notifications)
+	}
+}
+
+func (db *GoDB) handleNotificationTidy() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		query := FIndex(user.Username)
+		resp, err := db.Select(map[string]string{
+			"usr": query,
+		}, nil)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		response := <-resp
+		if len(response) > 0 {
+			// Delete unimportant notifications
+			for _, notifEntry := range response {
+				notification := &Notification{}
+				err = json.Unmarshal(notifEntry.Data, notification)
+				if err == nil {
+					if notification.Type != "frequest" {
+						_ = db.Delete(notifEntry.uUID, []string{"usr"})
+					}
+				}
+			}
+		}
 	}
 }

@@ -127,8 +127,13 @@ func (db *GoDB) handleChatMessageEdit(chatServer *ChatServer, chatGroupDB, chatM
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
 		}
+		msgID := chi.URLParam(r, "msgID")
+		if msgID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
 		// Retrieve POST payload
-		request := &ChatMessageContainer{}
+		request := &ChatMessage{}
 		if err := render.Bind(r, request); err != nil {
 			fmt.Println(err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -150,7 +155,7 @@ func (db *GoDB) handleChatMessageEdit(chatServer *ChatServer, chatGroupDB, chatM
 			return
 		}
 		// Get message
-		_, txn := db.Get(request.UUID)
+		_, txn := db.Get(msgID)
 		defer txn.Discard()
 		// Initialize message
 		request.TimeCreated = TimeNowIsoString()
@@ -158,8 +163,11 @@ func (db *GoDB) handleChatMessageEdit(chatServer *ChatServer, chatGroupDB, chatM
 		request.WasEdited = true // Edited!
 		// Distribute action message
 		actionMessage := &ChatActionMessage{
-			ChatMessageContainer: request,
-			Action:               "edit",
+			ChatMessageContainer: &ChatMessageContainer{
+				ChatMessage: request,
+				UUID:        msgID,
+			},
+			Action: "edit",
 		}
 		go chatServer.DistributeChatActionMessageJSON(actionMessage)
 		// Store message
@@ -169,17 +177,16 @@ func (db *GoDB) handleChatMessageEdit(chatServer *ChatServer, chatGroupDB, chatM
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(txn, request.UUID, jsonMessage, map[string]string{
+		err = db.Update(txn, msgID, jsonMessage, map[string]string{
 			"chatID": request.ChatGroupUUID,
-		},
-		)
+		})
 		if err != nil {
 			fmt.Println(err)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 		// Respond to client
-		_, _ = fmt.Fprintln(w, request.UUID)
+		_, _ = fmt.Fprintln(w, msgID)
 	}
 }
 
@@ -337,7 +344,7 @@ func (db *GoDB) handleChatMessageDelete(chatServer *ChatServer, chatGroupDB, cha
 		go chatServer.DistributeChatActionMessageJSON(actionMessage)
 		// Delete message
 		txn.Discard()
-		err = db.Delete(msgID)
+		err = db.Delete(msgID, []string{"chatID"})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -422,36 +429,51 @@ func (db *GoDB) handleChatMessageReaction(
 		if analytics == nil {
 			analytics = &Analytics{
 				Views:     0,
-				Reactions: make(map[string][]string, 1),
+				Reactions: make([]Reaction, 1),
 				Downloads: 0,
 				Bookmarks: 0,
 			}
-			analytics.Reactions[request.Reaction] = []string{user.Username}
+			// analytics.Reactions[request.Reaction] = []string{s.ChatMember.Username}
+			analytics.Reactions[0] = Reaction{
+				Type:      request.Reaction,
+				Usernames: []string{user.Username},
+			}
 		} else {
 			// Check if reaction is present already, if yes -> remove (toggle functionality)
-			index := -1
-			rUsers, ok := analytics.Reactions[request.Reaction]
-			if ok && len(rUsers) > 0 {
-				for ix, rUser := range rUsers {
-					if rUser == user.Username {
-						// Found -> Remove
-						index = ix
-						break
+			indexReaction := -1
+			indexUser := -1
+			for i, r := range analytics.Reactions {
+				if r.Type == request.Reaction {
+					indexReaction = i
+					// Find user
+					for ix, rUser := range r.Usernames {
+						if rUser == user.Username {
+							// Found -> Remove
+							indexUser = ix
+							break
+						}
 					}
+					break
 				}
-				reactions := analytics.Reactions[request.Reaction]
-				if index != -1 {
+			}
+			if indexReaction != -1 {
+				reactions := analytics.Reactions[indexReaction]
+				if indexUser != -1 {
 					// Delete
-					reactions = append(reactions[:index], reactions[index+1:]...)
+					reactions.Usernames = append(reactions.Usernames[:indexUser], reactions.Usernames[indexUser+1:]...)
 					reactionRemoved = true
 				} else {
 					// Append
-					reactions = append(reactions, user.Username)
+					reactions.Usernames = append(reactions.Usernames, user.Username)
 				}
-				analytics.Reactions[request.Reaction] = reactions
+				analytics.Reactions[indexReaction] = reactions
 			} else {
 				// No reaction of this type existed yet
-				analytics.Reactions[request.Reaction] = []string{user.Username}
+				// analytics.Reactions[request.Reaction] = []string{user.Username}
+				analytics.Reactions = append(analytics.Reactions, Reaction{
+					Type:      request.Reaction,
+					Usernames: []string{user.Username},
+				})
 			}
 		}
 		// Distribute action message
@@ -460,7 +482,7 @@ func (db *GoDB) handleChatMessageReaction(
 		actionMsg.Text = request.Reaction  // Reaction as msg
 		actionMsg.TimeCreated = ""
 		actionMsg.WasEdited = reactionRemoved // Edit=true if reaction existed before thus was removed
-		actionMsg.ChatGroupUUID = chatID
+		actionMsg.ChatGroupUUID = message.ChatGroupUUID
 		container := &ChatMessageContainer{
 			ChatMessage: actionMsg,
 			UUID:        messageBytes.uUID,
@@ -473,7 +495,6 @@ func (db *GoDB) handleChatMessageReaction(
 		// Save
 		analyticsJson, err := json.Marshal(analytics)
 		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 		// Commit changes

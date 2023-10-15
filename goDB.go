@@ -105,6 +105,7 @@ func (db *GoDB) Insert(data []byte, indices map[string]string) (string, error) {
 	return uUID, nil
 }
 
+// Update overrides an existing entry and its sub-indices if provided
 func (db *GoDB) Update(txn *badger.Txn, uUID string, data []byte, indices map[string]string) error {
 	indicesClean, _ := db.validateIndices(indices, false)
 	err := db.doUpdate(txn, []byte(uUID), data, indicesClean)
@@ -127,9 +128,9 @@ func (db *GoDB) doInsert(uUID []byte, data []byte, indices map[string]string) er
 		//				   	|      Index      |        Data        |
 		//            | --------------- | ------------------ |
 		// 		Main:	 	|	12345 					|	User1, Sample Name |
-		// 		Sub:		|	usr:User1|12345	|	12345							 |
+		// 		Sub:		|	usr:User1;12345	|	12345							 |
 		for k, v := range indices {
-			err := txn.Set([]byte(fmt.Sprintf("%s:%s\\|%s", k, v, uUID)), uUID)
+			err := txn.Set([]byte(fmt.Sprintf("%s:%s;%s", k, v, uUID)), uUID)
 			if err != nil {
 				return err
 			}
@@ -152,9 +153,27 @@ func (db *GoDB) doUpdate(txn *badger.Txn, uUID []byte, data []byte, indices map[
 	//				   	|      Index      |        Data        |
 	//            | --------------- | ------------------ |
 	// 		Main:	 	|	12345 					|	User1, Sample Name |
-	// 		Sub:		|	usr:User1|12345	|	12345							 |
+	// 		Sub:		|	usr:User1;12345	|	12345							 |
 	for k, v := range indices {
-		err := txn.Set([]byte(fmt.Sprintf("%s:%s\\|%s", k, v, uUID)), uUID)
+		// Delete existing index
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Reverse = true
+		it := txn.NewIterator(opts)
+		prefix := []byte(fmt.Sprintf("%s:", k))
+		for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
+			// Match!
+			item := it.Item()
+			_ = item.Value(func(val []byte) error {
+				if bytes.Equal(val, uUID) {
+					_ = txn.Delete(item.KeyCopy(nil))
+				}
+				return nil
+			})
+		}
+		it.Close()
+		// Set new index
+		err := txn.Set([]byte(fmt.Sprintf("%s:%s;%s", k, v, uUID)), uUID)
 		if err != nil {
 			return err
 		}
@@ -164,23 +183,45 @@ func (db *GoDB) doUpdate(txn *badger.Txn, uUID []byte, data []byte, indices map[
 }
 
 // Delete removes an entry from the database
-func (db *GoDB) Delete(uUID string) error {
+func (db *GoDB) Delete(uUID string, indices []string) error {
 	if uUID == "" {
 		return errors.New("missing uuid")
 	}
+	bUUID := []byte(uUID)
 	err := db.db.Update(func(txn *badger.Txn) error {
 		// Delete main index entry
 		err := txn.Delete([]byte(uUID))
-		return err
+		if err != nil {
+			return err
+		}
+		// Delete sub index entries
+		for _, k := range indices {
+			opts := badger.DefaultIteratorOptions
+			opts.PrefetchValues = false
+			opts.Reverse = true
+			it := txn.NewIterator(opts)
+			prefix := []byte(fmt.Sprintf("%s:", k))
+			for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
+				// Match!
+				item := it.Item()
+				_ = item.Value(func(val []byte) error {
+					if bytes.Equal(val, bUUID) {
+						_ = txn.Delete(item.KeyCopy(nil))
+					}
+					return nil
+				})
+			}
+			it.Close()
+		}
+		return nil
 	})
-	// Delete sub index entries by first gathering them
 	return err
 }
 
 func (db *GoDB) Get(uUID string) (*EntryResponse, *badger.Txn) {
 	var ixEntry []byte
 	err := db.db.View(func(txn *badger.Txn) error {
-		// Delete main index entry
+		// Get main index entry
 		ix, err := txn.Get([]byte(uUID))
 		if err != nil {
 			return err
