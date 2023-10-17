@@ -878,7 +878,7 @@ func notifyFriendRequestAccept(refUsername string, user *User,
 		return err
 	}
 	notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
-		"usr": refUsername,
+		"usr": FIndex(refUsername),
 	})
 	if err != nil {
 		return err
@@ -939,7 +939,7 @@ func notifyJoin(selfName string, chatMemberDB, notificationDB *GoDB, connector *
 			continue
 		}
 		notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
-			"usr": chatMember.Username,
+			"usr": FIndex(chatMember.Username),
 		})
 		if err != nil {
 			continue

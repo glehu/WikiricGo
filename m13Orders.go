@@ -121,6 +121,7 @@ func (db *GoDB) ProtectedOrdersEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAut
 		// ###########
 		r.Get("/orders", db.handleOrdersGetOwn())
 		r.Get("/commissions", db.handleOrdersGetCommissions(storeDB))
+		r.Get("/cancel/{orderID}", db.handleOrderCancel(storeDB))
 	})
 }
 
@@ -211,6 +212,7 @@ func CalculateOrder(itemDB *GoDB, order *Order, sanitize bool) error {
 		grossTotal += net + (net * vat)
 	}
 	order.GrossTotal = grossTotal
+	order.NetTotal = netTotal
 	return nil
 }
 
@@ -240,7 +242,7 @@ func NotifyBuyerOrderConfirmation(store *Store, order *Order, orderID string,
 	jsonNotification, err := json.Marshal(notification)
 	if err == nil {
 		_, _ = notificationDB.Insert(jsonNotification, map[string]string{
-			"usr": order.Username,
+			"usr": FIndex(order.Username),
 		})
 	}
 	return nil
@@ -258,9 +260,8 @@ func NotifyStoreOwnerOrderConfirmation(store *Store, order *Order, orderID strin
 	_ = emailClient.sendMail(to, []byte(subject), []byte(msg.String()))
 	// Notification
 	notification := &Notification{
-		Title: "New Order",
-		Description: fmt.Sprintf(
-			"Order (%s) from %s was commissioned by %s", orderID, order.TimeCreated, order.Username),
+		Title:             "New Order",
+		Description:       "A new commission came in!",
 		Type:              "info",
 		TimeCreated:       TimeNowIsoString(),
 		RecipientUsername: store.Username,
@@ -271,7 +272,7 @@ func NotifyStoreOwnerOrderConfirmation(store *Store, order *Order, orderID strin
 	jsonNotification, err := json.Marshal(notification)
 	if err == nil {
 		_, _ = notificationDB.Insert(jsonNotification, map[string]string{
-			"usr": store.Username,
+			"usr": FIndex(store.Username),
 		})
 	}
 	return nil
@@ -406,7 +407,7 @@ func (db *GoDB) handleOrdersGetCommissions(storeDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		orderList := make([]*OrderEntry, 0)
+		orderList := &OrderList{Orders: make([]*OrderEntry, 0)}
 		response = <-resp
 		if len(response) < 1 {
 			render.JSON(w, r, orderList)
@@ -416,14 +417,72 @@ func (db *GoDB) handleOrdersGetCommissions(storeDB *GoDB) http.HandlerFunc {
 		for _, orderResp := range response {
 			order = &Order{}
 			err = json.Unmarshal(orderResp.Data, order)
-			if err != nil {
+			if err != nil || order.State == "cancel" { // TODO: Allow cancelled with query parameter
 				continue
 			}
-			orderList = append(orderList, &OrderEntry{
+			orderList.Orders = append(orderList.Orders, &OrderEntry{
 				Order: order,
 				UUID:  orderResp.uUID,
 			})
 		}
 		render.JSON(w, r, orderList)
+	}
+}
+
+func (db *GoDB) handleOrderCancel(storeDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		orderID := chi.URLParam(r, "orderID")
+		if orderID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve order
+		response, txn := db.Get(orderID)
+		if response == nil || txn == nil {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		order := &Order{}
+		err := json.Unmarshal(response.Data, order)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if order belongs to caller's store
+		if order.StoreUUID != "" {
+			orderResp, ok := storeDB.Read(order.StoreUUID)
+			if !ok {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			store := &Store{}
+			err = json.Unmarshal(orderResp.Data, order)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			if store.Username != user.Username {
+				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+				return
+			}
+		}
+		// Cancel order
+		order.State = "cancel"
+		// TODO: Notify
+		// Update
+		jsonEntry, err := json.Marshal(order)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		err = db.Update(txn, response.uUID, jsonEntry, map[string]string{
+			"usr": FIndex(user.Username),
+			"pid": order.StoreUUID,
+		})
 	}
 }

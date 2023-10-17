@@ -319,7 +319,7 @@ func (db *GoDB) changeUserDisplayName(user *User, userUUID string, request *User
 		return err
 	}
 	err = db.Update(txn, userUUID, userBytes, map[string]string{
-		"usr": user.Username,
+		"usr": FIndex(user.Username),
 	})
 	if err != nil {
 		return err
@@ -348,7 +348,7 @@ func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserMod
 		return err
 	}
 	err = db.Update(txn, userUUID, userBytes, map[string]string{
-		"usr": user.Username,
+		"usr": FIndex(user.Username),
 	})
 	if err != nil {
 		return err
@@ -476,7 +476,7 @@ func (db *GoDB) handleUserFriendRequest(
 			return
 		}
 		notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
-			"usr": request.Username,
+			"usr": FIndex(request.Username),
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)

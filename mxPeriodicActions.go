@@ -202,7 +202,7 @@ func (db *GoDB) processSinglePeriodicAction(
 				continue
 			}
 			notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
-				"usr": recip.Username,
+				"usr": FIndex(recip.Username),
 			})
 			if err != nil {
 				continue
@@ -310,7 +310,7 @@ func notifyWebhookFailed(
 			continue
 		}
 		notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
-			"usr": recip.Username,
+			"usr": FIndex(recip.Username),
 		})
 		if err != nil {
 			continue

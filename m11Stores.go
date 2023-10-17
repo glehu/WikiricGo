@@ -146,7 +146,7 @@ func (db *GoDB) handleStoreCreate(notificationDB *GoDB, connector *Connector) ht
 		jsonNotification, err := json.Marshal(notification)
 		if err == nil {
 			_, _ = notificationDB.Insert(jsonNotification, map[string]string{
-				"usr": request.Username,
+				"usr": FIndex(request.Username),
 			})
 		}
 	}
@@ -455,11 +455,7 @@ func (db *GoDB) handleStoreOrder(itemDB, orderDB, notificationDB, analyticsDB *G
 	connector *Connector, emailClient *EmailClient,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// user := r.Context().Value("user").(*User)
-		// if user == nil {
-		//   http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-		//   return
-		// }
+		// We do not retrieve the user as usual since this is an unauthorized endpoint
 		// Retrieve POST payload
 		request := &Order{}
 		if err := render.Bind(r, request); err != nil {
@@ -493,6 +489,7 @@ func (db *GoDB) handleStoreOrder(itemDB, orderDB, notificationDB, analyticsDB *G
 				item.Variations = make([]ItemVariation, 0)
 			} else {
 				// Check if there are duplicate variations
+				// TODO: Also check if mandatory variations are missing
 				vars = map[string]string{}
 				for _, variation := range item.Variations {
 					if vars[variation.Name] != "" {
@@ -525,7 +522,7 @@ func (db *GoDB) handleStoreOrder(itemDB, orderDB, notificationDB, analyticsDB *G
 			return
 		}
 		uUID, err := orderDB.Insert(orderJson, map[string]string{
-			"usr": request.Username,
+			"usr": FIndex(request.Username),
 			"pid": request.StoreUUID,
 		})
 		// Respond

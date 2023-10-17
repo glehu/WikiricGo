@@ -920,7 +920,7 @@ func NotifyWisdomCollaborators(title, message string, user *User, wisdom *Wisdom
 			continue
 		}
 		notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
-			"usr": collab,
+			"usr": FIndex(collab),
 		})
 		if err != nil {
 			continue
