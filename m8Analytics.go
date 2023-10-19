@@ -1,5 +1,7 @@
 package main
 
+const AnaDB = "m8"
+
 type Analytics struct {
 	Views     int64      `json:"views"`
 	Reactions []Reaction `json:"reacts"` // Map of reactions e.g. upvote (+) with usernames
@@ -10,9 +12,4 @@ type Analytics struct {
 type Reaction struct {
 	Type      string   `json:"t"`
 	Usernames []string `json:"src"`
-}
-
-func OpenAnalyticsDatabase() *GoDB {
-	db := OpenDB("analytics")
-	return db
 }

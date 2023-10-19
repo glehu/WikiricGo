@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const StoreDB = "m11"
+
 type Store struct {
 	Name                 string      `json:"t"`
 	Username             string      `json:"usr"`
@@ -24,6 +26,7 @@ type Store struct {
 	BannerURL            string      `json:"burl"`
 	BannerAnimatedURL    string      `json:"burla"`
 	BankDetails          BankDetails `json:"bank"`
+	AnalyticsUUID        string      `json:"ana"` // Views, likes etc. will be stored in a separate database
 }
 
 type BankDetails struct {
@@ -45,36 +48,31 @@ type StoreModification struct {
 	NewValue string `json:"new"`
 }
 
-func OpenStoresDatabase() *GoDB {
-	db := OpenDB("stores")
-	return db
-}
-
 func (db *GoDB) PublicStoreEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
-	itemDB, orderDB, notificationDB, analyticsDB *GoDB, connector *Connector, emailClient *EmailClient,
+	rapidDB *GoDB, connector *Connector, emailClient *EmailClient,
 ) {
 	r.Route("/stores/public", func(r chi.Router) {
 		// ############
 		// ### POST ###
 		// ############
 		r.Post("/order/{storeID}", db.handleStoreOrder(
-			itemDB, orderDB, notificationDB, analyticsDB, connector, emailClient))
+			rapidDB, connector, emailClient))
 		// ###########
 		// ### GET ###
 		// ###########
-		r.Get("/get/{storeID}", db.handleStoreVisit())
+		r.Get("/get/{storeID}", db.handleStoreVisit(rapidDB))
 	})
 }
 
 func (db *GoDB) ProtectedStoreEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
-	userDB, notificationDB, filesDB *GoDB, connector *Connector,
+	rapidDB *GoDB, connector *Connector,
 ) {
 	r.Route("/stores/private", func(r chi.Router) {
 		// ############
 		// ### POST ###
 		// ############
-		r.Post("/create", db.handleStoreCreate(notificationDB, connector))
-		r.Post("/mod/{storeID}", db.handleStoreModification(filesDB))
+		r.Post("/create", db.handleStoreCreate(rapidDB, connector))
+		r.Post("/mod/{storeID}", db.handleStoreModification(rapidDB))
 		r.Post("/cats/mod/{storeID}", db.handleStoreCategoryModification())
 		// ###########
 		// ### GET ###
@@ -100,11 +98,28 @@ func (a *StoreModification) Bind(_ *http.Request) error {
 	return nil
 }
 
-func (db *GoDB) handleStoreCreate(notificationDB *GoDB, connector *Connector) http.HandlerFunc {
+func (db *GoDB) handleStoreCreate(rapidDB *GoDB, connector *Connector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		// Check if user has a store already
+		resp, err := db.Select(StoreDB, map[string]string{
+			"usr": FIndex(user.Username),
+		}, &SelectOptions{
+			MaxResults: 1,
+			Page:       0,
+			Skip:       0,
+		})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		response := <-resp
+		if len(response) > 0 {
+			http.Error(w, http.StatusText(http.StatusConflict), http.StatusConflict)
 			return
 		}
 		// Retrieve POST payload
@@ -122,7 +137,7 @@ func (db *GoDB) handleStoreCreate(notificationDB *GoDB, connector *Connector) ht
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		uUID, err := db.Insert(jsonEntry, map[string]string{
+		uUID, err := db.Insert(StoreDB, jsonEntry, map[string]string{
 			"usr": FIndex(request.Username),
 		})
 		if err != nil {
@@ -145,7 +160,7 @@ func (db *GoDB) handleStoreCreate(notificationDB *GoDB, connector *Connector) ht
 		}
 		jsonNotification, err := json.Marshal(notification)
 		if err == nil {
-			_, _ = notificationDB.Insert(jsonNotification, map[string]string{
+			_, _ = rapidDB.Insert(NotifyDB, jsonNotification, map[string]string{
 				"usr": FIndex(request.Username),
 			})
 		}
@@ -160,9 +175,8 @@ func (db *GoDB) handleStoreGet() http.HandlerFunc {
 			return
 		}
 		// Retrieve user's store
-		query := FIndex(user.Username)
-		resp, err := db.Select(map[string]string{
-			"usr": query,
+		resp, err := db.Select(StoreDB, map[string]string{
+			"usr": FIndex(user.Username),
 		}, &SelectOptions{
 			MaxResults: 1,
 			Page:       0,
@@ -191,7 +205,7 @@ func (db *GoDB) handleStoreGet() http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handleStoreVisit() http.HandlerFunc {
+func (db *GoDB) handleStoreVisit(rapidDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		storeID := chi.URLParam(r, "storeID")
 		if storeID == "" {
@@ -199,7 +213,7 @@ func (db *GoDB) handleStoreVisit() http.HandlerFunc {
 			return
 		}
 		// Retrieve store
-		response, ok := db.Read(storeID)
+		response, ok := db.Read(StoreDB, storeID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -215,6 +229,52 @@ func (db *GoDB) handleStoreVisit() http.HandlerFunc {
 			Store: store,
 			UUID:  storeID,
 		})
+		// Is there an analytics entry?
+		analytics := &Analytics{}
+		if store.AnalyticsUUID != "" {
+			anaBytes, txn := rapidDB.Get(AnaDB, store.AnalyticsUUID)
+			if txn != nil {
+				err := json.Unmarshal(anaBytes.Data, analytics)
+				if err != nil {
+					txn.Discard()
+					analytics = &Analytics{}
+				} else {
+					analytics.Views += 1
+					// Asynchronously update view count in database
+					go func() {
+						defer txn.Discard()
+						jsonAna, err := json.Marshal(analytics)
+						if err == nil {
+							_ = rapidDB.Update(AnaDB, txn, store.AnalyticsUUID, jsonAna, map[string]string{})
+						}
+					}()
+				}
+			}
+		} else {
+			// Create an analytics entry to keep track of the views
+			analytics = &Analytics{}
+			analytics.Views = 1
+			jsonAna, err := json.Marshal(analytics)
+			if err == nil {
+				// Insert analytics while returning its UUID to the store for reference
+				storeBytes, txnWis := db.Get(StoreDB, storeID)
+				defer txnWis.Discard()
+				store.AnalyticsUUID, err = rapidDB.Insert(AnaDB, jsonAna, map[string]string{})
+				if err != nil {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+				// Update store
+				storeJson, err := json.Marshal(store)
+				if err != nil {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+				err = db.Update(StoreDB, txnWis, storeBytes.uUID, storeJson, map[string]string{
+					"usr": FIndex(store.Username),
+				})
+			}
+		}
 	}
 }
 
@@ -246,7 +306,7 @@ func (db *GoDB) handleStoreCategoryModification() http.HandlerFunc {
 			return
 		}
 		// Retrieve store
-		response, txn := db.Get(storeID)
+		response, txn := db.Get(StoreDB, storeID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -286,7 +346,7 @@ func (db *GoDB) handleStoreCategoryModification() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(txn, response.uUID, jsonEntry, map[string]string{
+		err = db.Update(StoreDB, txn, response.uUID, jsonEntry, map[string]string{
 			"usr": FIndex(store.Username),
 		})
 		if err != nil {
@@ -296,7 +356,7 @@ func (db *GoDB) handleStoreCategoryModification() http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handleStoreModification(filesDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleStoreModification(rapidDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -316,7 +376,7 @@ func (db *GoDB) handleStoreModification(filesDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Is user owner?
-		response, ok := db.Read(storeID)
+		response, ok := db.Read(StoreDB, storeID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -334,9 +394,9 @@ func (db *GoDB) handleStoreModification(filesDB *GoDB) http.HandlerFunc {
 		// Check what action is required
 		if request.Type == "edit" {
 			if request.Field == "iurl" {
-				err = db.changeStoreImage(filesDB, user, storeID, request, false, false)
+				err = db.changeStoreImage(rapidDB, user, storeID, request, false, false)
 			} else if request.Field == "burl" {
-				err = db.changeStoreImage(filesDB, user, storeID, request, true, false)
+				err = db.changeStoreImage(rapidDB, user, storeID, request, true, false)
 			} else if request.Field == "bank" {
 				err = db.changeStoreBankDetails(user, storeID, request)
 			}
@@ -352,7 +412,7 @@ func (db *GoDB) changeStoreBankDetails(
 	user *User, storeID string, request *StoreModification,
 ) error {
 	// Retrieve store
-	response, txn := db.Get(storeID)
+	response, txn := db.Get(StoreDB, storeID)
 	if txn == nil {
 		return nil
 	}
@@ -378,7 +438,7 @@ func (db *GoDB) changeStoreBankDetails(
 	if err != nil {
 		return err
 	}
-	err = db.Update(txn, response.uUID, jsonEntry, map[string]string{
+	err = db.Update(StoreDB, txn, response.uUID, jsonEntry, map[string]string{
 		"usr": FIndex(store.Username),
 	})
 	if err != nil {
@@ -388,7 +448,7 @@ func (db *GoDB) changeStoreBankDetails(
 }
 
 func (db *GoDB) changeStoreImage(
-	filesDB *GoDB, user *User, storeID string, request *StoreModification, isBanner, isAnimated bool,
+	rapidDB *GoDB, user *User, storeID string, request *StoreModification, isBanner, isAnimated bool,
 ) error {
 	if request.NewValue == "" {
 		return nil
@@ -412,12 +472,12 @@ func (db *GoDB) changeStoreImage(
 		IsPrivate:  false,
 	}
 	fileSizeMB := float64(fileSize) / float64(1*MiB)
-	uUID, err := filesDB.SaveBase64AsFile(user, fileRequest, fileSizeMB)
+	uUID, err := rapidDB.SaveBase64AsFile(user, fileRequest, fileSizeMB)
 	if err != nil {
 		return err
 	}
 	// Retrieve store
-	response, txn := db.Get(storeID)
+	response, txn := db.Get(StoreDB, storeID)
 	if txn == nil {
 		return nil
 	}
@@ -442,7 +502,7 @@ func (db *GoDB) changeStoreImage(
 	if err != nil {
 		return err
 	}
-	err = db.Update(txn, response.uUID, jsonEntry, map[string]string{
+	err = db.Update(StoreDB, txn, response.uUID, jsonEntry, map[string]string{
 		"usr": FIndex(store.Username),
 	})
 	if err != nil {
@@ -451,7 +511,7 @@ func (db *GoDB) changeStoreImage(
 	return nil
 }
 
-func (db *GoDB) handleStoreOrder(itemDB, orderDB, notificationDB, analyticsDB *GoDB,
+func (db *GoDB) handleStoreOrder(rapidDB *GoDB,
 	connector *Connector, emailClient *EmailClient,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -464,7 +524,7 @@ func (db *GoDB) handleStoreOrder(itemDB, orderDB, notificationDB, analyticsDB *G
 		}
 		// Retrieve store
 		var ok bool
-		storeResp, ok := db.Read(request.StoreUUID)
+		storeResp, ok := db.Read(StoreDB, request.StoreUUID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -510,7 +570,7 @@ func (db *GoDB) handleStoreOrder(itemDB, orderDB, notificationDB, analyticsDB *G
 			}
 		}
 		// Calculate
-		err = CalculateOrder(itemDB, request, true)
+		err = CalculateOrder(rapidDB, request, true)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -521,17 +581,17 @@ func (db *GoDB) handleStoreOrder(itemDB, orderDB, notificationDB, analyticsDB *G
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		uUID, err := orderDB.Insert(orderJson, map[string]string{
-			"usr": FIndex(request.Username),
-			"pid": request.StoreUUID,
+		uUID, err := rapidDB.Insert(OrderDB, orderJson, map[string]string{
+			"usr":       FIndex(request.Username),
+			"pid-state": fmt.Sprintf("%s;%s", request.StoreUUID, request.State),
 		})
 		// Respond
 		_, _ = fmt.Fprintln(w, uUID)
 		// Notify buyer
 		err = NotifyBuyerOrderConfirmation(
-			store, request, uUID, notificationDB, connector, emailClient)
+			store, request, uUID, rapidDB, connector, emailClient)
 		// Notify store owner
 		err = NotifyStoreOwnerOrderConfirmation(
-			store, request, uUID, notificationDB, connector, emailClient)
+			store, request, uUID, rapidDB, connector, emailClient)
 	}
 }

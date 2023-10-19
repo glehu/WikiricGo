@@ -8,6 +8,8 @@ import (
 	"net/http"
 )
 
+const NotifyDB = "m9"
+
 type Notification struct {
 	Title             string `json:"t"`
 	Description       string `json:"desc"`
@@ -26,11 +28,6 @@ type NotificationContainer struct {
 
 type NotificationsResponse struct {
 	Notifications []*NotificationContainer
-}
-
-func OpenNotificationDatabase() *GoDB {
-	db := OpenDB("notifications")
-	return db
 }
 
 func (db *GoDB) ProtectedNotificationEndpoints(
@@ -60,7 +57,7 @@ func (db *GoDB) handleNotificationGet() http.HandlerFunc {
 			return
 		}
 		// Get notification
-		resp, ok := db.Read(notificationID)
+		resp, ok := db.Read(NotifyDB, notificationID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -93,7 +90,7 @@ func (db *GoDB) handleNotificationDelete() http.HandlerFunc {
 			return
 		}
 		// Get notification
-		resp, txn := db.Get(notificationID)
+		resp, txn := db.Get(NotifyDB, notificationID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -110,7 +107,7 @@ func (db *GoDB) handleNotificationDelete() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
-		err = db.Delete(notificationID, []string{"usr"})
+		err = db.Delete(NotifyDB, notificationID, []string{"usr"})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -126,7 +123,7 @@ func (db *GoDB) handleNotificationRead() http.HandlerFunc {
 			return
 		}
 		query := FIndex(user.Username)
-		resp, err := db.Select(map[string]string{
+		resp, err := db.Select(NotifyDB, map[string]string{
 			"usr": query,
 		}, nil)
 		if err != nil {
@@ -162,7 +159,7 @@ func (db *GoDB) handleNotificationTidy() http.HandlerFunc {
 			return
 		}
 		query := FIndex(user.Username)
-		resp, err := db.Select(map[string]string{
+		resp, err := db.Select(NotifyDB, map[string]string{
 			"usr": query,
 		}, nil)
 		if err != nil {
@@ -177,7 +174,7 @@ func (db *GoDB) handleNotificationTidy() http.HandlerFunc {
 				err = json.Unmarshal(notifEntry.Data, notification)
 				if err == nil {
 					if notification.Type != "frequest" {
-						_ = db.Delete(notifEntry.uUID, []string{"usr"})
+						_ = db.Delete(NotifyDB, notifEntry.uUID, []string{"usr"})
 					}
 				}
 			}

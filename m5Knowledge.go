@@ -10,6 +10,8 @@ import (
 	"net/http"
 )
 
+const KnowledgeDB = "m5"
+
 type Category struct {
 	Name     string `json:"t"`
 	ColorHex string `json:"hex"`
@@ -28,25 +30,20 @@ type KnowledgeEntry struct {
 	UUID string `json:"uid"`
 }
 
-func OpenKnowledgeDatabase() *GoDB {
-	db := OpenDB("knowledge")
-	return db
-}
-
 func (db *GoDB) ProtectedKnowledgeEndpoints(
-	r chi.Router, tokenAuth *jwtauth.JWTAuth, chatGroupDB, chatMemberDB *GoDB, chatServer *ChatServer,
+	r chi.Router, tokenAuth *jwtauth.JWTAuth, rapidDB *GoDB, chatServer *ChatServer,
 ) {
 	r.Route("/knowledge/private", func(r chi.Router) {
 		// ############
 		// ### POST ###
 		// ############
-		r.Post("/create", db.handleKnowledgeCreate(chatGroupDB, chatMemberDB, chatServer))
+		r.Post("/create", db.handleKnowledgeCreate(rapidDB, chatServer))
 		r.Post("/cats/mod/{knowledgeID}", db.handleKnowledgeCategoryModification())
 		// ###########
 		// ### GET ###
 		// ###########
-		r.Get("/get/{knowledgeID}", db.handleKnowledgeGet(chatGroupDB, chatMemberDB))
-		r.Get("/chat/{chatID}", db.handleKnowledgeGetFromChatID(chatGroupDB, chatMemberDB))
+		r.Get("/get/{knowledgeID}", db.handleKnowledgeGet(rapidDB))
+		r.Get("/chat/{chatID}", db.handleKnowledgeGetFromChatID(rapidDB))
 	})
 }
 
@@ -67,7 +64,7 @@ func (a *Category) Bind(_ *http.Request) error {
 	return nil
 }
 
-func (db *GoDB) handleKnowledgeCreate(chatGroupDB, chatMemberDB *GoDB, chatServer *ChatServer) http.HandlerFunc {
+func (db *GoDB) handleKnowledgeCreate(rapidDB *GoDB, chatServer *ChatServer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -83,7 +80,7 @@ func (db *GoDB) handleKnowledgeCreate(chatGroupDB, chatMemberDB *GoDB, chatServe
 		}
 		// Check if user has admin rights for the specified chat group
 		_, chatMember, chatGroup, err := ReadChatGroupAndMember(
-			chatGroupDB, chatMemberDB, nil, nil,
+			db, rapidDB, nil,
 			request.ChatGroupUUID, user.Username, "", r)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
@@ -106,7 +103,7 @@ func (db *GoDB) handleKnowledgeCreate(chatGroupDB, chatMemberDB *GoDB, chatServe
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		uUID, err := db.Insert(jsonEntry, map[string]string{
+		uUID, err := db.Insert(KnowledgeDB, jsonEntry, map[string]string{
 			"chatID": request.ChatGroupUUID,
 		})
 		if err != nil {
@@ -117,7 +114,7 @@ func (db *GoDB) handleKnowledgeCreate(chatGroupDB, chatMemberDB *GoDB, chatServe
 	}
 }
 
-func (db *GoDB) handleKnowledgeGet(chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleKnowledgeGet(rapidDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -129,7 +126,7 @@ func (db *GoDB) handleKnowledgeGet(chatGroupDB, chatMemberDB *GoDB) http.Handler
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, ok := db.Read(knowledgeID)
+		response, ok := db.Read(KnowledgeDB, knowledgeID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -143,7 +140,7 @@ func (db *GoDB) handleKnowledgeGet(chatGroupDB, chatMemberDB *GoDB) http.Handler
 		}
 		// Check if user has read rights for the specified chat group
 		_, chatMember, chatGroup, err := ReadChatGroupAndMember(
-			chatGroupDB, chatMemberDB, nil, nil,
+			db, rapidDB, nil,
 			knowledge.ChatGroupUUID, user.Username, "", r)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
@@ -161,7 +158,7 @@ func (db *GoDB) handleKnowledgeGet(chatGroupDB, chatMemberDB *GoDB) http.Handler
 	}
 }
 
-func (db *GoDB) handleKnowledgeGetFromChatID(chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleKnowledgeGetFromChatID(rapidDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -174,7 +171,7 @@ func (db *GoDB) handleKnowledgeGetFromChatID(chatGroupDB, chatMemberDB *GoDB) ht
 			return
 		}
 		query := FIndex(chatID)
-		resp, err := db.Select(map[string]string{
+		resp, err := db.Select(KnowledgeDB, map[string]string{
 			"chatID": query,
 		}, &SelectOptions{
 			MaxResults: 1,
@@ -199,7 +196,7 @@ func (db *GoDB) handleKnowledgeGetFromChatID(chatGroupDB, chatMemberDB *GoDB) ht
 		}
 		// Check if user has read rights for the specified chat group
 		_, chatMember, chatGroup, err := ReadChatGroupAndMember(
-			chatGroupDB, chatMemberDB, nil, nil,
+			db, rapidDB, nil,
 			knowledge.ChatGroupUUID, user.Username, "", r)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
@@ -245,7 +242,7 @@ func (db *GoDB) handleKnowledgeCategoryModification() http.HandlerFunc {
 			return
 		}
 		// Retrieve chat group
-		response, txn := db.Get(knowledgeID)
+		response, txn := db.Get(KnowledgeDB, knowledgeID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -285,7 +282,7 @@ func (db *GoDB) handleKnowledgeCategoryModification() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(txn, response.uUID, jsonEntry, map[string]string{
+		err = db.Update(KnowledgeDB, txn, response.uUID, jsonEntry, map[string]string{
 			"chatID": knowledge.ChatGroupUUID,
 		})
 		if err != nil {

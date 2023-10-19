@@ -13,6 +13,8 @@ import (
 	"strings"
 )
 
+const GroupDB = "m2"
+
 type ChatUserRoleModification struct {
 	Username string `json:"usr"`
 	Role     string `json:"role"`
@@ -88,38 +90,33 @@ type ChatMemberModification struct {
 	NewValue string `json:"new"`
 }
 
-func OpenChatGroupDatabase() *GoDB {
-	db := OpenDB("chatGroups")
-	return db
-}
-
 func (db *GoDB) ProtectedChatGroupEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
-	userDB, chatGroupDB, chatMemberDB, filesDB *GoDB, chatServer *ChatServer,
+	rapidDB *GoDB, chatServer *ChatServer,
 ) {
 	r.Route("/chat/private", func(r chi.Router) {
 		// Creation and Retrieval
-		r.Post("/create", db.handleChatGroupCreate(userDB, chatMemberDB))
-		r.Post("/mod/{chatID}", db.handleChatGroupModification(chatMemberDB, filesDB))
+		r.Post("/create", db.handleChatGroupCreate())
+		r.Post("/mod/{chatID}", db.handleChatGroupModification(rapidDB))
 		r.Get("/get/{chatID}", db.handleChatGroupGet())
 		// Roles
 		r.Post("/roles/mod/{chatID}", db.handleChatGroupRoleModification())
 		// PubKey
-		r.Post("/pubkey/{chatID}", db.handlePublicKeySet(chatGroupDB, chatMemberDB))
+		r.Post("/pubkey/{chatID}", db.handlePublicKeySet())
 		// Users
 		r.Route("/users", func(r chi.Router) {
-			r.Post("/roles/mod/{chatID}", db.handleChatMemberRoleModification(chatMemberDB))
-			r.Get("/members/{chatID}", db.handleChatGroupGetMembers(chatGroupDB, chatMemberDB))
-			r.Get("/friends", db.handleGetFriends(chatMemberDB))
+			r.Post("/roles/mod/{chatID}", db.handleChatMemberRoleModification())
+			r.Get("/members/{chatID}", db.handleChatGroupGetMembers())
+			r.Get("/friends", db.handleGetFriends())
 			r.Get("/active/{chatID}", db.handleChatGroupGetActiveMembers(chatServer))
 		})
 		// Self Actions
 		r.Route("/self", func(r chi.Router) {
-			r.Post("/mod/{chatID}", db.handleChatMemberModification(chatGroupDB, chatMemberDB, filesDB))
+			r.Post("/mod/{chatID}", db.handleChatMemberModification(rapidDB))
 		})
 	})
 }
 
-func (db *GoDB) handleChatGroupCreate(userDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleChatGroupCreate() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -192,7 +189,7 @@ func (db *GoDB) handleChatGroupCreate(userDB, chatMemberDB *GoDB) http.HandlerFu
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		uUID, err := db.Insert(newChatGroup, map[string]string{})
+		uUID, err := db.Insert(GroupDB, newChatGroup, map[string]string{})
 		if err != nil {
 			fmt.Println(err)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -203,7 +200,7 @@ func (db *GoDB) handleChatGroupCreate(userDB, chatMemberDB *GoDB) http.HandlerFu
 		// Check if we need to update a parent chat group
 		if request.ParentUUID != "" {
 			// Retrieve parent chat group
-			response, txn := db.Get(request.ParentUUID)
+			response, txn := db.Get(GroupDB, request.ParentUUID)
 			if txn == nil {
 				http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 				return
@@ -228,7 +225,7 @@ func (db *GoDB) handleChatGroupCreate(userDB, chatMemberDB *GoDB) http.HandlerFu
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
-			err = db.Update(txn, response.uUID, chatGroupJson, map[string]string{})
+			err = db.Update(GroupDB, txn, response.uUID, chatGroupJson, map[string]string{})
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
@@ -253,7 +250,7 @@ func (db *GoDB) handleChatGroupCreate(userDB, chatMemberDB *GoDB) http.HandlerFu
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
-			_, err = chatMemberDB.Insert(
+			_, err = db.Insert(MemberDB,
 				newMember, map[string]string{
 					"chat-usr": fmt.Sprintf("%s;%s;", uUID, user.Username),
 				},
@@ -337,7 +334,7 @@ func (db *GoDB) handleChatGroupGet() http.HandlerFunc {
 }
 
 func (db *GoDB) ReadChatGroup(chatID string) (*ChatGroupEntry, error) {
-	response, ok := db.Read(chatID)
+	response, ok := db.Read(GroupDB, chatID)
 	if !ok {
 		return nil, errors.New("no chat group found")
 	}
@@ -353,9 +350,9 @@ func (db *GoDB) ReadChatGroup(chatID string) (*ChatGroupEntry, error) {
 	return entry, err
 }
 
-func GetChatMember(chatGroupDB, chatMemberDB *GoDB, chatID, username string) (*ChatMemberEntry, *badger.Txn) {
+func GetChatMember(mainDB *GoDB, chatID, username string) (*ChatMemberEntry, *badger.Txn) {
 	// Check if chat group exists
-	dataOriginal, ok := chatGroupDB.Read(chatID)
+	dataOriginal, ok := mainDB.Read(GroupDB, chatID)
 	if !ok {
 		return nil, nil
 	}
@@ -374,7 +371,7 @@ func GetChatMember(chatGroupDB, chatMemberDB *GoDB, chatID, username string) (*C
 	if chatGroupOriginal.ParentUUID != "" {
 		// Get parent
 		chatID = chatGroupOriginal.ParentUUID
-		dataMain, ok = chatGroupDB.Read(chatID)
+		dataMain, ok = mainDB.Read(GroupDB, chatID)
 		if !ok {
 			return nil, nil
 		}
@@ -398,7 +395,7 @@ func GetChatMember(chatGroupDB, chatMemberDB *GoDB, chatID, username string) (*C
 		username,
 	)
 	// MaxResults 1 to have maximum performance (it avoids unnecessary searching)
-	resp, err := chatMemberDB.Select(
+	resp, err := mainDB.Select(MemberDB,
 		map[string]string{
 			"chat-usr": query,
 		}, &SelectOptions{
@@ -425,7 +422,7 @@ func GetChatMember(chatGroupDB, chatMemberDB *GoDB, chatID, username string) (*C
 		return nil, nil
 	}
 	// Lock it
-	_, txn := chatMemberDB.Get(responseMember[0].uUID)
+	_, txn := mainDB.Get(MemberDB, responseMember[0].uUID)
 	entry := &ChatMemberEntry{
 		ChatMember: chatMember,
 		UUID:       responseMember[0].uUID,
@@ -434,7 +431,7 @@ func GetChatMember(chatGroupDB, chatMemberDB *GoDB, chatID, username string) (*C
 }
 
 func ReadChatGroupAndMember(
-	chatGroupDB, chatMemberDB, notificationDB *GoDB,
+	mainDB, rapidDB *GoDB,
 	connector *Connector,
 	chatID, username, password string,
 	r *http.Request) (
@@ -445,7 +442,7 @@ func ReadChatGroupAndMember(
 		return nil, nil, nil, errors.New("no user provided")
 	}
 	// Check if chat group exists
-	dataOriginal, ok := chatGroupDB.Read(chatID)
+	dataOriginal, ok := mainDB.Read(GroupDB, chatID)
 	if !ok {
 		return nil, nil, nil, errors.New("err chat group nonexistent")
 	}
@@ -465,7 +462,7 @@ func ReadChatGroupAndMember(
 	if chatGroupOriginal.ParentUUID != "" {
 		// Get parent
 		chatID = chatGroupOriginal.ParentUUID
-		dataMain, ok = chatGroupDB.Read(chatID)
+		dataMain, ok = mainDB.Read(GroupDB, chatID)
 		if !ok {
 			return nil, nil, nil, errors.New("err provided main chat group nonexistent")
 		}
@@ -489,7 +486,7 @@ func ReadChatGroupAndMember(
 		username,
 	)
 	// MaxResults 1 to have maximum performance (it avoids unnecessary searching)
-	resp, err := chatMemberDB.Select(
+	resp, err := mainDB.Select(MemberDB,
 		map[string]string{
 			"chat-usr": query,
 		}, &SelectOptions{
@@ -530,7 +527,7 @@ func ReadChatGroupAndMember(
 					"user-friend": fmt.Sprintf("%s;%s;", refUsername, username), // Sides switched to enable friend query
 				}
 				go func() {
-					err = notifyFriendRequestAccept(refUsername, user, notificationDB, connector, chatID, password)
+					err = notifyFriendRequestAccept(refUsername, user, rapidDB, connector, chatID, password)
 					if err != nil {
 						fmt.Println(err)
 						return
@@ -550,7 +547,7 @@ func ReadChatGroupAndMember(
 					ChatGroup: &chatGroup,
 					UUID:      dataOriginal.uUID,
 				}
-				err = notifyJoin(user.DisplayName, chatMemberDB, notificationDB, connector, container)
+				err = notifyJoin(user.DisplayName, mainDB, rapidDB, connector, container)
 				if err != nil {
 					fmt.Println(err)
 					return
@@ -570,7 +567,7 @@ func ReadChatGroupAndMember(
 			DateCreated:          TimeNowIsoString(),
 		}
 		newMember, err := json.Marshal(chatMember)
-		memberUUID, err = chatMemberDB.Insert(newMember, indices)
+		memberUUID, err = mainDB.Insert(MemberDB, newMember, indices)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -676,7 +673,7 @@ func (db *GoDB) handleChatGroupRoleModification() http.HandlerFunc {
 			return
 		}
 		// Retrieve chat group
-		response, txn := db.Get(chatID)
+		response, txn := db.Get(GroupDB, chatID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -723,7 +720,7 @@ func (db *GoDB) handleChatGroupRoleModification() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(txn, response.uUID, jsonEntry, map[string]string{})
+		err = db.Update(GroupDB, txn, response.uUID, jsonEntry, map[string]string{})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -731,7 +728,7 @@ func (db *GoDB) handleChatGroupRoleModification() http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handleChatMemberRoleModification(chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleChatMemberRoleModification() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -761,7 +758,7 @@ func (db *GoDB) handleChatMemberRoleModification(chatMemberDB *GoDB) http.Handle
 		}
 		// Retrieve chat group etc.
 		_, chatMember, _, err := ReadChatGroupAndMember(
-			db, chatMemberDB, nil, nil, chatID, request.Username, "", r)
+			db, nil, nil, chatID, request.Username, "", r)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -788,10 +785,10 @@ func (db *GoDB) handleChatMemberRoleModification(chatMemberDB *GoDB) http.Handle
 				chatMember.Roles[index] = request.Role
 			}
 		}
-		_, txn := chatMemberDB.Get(chatMember.UUID)
+		_, txn := db.Get(MemberDB, chatMember.UUID)
 		defer txn.Discard()
 		jsonEntry, err := json.Marshal(chatMember)
-		err = chatMemberDB.Update(txn, chatMember.UUID, jsonEntry, map[string]string{
+		err = db.Update(MemberDB, txn, chatMember.UUID, jsonEntry, map[string]string{
 			"chat-usr": fmt.Sprintf("%s;%s;", chatID, chatMember.Username)},
 		)
 		if err != nil {
@@ -801,7 +798,7 @@ func (db *GoDB) handleChatMemberRoleModification(chatMemberDB *GoDB) http.Handle
 	}
 }
 
-func (db *GoDB) handleChatGroupGetMembers(chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleChatGroupGetMembers() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		chatID := chi.URLParam(r, "chatID")
 		if chatID == "" {
@@ -809,7 +806,7 @@ func (db *GoDB) handleChatGroupGetMembers(chatGroupDB, chatMemberDB *GoDB) http.
 			return
 		}
 		// Check if we're targeting a sub chat since only main chat rooms have members technically
-		dataOriginal, ok := chatGroupDB.Read(chatID)
+		dataOriginal, ok := db.Read(GroupDB, chatID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		}
@@ -828,7 +825,7 @@ func (db *GoDB) handleChatGroupGetMembers(chatGroupDB, chatMemberDB *GoDB) http.
 		}
 		// Retrieve chat members
 		query := FIndex(chatID)
-		resp, err := chatMemberDB.Select(
+		resp, err := db.Select(MemberDB,
 			map[string]string{
 				"chat-usr": query,
 			}, nil,
@@ -861,8 +858,11 @@ func (db *GoDB) handleChatGroupGetMembers(chatGroupDB, chatMemberDB *GoDB) http.
 }
 
 func notifyFriendRequestAccept(refUsername string, user *User,
-	notificationDB *GoDB, connector *Connector, chatID, password string,
+	rapidDB *GoDB, connector *Connector, chatID, password string,
 ) error {
+	if rapidDB == nil {
+		return nil
+	}
 	notification := &Notification{
 		Title:             "Friend Request Accepted",
 		Description:       fmt.Sprintf("%s accepted your friend request!", user.DisplayName),
@@ -877,7 +877,7 @@ func notifyFriendRequestAccept(refUsername string, user *User,
 	if err != nil {
 		return err
 	}
-	notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
+	notificationUUID, err := rapidDB.Insert(NotifyDB, jsonNotification, map[string]string{
 		"usr": FIndex(refUsername),
 	})
 	if err != nil {
@@ -901,11 +901,14 @@ func notifyFriendRequestAccept(refUsername string, user *User,
 	return nil
 }
 
-func notifyJoin(selfName string, chatMemberDB, notificationDB *GoDB, connector *Connector, chatGroup *ChatGroupEntry,
+func notifyJoin(selfName string, mainDB, rapidDB *GoDB, connector *Connector, chatGroup *ChatGroupEntry,
 ) error {
+	if rapidDB == nil {
+		return nil
+	}
 	// Retrieve all members of this chat group
 	query := FIndex(chatGroup.UUID)
-	resp, err := chatMemberDB.Select(map[string]string{"chat-usr": query}, nil)
+	resp, err := mainDB.Select(MemberDB, map[string]string{"chat-usr": query}, nil)
 	if err != nil {
 		return err
 	}
@@ -938,7 +941,7 @@ func notifyJoin(selfName string, chatMemberDB, notificationDB *GoDB, connector *
 		if err != nil {
 			continue
 		}
-		notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
+		notificationUUID, err := rapidDB.Insert(NotifyDB, jsonNotification, map[string]string{
 			"usr": FIndex(chatMember.Username),
 		})
 		if err != nil {
@@ -964,7 +967,7 @@ func notifyJoin(selfName string, chatMemberDB, notificationDB *GoDB, connector *
 	return nil
 }
 
-func (db *GoDB) handleGetFriends(chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleGetFriends() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -975,7 +978,7 @@ func (db *GoDB) handleGetFriends(chatMemberDB *GoDB) http.HandlerFunc {
 		members := FriendList{
 			Friends: make([]*FriendGroup, 0),
 		}
-		resp, err := chatMemberDB.Select(map[string]string{
+		resp, err := db.Select(MemberDB, map[string]string{
 			"user-friend": FIndex(user.Username),
 		}, nil)
 		if err != nil {
@@ -1014,7 +1017,7 @@ func (db *GoDB) handleGetFriends(chatMemberDB *GoDB) http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handlePublicKeySet(chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handlePublicKeySet() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -1027,7 +1030,7 @@ func (db *GoDB) handlePublicKeySet(chatGroupDB, chatMemberDB *GoDB) http.Handler
 			return
 		}
 		// Check if chat group is encrypted before applying pubkey
-		resp, ok := db.Read(chatID)
+		resp, ok := db.Read(GroupDB, chatID)
 		if !ok {
 			return
 		}
@@ -1051,7 +1054,7 @@ func (db *GoDB) handlePublicKeySet(chatGroupDB, chatMemberDB *GoDB) http.Handler
 			return
 		}
 		// Retrieve chat group etc.
-		chatMember, txn := GetChatMember(chatGroupDB, chatMemberDB, chatID, user.Username)
+		chatMember, txn := GetChatMember(db, chatID, user.Username)
 		if chatMember == nil || txn == nil {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -1070,7 +1073,7 @@ func (db *GoDB) handlePublicKeySet(chatGroupDB, chatMemberDB *GoDB) http.Handler
 		chatMember.PublicKey = request.PubKeyPEM
 		// Commit changes
 		jsonEntry, err := json.Marshal(chatMember)
-		err = chatMemberDB.Update(txn, chatMember.UUID, jsonEntry, map[string]string{
+		err = db.Update(MemberDB, txn, chatMember.UUID, jsonEntry, map[string]string{
 			"chat-usr": fmt.Sprintf("%s;%s;", chatID, chatMember.Username)},
 		)
 		if err != nil {
@@ -1107,7 +1110,7 @@ func (db *GoDB) handleChatGroupGetActiveMembers(chatServer *ChatServer) http.Han
 	}
 }
 
-func (db *GoDB) handleChatGroupModification(chatMemberDB, filesDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleChatGroupModification(rapidDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -1129,11 +1132,11 @@ func (db *GoDB) handleChatGroupModification(chatMemberDB, filesDB *GoDB) http.Ha
 		var err error
 		if request.Type == "edit" {
 			if request.Field == "iurl" {
-				err = db.changeChatGroupImage(filesDB, user, chatID, request, false, false)
+				err = db.changeChatGroupImage(rapidDB, user, chatID, request, false, false)
 			} else if request.Field == "burl" {
-				err = db.changeChatGroupImage(filesDB, user, chatID, request, true, false)
+				err = db.changeChatGroupImage(rapidDB, user, chatID, request, true, false)
 			} else if request.Field == "pw" {
-				err = db.changeChatGroupAccess(chatMemberDB, user, chatID, request, r)
+				err = db.changeChatGroupAccess(user, chatID, request, r)
 			}
 		}
 		if err != nil {
@@ -1144,7 +1147,7 @@ func (db *GoDB) handleChatGroupModification(chatMemberDB, filesDB *GoDB) http.Ha
 }
 
 func (db *GoDB) changeChatGroupImage(
-	filesDB *GoDB, user *User, chatID string, request *ChatGroupModification, isBanner, isAnimated bool,
+	rapidDB *GoDB, user *User, chatID string, request *ChatGroupModification, isBanner, isAnimated bool,
 ) error {
 	if request.NewValue == "" {
 		return nil
@@ -1169,12 +1172,12 @@ func (db *GoDB) changeChatGroupImage(
 		IsPrivate:     false,
 	}
 	fileSizeMB := float64(fileSize) / float64(1*MiB)
-	uUID, err := filesDB.SaveBase64AsFile(user, fileRequest, fileSizeMB)
+	uUID, err := rapidDB.SaveBase64AsFile(user, fileRequest, fileSizeMB)
 	if err != nil {
 		return err
 	}
 	// Retrieve chat group
-	response, txn := db.Get(chatID)
+	response, txn := db.Get(GroupDB, chatID)
 	if txn == nil {
 		return nil
 	}
@@ -1194,14 +1197,14 @@ func (db *GoDB) changeChatGroupImage(
 	if err != nil {
 		return err
 	}
-	err = db.Update(txn, response.uUID, jsonEntry, map[string]string{})
+	err = db.Update(GroupDB, txn, response.uUID, jsonEntry, map[string]string{})
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (db *GoDB) handleChatMemberModification(chatGroupDB, chatMemberDB, filesDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleChatMemberModification(rapidDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -1222,9 +1225,9 @@ func (db *GoDB) handleChatMemberModification(chatGroupDB, chatMemberDB, filesDB 
 		}
 		if request.Type == "edit" {
 			if request.Field == "iurl" {
-				handleChatMemberImageMod(w, user, request, chatID, chatGroupDB, chatMemberDB, filesDB)
+				handleChatMemberImageMod(w, user, request, chatID, db, rapidDB)
 			} else if request.Field == "fcm" {
-				handleChatMemberFCMTokenMod(w, user, request, chatID, chatGroupDB, chatMemberDB)
+				handleChatMemberFCMTokenMod(w, user, request, chatID, db)
 			}
 		}
 	}
@@ -1232,7 +1235,7 @@ func (db *GoDB) handleChatMemberModification(chatGroupDB, chatMemberDB, filesDB 
 
 func handleChatMemberImageMod(w http.ResponseWriter, user *User,
 	request *ChatMemberModification, chatID string,
-	chatGroupDB, chatMemberDB, filesDB *GoDB,
+	mainDB, rapidDB *GoDB,
 ) {
 	if request.NewValue == "" {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
@@ -1257,7 +1260,7 @@ func handleChatMemberImageMod(w http.ResponseWriter, user *User,
 			IsPrivate:     false,
 		}
 		fileSizeMB := float64(fileSize) / float64(1*MiB)
-		uUIDStatic, err = filesDB.SaveBase64AsPredefinedFile(user, fileRequest, ".png", fileSizeMB)
+		uUIDStatic, err = rapidDB.SaveBase64AsPredefinedFile(user, fileRequest, ".png", fileSizeMB)
 	}
 	// Save profile picture
 	fileRequest := &FileSubmission{
@@ -1267,9 +1270,9 @@ func handleChatMemberImageMod(w http.ResponseWriter, user *User,
 		IsPrivate:     false,
 	}
 	fileSizeMB := float64(fileSize) / float64(1*MiB)
-	uUID, err := filesDB.SaveBase64AsFile(user, fileRequest, fileSizeMB)
+	uUID, err := rapidDB.SaveBase64AsFile(user, fileRequest, fileSizeMB)
 	// Retrieve chat member
-	chatMember, txn := GetChatMember(chatGroupDB, chatMemberDB, chatID, user.Username)
+	chatMember, txn := GetChatMember(mainDB, chatID, user.Username)
 	defer txn.Discard()
 	// Update Image URL
 	if uUIDStatic == "" {
@@ -1281,7 +1284,7 @@ func handleChatMemberImageMod(w http.ResponseWriter, user *User,
 	}
 	// Commit changes
 	jsonEntry, err := json.Marshal(chatMember)
-	err = chatMemberDB.Update(txn, chatMember.UUID, jsonEntry, map[string]string{
+	err = mainDB.Update(MemberDB, txn, chatMember.UUID, jsonEntry, map[string]string{
 		"chat-usr": fmt.Sprintf("%s;%s;", chatID, chatMember.Username)},
 	)
 	if err != nil {
@@ -1292,14 +1295,14 @@ func handleChatMemberImageMod(w http.ResponseWriter, user *User,
 
 func handleChatMemberFCMTokenMod(w http.ResponseWriter, user *User,
 	request *ChatMemberModification, chatID string,
-	chatGroupDB, chatMemberDB *GoDB,
+	mainDB *GoDB,
 ) {
 	if request.NewValue == "" {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
 	// Retrieve chat member
-	chatMember, txn := GetChatMember(chatGroupDB, chatMemberDB, chatID, user.Username)
+	chatMember, txn := GetChatMember(mainDB, chatID, user.Username)
 	defer txn.Discard()
 	// Does the user have this token already?
 	if chatMember.FCMToken == request.NewValue {
@@ -1309,7 +1312,7 @@ func handleChatMemberFCMTokenMod(w http.ResponseWriter, user *User,
 	chatMember.FCMToken = request.NewValue
 	// Commit changes
 	jsonEntry, err := json.Marshal(chatMember)
-	err = chatMemberDB.Update(txn, chatMember.UUID, jsonEntry, map[string]string{
+	err = mainDB.Update(MemberDB, txn, chatMember.UUID, jsonEntry, map[string]string{
 		"chat-usr": fmt.Sprintf("%s;%s;", chatID, chatMember.Username)},
 	)
 	if err != nil {
@@ -1319,7 +1322,7 @@ func handleChatMemberFCMTokenMod(w http.ResponseWriter, user *User,
 }
 
 func (db *GoDB) GetMainChatGroup(chatID string) (*ChatGroupEntry, bool) {
-	resp, ok := db.Read(chatID)
+	resp, ok := db.Read(GroupDB, chatID)
 	if !ok {
 		return nil, false
 	}
@@ -1334,7 +1337,7 @@ func (db *GoDB) GetMainChatGroup(chatID string) (*ChatGroupEntry, bool) {
 	}
 	if chatGroup.ParentUUID != "" {
 		// Get parent
-		resp, ok = db.Read(chatGroup.ParentUUID)
+		resp, ok = db.Read(GroupDB, chatGroup.ParentUUID)
 		if !ok {
 			return nil, false
 		}
@@ -1355,10 +1358,10 @@ func (db *GoDB) GetMainChatGroup(chatID string) (*ChatGroupEntry, bool) {
 }
 
 func (db *GoDB) changeChatGroupAccess(
-	chatMemberDB *GoDB, user *User, chatID string, request *ChatGroupModification, r *http.Request,
+	user *User, chatID string, request *ChatGroupModification, r *http.Request,
 ) error {
 	// Check if user is admin
-	chatGroup, chatMember, _, _ := ReadChatGroupAndMember(db, chatMemberDB, nil, nil,
+	chatGroup, chatMember, _, _ := ReadChatGroupAndMember(db, nil, nil,
 		chatID, user.Username, "", r)
 	if chatGroup == nil || chatMember == nil {
 		return errors.New(http.StatusText(http.StatusForbidden))
@@ -1368,7 +1371,7 @@ func (db *GoDB) changeChatGroupAccess(
 		return errors.New(http.StatusText(http.StatusForbidden))
 	}
 	// Retrieve chat group
-	response, txn := db.Get(chatID)
+	response, txn := db.Get(GroupDB, chatID)
 	if txn == nil {
 		return errors.New(http.StatusText(http.StatusNotFound))
 	}
@@ -1391,7 +1394,7 @@ func (db *GoDB) changeChatGroupAccess(
 	if err != nil {
 		return errors.New(http.StatusText(http.StatusInternalServerError))
 	}
-	err = db.Update(txn, response.uUID, jsonEntry, map[string]string{})
+	err = db.Update(GroupDB, txn, response.uUID, jsonEntry, map[string]string{})
 	if err != nil {
 		return errors.New(http.StatusText(http.StatusInternalServerError))
 	}

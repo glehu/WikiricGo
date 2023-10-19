@@ -15,6 +15,8 @@ import (
 	"time"
 )
 
+const ItemDB = "m12"
+
 type Item struct {
 	Name                  string          `json:"t"`
 	Description           string          `json:"desc"`
@@ -76,10 +78,12 @@ type ItemImage struct {
 }
 
 type ItemQuery struct {
-	Query  string `json:"query"`
-	Type   string `json:"type"`
-	Fields string `json:"fields"`
-	State  string `json:"state"`
+	Query   string  `json:"query"`
+	Type    string  `json:"type"`
+	Fields  string  `json:"fields"`
+	State   string  `json:"state"`
+	MinCost float64 `json:"minCost"`
+	MaxCost float64 `json:"maxCost"`
 }
 
 type ItemQueryResponse struct {
@@ -95,38 +99,32 @@ type ItemModification struct {
 	MetaValue string `json:"meta"`
 }
 
-func OpenItemsDatabase() *GoDB {
-	db := OpenDB("items")
-	return db
-}
-
-func (db *GoDB) PublicItemsEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, storeDB, analyticsDB *GoDB) {
+func (db *GoDB) PublicItemsEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, mainDB *GoDB) {
 	r.Route("/items/public", func(r chi.Router) {
 		// ############
 		// ### POST ###
 		// ############
-		r.Post("/query/{storeID}", db.handleItemQuery(storeDB, analyticsDB))
+		r.Post("/query/{storeID}", db.handleItemQuery())
 		// ###########
 		// ### GET ###
 		// ###########
-		r.Get("/get/{itemID}", db.handleItemGet(analyticsDB))
+		r.Get("/get/{itemID}", db.handleItemGet())
 	})
 }
 
-func (db *GoDB) ProtectedItemEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
-	storeDB, userDB, notificationDB, analyticsDB, filesDB *GoDB,
+func (db *GoDB) ProtectedItemEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, mainDB *GoDB,
 ) {
 	r.Route("/items/private", func(r chi.Router) {
 		// ############
 		// ### POST ###
 		// ############
-		r.Post("/create/{storeID}", db.handleItemCreate(storeDB, filesDB))
-		r.Post("/edit/{itemID}", db.handleItemEdit(storeDB, filesDB))
-		r.Post("/mod/{itemID}", db.handleItemModification(storeDB, filesDB))
+		r.Post("/create/{storeID}", db.handleItemCreate(mainDB))
+		r.Post("/edit/{itemID}", db.handleItemEdit(mainDB))
+		r.Post("/mod/{itemID}", db.handleItemModification(mainDB))
 		// ###########
 		// ### GET ###
 		// ###########
-		r.Get("/delete/{itemID}", db.handleItemDelete(storeDB, analyticsDB))
+		r.Get("/delete/{itemID}", db.handleItemDelete(mainDB))
 	})
 }
 
@@ -157,7 +155,7 @@ func (a *ItemModification) Bind(_ *http.Request) error {
 	return nil
 }
 
-func (db *GoDB) handleItemCreate(storeDB, filesDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleItemCreate(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -169,7 +167,7 @@ func (db *GoDB) handleItemCreate(storeDB, filesDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, ok := storeDB.Read(storeID)
+		response, ok := mainDB.Read(StoreDB, storeID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -211,7 +209,7 @@ func (db *GoDB) handleItemCreate(storeDB, filesDB *GoDB) http.HandlerFunc {
 				if img.URL == "" {
 					continue
 				}
-				uUID, err = saveThumbnailImage(filesDB, user, img.URL)
+				uUID, err = saveThumbnailImage(db, user, img.URL)
 				if err != nil {
 					continue
 				}
@@ -294,7 +292,7 @@ func (db *GoDB) handleItemCreate(storeDB, filesDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		uUID, err := db.Insert(jsonEntry, map[string]string{
+		uUID, err := db.Insert(ItemDB, jsonEntry, map[string]string{
 			"pid": request.StoreUUID,
 		})
 		if err != nil {
@@ -305,7 +303,7 @@ func (db *GoDB) handleItemCreate(storeDB, filesDB *GoDB) http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handleItemGet(analyticsDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleItemGet() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// user := r.Context().Value("user").(*User)
 		// if user == nil {
@@ -318,7 +316,7 @@ func (db *GoDB) handleItemGet(analyticsDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Retrieve item
-		response, ok := db.Read(itemID)
+		response, ok := db.Read(ItemDB, itemID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -333,7 +331,7 @@ func (db *GoDB) handleItemGet(analyticsDB *GoDB) http.HandlerFunc {
 		// Is there an analytics entry?
 		analytics := &Analytics{}
 		if item.AnalyticsUUID != "" {
-			anaBytes, txn := analyticsDB.Get(item.AnalyticsUUID)
+			anaBytes, txn := db.Get(AnaDB, item.AnalyticsUUID)
 			if txn != nil {
 				err := json.Unmarshal(anaBytes.Data, analytics)
 				if err != nil {
@@ -346,7 +344,7 @@ func (db *GoDB) handleItemGet(analyticsDB *GoDB) http.HandlerFunc {
 						defer txn.Discard()
 						jsonAna, err := json.Marshal(analytics)
 						if err == nil {
-							_ = analyticsDB.Update(txn, item.AnalyticsUUID, jsonAna, map[string]string{})
+							_ = db.Update(AnaDB, txn, item.AnalyticsUUID, jsonAna, map[string]string{})
 						}
 					}()
 				}
@@ -358,9 +356,9 @@ func (db *GoDB) handleItemGet(analyticsDB *GoDB) http.HandlerFunc {
 			jsonAna, err := json.Marshal(analytics)
 			if err == nil {
 				// Insert analytics while returning its UUID to the item for reference
-				itemBytes, txnItem := db.Get(itemID)
+				itemBytes, txnItem := db.Get(ItemDB, itemID)
 				defer txnItem.Discard()
-				item.AnalyticsUUID, err = analyticsDB.Insert(jsonAna, map[string]string{})
+				item.AnalyticsUUID, err = db.Insert(AnaDB, jsonAna, map[string]string{})
 				if err != nil {
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
@@ -371,7 +369,7 @@ func (db *GoDB) handleItemGet(analyticsDB *GoDB) http.HandlerFunc {
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
 				}
-				err = db.Update(txnItem, itemBytes.uUID, itemJson, map[string]string{
+				err = db.Update(ItemDB, txnItem, itemBytes.uUID, itemJson, map[string]string{
 					"pid": item.StoreUUID,
 				})
 			}
@@ -383,8 +381,7 @@ func (db *GoDB) handleItemGet(analyticsDB *GoDB) http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handleItemQuery(storeDB, analyticsDB *GoDB,
-) http.HandlerFunc {
+func (db *GoDB) handleItemQuery() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		timeStart := time.Now()
 		storeID := chi.URLParam(r, "storeID")
@@ -400,7 +397,7 @@ func (db *GoDB) handleItemQuery(storeDB, analyticsDB *GoDB,
 			return
 		}
 		// Retrieve all Item entries
-		resp, err := db.Select(map[string]string{
+		resp, err := db.Select(ItemDB, map[string]string{
 			"pid": storeID,
 		}, nil)
 		if err != nil {
@@ -430,6 +427,12 @@ func (db *GoDB) handleItemQuery(storeDB, analyticsDB *GoDB,
 			if err != nil {
 				continue
 			}
+			if request.MinCost != 0.0 && item.NetPrice < request.MinCost {
+				continue
+			}
+			if request.MaxCost != 0.0 && item.NetPrice > request.MaxCost {
+				continue
+			}
 			// Flip boolean on each iteration
 			b = !b
 			accuracy, points = GetItemQueryPoints(item, request, p, words, b)
@@ -443,7 +446,7 @@ func (db *GoDB) handleItemQuery(storeDB, analyticsDB *GoDB,
 			// Load analytics if available
 			analytics = &Analytics{}
 			if item.AnalyticsUUID != "" {
-				anaBytes, okAna := analyticsDB.Read(item.AnalyticsUUID)
+				anaBytes, okAna := db.Read(AnaDB, item.AnalyticsUUID)
 				if okAna {
 					err = json.Unmarshal(anaBytes.Data, analytics)
 					if err != nil {
@@ -577,7 +580,7 @@ func GetItemQueryPoints(
 	return accuracy, points
 }
 
-func (db *GoDB) handleItemDelete(storeDB, analyticsDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleItemDelete(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -590,7 +593,7 @@ func (db *GoDB) handleItemDelete(storeDB, analyticsDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Retrieve item
-		response, ok := db.Read(itemID)
+		response, ok := db.Read(ItemDB, itemID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -603,7 +606,7 @@ func (db *GoDB) handleItemDelete(storeDB, analyticsDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Retrieve store
-		storeResp, ok := storeDB.Read(item.StoreUUID)
+		storeResp, ok := mainDB.Read(StoreDB, item.StoreUUID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -620,14 +623,14 @@ func (db *GoDB) handleItemDelete(storeDB, analyticsDB *GoDB) http.HandlerFunc {
 		}
 		// Is there an analytics entry?
 		if item.AnalyticsUUID != "" {
-			_ = analyticsDB.Delete(item.AnalyticsUUID, []string{})
+			_ = db.Delete(AnaDB, item.AnalyticsUUID, []string{})
 		}
 		// Delete item
-		_ = db.Delete(itemID, []string{"pid"})
+		_ = db.Delete(ItemDB, itemID, []string{"pid"})
 	}
 }
 
-func (db *GoDB) handleItemModification(storeDB, filesDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleItemModification(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -641,7 +644,7 @@ func (db *GoDB) handleItemModification(storeDB, filesDB *GoDB) http.HandlerFunc 
 		}
 		// Retrieve item
 		var err error
-		response, ok := db.Read(itemID)
+		response, ok := db.Read(ItemDB, itemID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -659,7 +662,7 @@ func (db *GoDB) handleItemModification(storeDB, filesDB *GoDB) http.HandlerFunc 
 			return
 		}
 		// Is user owner?
-		response, ok = storeDB.Read(item.StoreUUID)
+		response, ok = mainDB.Read(StoreDB, item.StoreUUID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -677,15 +680,15 @@ func (db *GoDB) handleItemModification(storeDB, filesDB *GoDB) http.HandlerFunc 
 		// Check what action is required
 		if request.Type == "edit" {
 			if request.Field == "iurl" {
-				err = db.changeItemImage(filesDB, user, itemID, request, false, false)
+				err = db.changeItemImage(user, itemID, request, false, false)
 			} else if request.Field == "burl" {
-				err = db.changeItemImage(filesDB, user, itemID, request, true, false)
+				err = db.changeItemImage(user, itemID, request, true, false)
 			}
 		} else if request.Type == "del" {
 			if request.Field == "iurl" {
-				err = db.removeItemImage(filesDB, user, itemID, request, false, false)
+				err = db.removeItemImage(user, itemID, request, false, false)
 			} else if request.Field == "burl" {
-				err = db.removeItemImage(filesDB, user, itemID, request, true, false)
+				err = db.removeItemImage(user, itemID, request, true, false)
 			}
 		}
 		if err != nil {
@@ -695,7 +698,7 @@ func (db *GoDB) handleItemModification(storeDB, filesDB *GoDB) http.HandlerFunc 
 	}
 }
 
-func saveThumbnailImage(filesDB *GoDB, user *User, base64 string) (string, error) {
+func saveThumbnailImage(rapidDB *GoDB, user *User, base64 string) (string, error) {
 	if base64 == "" {
 		return "", nil
 	}
@@ -711,7 +714,7 @@ func saveThumbnailImage(filesDB *GoDB, user *User, base64 string) (string, error
 		IsPrivate:  false,
 	}
 	fileSizeMB := float64(fileSize) / float64(1*MiB)
-	uUID, err := filesDB.SaveBase64AsFile(user, fileRequest, fileSizeMB)
+	uUID, err := rapidDB.SaveBase64AsFile(user, fileRequest, fileSizeMB)
 	if err != nil {
 		return "", err
 	}
@@ -719,7 +722,7 @@ func saveThumbnailImage(filesDB *GoDB, user *User, base64 string) (string, error
 }
 
 func (db *GoDB) changeItemImage(
-	filesDB *GoDB, user *User, itemID string, request *ItemModification, isBanner, isAnimated bool,
+	user *User, itemID string, request *ItemModification, isBanner, isAnimated bool,
 ) error {
 	if request.NewValue == "" {
 		return nil
@@ -743,12 +746,12 @@ func (db *GoDB) changeItemImage(
 		IsPrivate:  false,
 	}
 	fileSizeMB := float64(fileSize) / float64(1*MiB)
-	uUID, err := filesDB.SaveBase64AsFile(user, fileRequest, fileSizeMB)
+	uUID, err := db.SaveBase64AsFile(user, fileRequest, fileSizeMB)
 	if err != nil {
 		return err
 	}
 	// Retrieve item
-	response, txn := db.Get(itemID)
+	response, txn := db.Get(ItemDB, itemID)
 	if txn == nil {
 		return nil
 	}
@@ -774,7 +777,7 @@ func (db *GoDB) changeItemImage(
 	if err != nil {
 		return err
 	}
-	err = db.Update(txn, response.uUID, jsonEntry, map[string]string{
+	err = db.Update(ItemDB, txn, response.uUID, jsonEntry, map[string]string{
 		"pid": FIndex(item.StoreUUID),
 	})
 	if err != nil {
@@ -784,14 +787,14 @@ func (db *GoDB) changeItemImage(
 }
 
 func (db *GoDB) removeItemImage(
-	filesDB *GoDB, user *User, itemID string, request *ItemModification, isBanner, isAnimated bool,
+	user *User, itemID string, request *ItemModification, isBanner, isAnimated bool,
 ) error {
 	if request.NewValue == "" {
 		return nil
 	}
 	ix, err := strconv.ParseInt(request.NewValue, 10, 64)
 	// Retrieve item
-	response, txn := db.Get(itemID)
+	response, txn := db.Get(ItemDB, itemID)
 	if txn == nil {
 		return nil
 	}
@@ -811,7 +814,7 @@ func (db *GoDB) removeItemImage(
 	if err != nil {
 		return err
 	}
-	err = db.Update(txn, response.uUID, jsonEntry, map[string]string{
+	err = db.Update(ItemDB, txn, response.uUID, jsonEntry, map[string]string{
 		"pid": FIndex(item.StoreUUID),
 	})
 	if err != nil {
@@ -820,7 +823,7 @@ func (db *GoDB) removeItemImage(
 	return nil
 }
 
-func (db *GoDB) handleItemEdit(storeDB, filesDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleItemEdit(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -833,7 +836,7 @@ func (db *GoDB) handleItemEdit(storeDB, filesDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Retrieve item
-		response, ok := db.Read(itemID)
+		response, ok := db.Read(ItemDB, itemID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -846,7 +849,7 @@ func (db *GoDB) handleItemEdit(storeDB, filesDB *GoDB) http.HandlerFunc {
 			return
 		}
 		storeID := item.StoreUUID
-		response, ok = storeDB.Read(storeID)
+		response, ok = mainDB.Read(StoreDB, storeID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -892,7 +895,7 @@ func (db *GoDB) handleItemEdit(storeDB, filesDB *GoDB) http.HandlerFunc {
 					newArray = append(newArray, img)
 					continue
 				}
-				uUID, err = saveThumbnailImage(filesDB, user, img.URL)
+				uUID, err = saveThumbnailImage(db, user, img.URL)
 				if err != nil {
 					continue
 				}
@@ -970,13 +973,13 @@ func (db *GoDB) handleItemEdit(storeDB, filesDB *GoDB) http.HandlerFunc {
 			}
 		}
 		// Update
-		_, txn := db.Get(itemID)
+		_, txn := db.Get(ItemDB, itemID)
 		jsonEntry, err := json.Marshal(request)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(txn, itemID, jsonEntry, map[string]string{
+		err = db.Update(ItemDB, txn, itemID, jsonEntry, map[string]string{
 			"pid": FIndex(request.StoreUUID),
 		})
 	}

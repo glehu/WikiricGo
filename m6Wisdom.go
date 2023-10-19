@@ -17,6 +17,8 @@ import (
 	"unicode"
 )
 
+const WisdomDB = "m6"
+
 type Wisdom struct {
 	Name                 string   `json:"t"`
 	Description          string   `json:"desc"`
@@ -118,58 +120,37 @@ type WisdomKeywordList struct {
 	Keywords []string `json:"keys"`
 }
 
-func OpenWisdomDatabase() *GoDB {
-	db := OpenDB("wisdom")
-	return db
-}
-
 func (db *GoDB) ProtectedWisdomEndpoints(
 	r chi.Router, tokenAuth *jwtauth.JWTAuth,
-	chatGroupDB, chatMemberDB, notificationDB, knowledgeDB, analyticsDB, periodicDB *GoDB, connector *Connector,
+	mainDB *GoDB, connector *Connector,
 ) {
 	r.Route("/wisdom/private", func(r chi.Router) {
 		// ############
 		// ### POST ###
 		// ############
-		r.Post("/create", db.handleWisdomCreate(
-			chatGroupDB, chatMemberDB, knowledgeDB, notificationDB, connector))
-		r.Post("/edit/{wisdomID}", db.handleWisdomEdit(
-			chatGroupDB, chatMemberDB, knowledgeDB, connector))
-		r.Post("/move/{wisdomID}", db.handleWisdomMove(
-			chatGroupDB, chatMemberDB, knowledgeDB, connector))
-		r.Post("/reply", db.handleWisdomReply(
-			chatGroupDB, chatMemberDB, knowledgeDB, notificationDB, connector))
-		r.Post("/react/{wisdomID}", db.handleWisdomReaction(
-			chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB, notificationDB, connector))
-		r.Post("/query/{knowledgeID}", db.handleWisdomQuery(
-			chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB))
-		r.Post("/mod/{wisdomID}", db.handleWisdomModification(
-			chatGroupDB, chatMemberDB, knowledgeDB, connector))
-		r.Post("/reminder/{wisdomID}", db.handleWisdomReminderRequest(
-			chatGroupDB, chatMemberDB, knowledgeDB, periodicDB))
+		r.Post("/create", db.handleWisdomCreate(mainDB, connector))
+		r.Post("/edit/{wisdomID}", db.handleWisdomEdit(mainDB, connector))
+		r.Post("/move/{wisdomID}", db.handleWisdomMove(mainDB, connector))
+		r.Post("/reply", db.handleWisdomReply(mainDB, connector))
+		r.Post("/react/{wisdomID}", db.handleWisdomReaction(mainDB, connector))
+		r.Post("/query/{knowledgeID}", db.handleWisdomQuery(mainDB))
+		r.Post("/mod/{wisdomID}", db.handleWisdomModification(mainDB, connector))
+		r.Post("/reminder/{wisdomID}", db.handleWisdomReminderRequest(mainDB))
 		// ###########
 		// ### GET ###
 		// ###########
-		r.Get("/get/{wisdomID}", db.handleWisdomGet(
-			chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB))
-		r.Get("/delete/{wisdomID}", db.handleWisdomDelete(
-			chatGroupDB, chatMemberDB, knowledgeDB, notificationDB, analyticsDB, connector))
-		r.Get("/finish/{wisdomID}", db.handleWisdomFinish(
-			chatGroupDB, chatMemberDB, knowledgeDB, notificationDB, connector))
-		r.Get("/tasks/{knowledgeID}", db.handleWisdomGetTasks(
-			chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB))
-		r.Get("/contributors/{knowledgeID}", db.handleGetContributors(
-			chatGroupDB, chatMemberDB, knowledgeDB))
-		r.Get("/investigate/{wisdomID}", db.handleWisdomInvestigate(
-			chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB))
-		r.Get("/accept/{wisdomID}", db.handleWisdomAcceptAnswer(
-			chatGroupDB, chatMemberDB, knowledgeDB, notificationDB, connector))
-		r.Get("/meta/{knowledgeID}", db.handleWisdomMetaRetrieval(
-			chatGroupDB, chatMemberDB, knowledgeDB))
+		r.Get("/get/{wisdomID}", db.handleWisdomGet(mainDB))
+		r.Get("/delete/{wisdomID}", db.handleWisdomDelete(mainDB, connector))
+		r.Get("/finish/{wisdomID}", db.handleWisdomFinish(mainDB, connector))
+		r.Get("/tasks/{knowledgeID}", db.handleWisdomGetTasks(mainDB))
+		r.Get("/contributors/{knowledgeID}", db.handleGetContributors(mainDB))
+		r.Get("/investigate/{wisdomID}", db.handleWisdomInvestigate(mainDB))
+		r.Get("/accept/{wisdomID}", db.handleWisdomAcceptAnswer(mainDB, connector))
+		r.Get("/meta/{knowledgeID}", db.handleWisdomMetaRetrieval(mainDB))
 	})
 }
 
-func (db *GoDB) handleWisdomGet(chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleWisdomGet(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -181,7 +162,7 @@ func (db *GoDB) handleWisdomGet(chatGroupDB, chatMemberDB, knowledgeDB, analytic
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, ok := db.Read(wisdomID)
+		response, ok := db.Read(WisdomDB, wisdomID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -195,7 +176,7 @@ func (db *GoDB) handleWisdomGet(chatGroupDB, chatMemberDB, knowledgeDB, analytic
 		}
 		// If Wisdom is not public, check member and read right
 		canRead, _ := CheckWisdomAccess(
-			user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
+			user, wisdom, mainDB, db, r)
 		if !canRead {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -203,7 +184,7 @@ func (db *GoDB) handleWisdomGet(chatGroupDB, chatMemberDB, knowledgeDB, analytic
 		// Is there an analytics entry?
 		analytics := &Analytics{}
 		if wisdom.AnalyticsUUID != "" {
-			anaBytes, txn := analyticsDB.Get(wisdom.AnalyticsUUID)
+			anaBytes, txn := db.Get(AnaDB, wisdom.AnalyticsUUID)
 			if txn != nil {
 				err := json.Unmarshal(anaBytes.Data, analytics)
 				if err != nil {
@@ -216,7 +197,7 @@ func (db *GoDB) handleWisdomGet(chatGroupDB, chatMemberDB, knowledgeDB, analytic
 						defer txn.Discard()
 						jsonAna, err := json.Marshal(analytics)
 						if err == nil {
-							_ = analyticsDB.Update(txn, wisdom.AnalyticsUUID, jsonAna, map[string]string{})
+							_ = db.Update(AnaDB, txn, wisdom.AnalyticsUUID, jsonAna, map[string]string{})
 						}
 					}()
 				}
@@ -228,9 +209,9 @@ func (db *GoDB) handleWisdomGet(chatGroupDB, chatMemberDB, knowledgeDB, analytic
 			jsonAna, err := json.Marshal(analytics)
 			if err == nil {
 				// Insert analytics while returning its UUID to the wisdom for reference
-				wisdomBytes, txnWis := db.Get(wisdomID)
+				wisdomBytes, txnWis := db.Get(WisdomDB, wisdomID)
 				defer txnWis.Discard()
-				wisdom.AnalyticsUUID, err = analyticsDB.Insert(jsonAna, map[string]string{})
+				wisdom.AnalyticsUUID, err = db.Insert(AnaDB, jsonAna, map[string]string{})
 				if err != nil {
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
@@ -241,10 +222,7 @@ func (db *GoDB) handleWisdomGet(chatGroupDB, chatMemberDB, knowledgeDB, analytic
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
 				}
-				err = db.Update(txnWis, wisdomBytes.uUID, wisdomJson, map[string]string{
-					"knowledgeID-type": fmt.Sprintf("%s;%s", wisdom.KnowledgeUUID, wisdom.Type),
-					"refID":            wisdom.ReferenceUUID,
-				})
+				err = db.Update(WisdomDB, txnWis, wisdomBytes.uUID, wisdomJson, map[string]string{})
 			}
 		}
 		container := &WisdomContainer{
@@ -321,9 +299,7 @@ func (a *WisdomReminderRequest) Bind(_ *http.Request) error {
 	return nil
 }
 
-func (db *GoDB) handleWisdomCreate(
-	chatGroupDB, chatMemberDB, knowledgeDB, notificationDB *GoDB, connector *Connector,
-) http.HandlerFunc {
+func (db *GoDB) handleWisdomCreate(mainDB *GoDB, connector *Connector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -361,7 +337,7 @@ func (db *GoDB) handleWisdomCreate(
 		}
 		// Check member and write right
 		_, knowledgeAccess := CheckKnowledgeAccess(
-			user, request.KnowledgeUUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+			user, request.KnowledgeUUID, mainDB, r)
 		if !knowledgeAccess {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -388,31 +364,27 @@ func (db *GoDB) handleWisdomCreate(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		uUID, err := db.Insert(jsonEntry, map[string]string{
+		uUID, err := db.Insert(WisdomDB, jsonEntry, map[string]string{
 			"knowledgeID-type": fmt.Sprintf("%s;%s", request.KnowledgeUUID, request.Type),
-			"refID":            request.ReferenceUUID,
+			"refID-state":      fmt.Sprintf("%s;%t", request.ReferenceUUID, request.IsFinished),
 		})
 		if request.Type == "task" {
-			_, txn := db.Get(uUID)
+			_, txn := db.Get(WisdomDB, uUID)
 			db.rearrangeTasks(request, uUID)
-			jsonEntry, err := json.Marshal(request)
+			jsonEntry, err = json.Marshal(request)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
-			err = db.Update(txn, uUID, jsonEntry, map[string]string{
-				"knowledgeID-type": fmt.Sprintf("%s;%s", request.KnowledgeUUID, request.Type),
-				"refID":            request.ReferenceUUID,
-			})
+			err = db.Update(WisdomDB, txn, uUID, jsonEntry, nil)
 		}
 		// Respond to client
 		_, _ = fmt.Fprintln(w, uUID)
-		go NotifyTaskChange(user, request, uUID, knowledgeDB, chatMemberDB, connector)
+		go db.NotifyTaskChange(user, request, uUID, mainDB, connector)
 	}
 }
 
-func (db *GoDB) handleWisdomEdit(
-	chatGroupDB, chatMemberDB, knowledgeDB *GoDB, connector *Connector,
+func (db *GoDB) handleWisdomEdit(mainDB *GoDB, connector *Connector,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -426,7 +398,7 @@ func (db *GoDB) handleWisdomEdit(
 			return
 		}
 		// Get Wisdom
-		resp, txn := db.Get(wisdomID)
+		resp, txn := db.Get(WisdomDB, wisdomID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -439,7 +411,7 @@ func (db *GoDB) handleWisdomEdit(
 			return
 		}
 		// Check if user has right to delete this Wisdom
-		_, canEdit := CheckWisdomAccess(user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		_, canEdit := CheckWisdomAccess(user, wisdom, mainDB, db, r)
 		if !canEdit {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -472,7 +444,7 @@ func (db *GoDB) handleWisdomEdit(
 		}
 		// Check member and write right
 		_, knowledgeAccess := CheckKnowledgeAccess(
-			user, request.KnowledgeUUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+			user, request.KnowledgeUUID, mainDB, r)
 		if !knowledgeAccess {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -492,20 +464,19 @@ func (db *GoDB) handleWisdomEdit(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(txn, wisdomID, jsonEntry, map[string]string{
+		err = db.Update(WisdomDB, txn, wisdomID, jsonEntry, map[string]string{
 			"knowledgeID-type": fmt.Sprintf("%s;%s", request.KnowledgeUUID, request.Type),
-			"refID":            request.ReferenceUUID,
+			"refID-state":      fmt.Sprintf("%s;%t", request.ReferenceUUID, request.IsFinished),
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		go NotifyTaskChange(user, request, wisdomID, knowledgeDB, chatMemberDB, connector)
+		go db.NotifyTaskChange(user, request, wisdomID, mainDB, connector)
 	}
 }
 
-func (db *GoDB) handleWisdomMove(
-	chatGroupDB, chatMemberDB, knowledgeDB *GoDB, connector *Connector,
+func (db *GoDB) handleWisdomMove(mainDB *GoDB, connector *Connector,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -519,7 +490,7 @@ func (db *GoDB) handleWisdomMove(
 			return
 		}
 		// Get Wisdom
-		resp, txn := db.Get(wisdomID)
+		resp, txn := db.Get(WisdomDB, wisdomID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -531,8 +502,8 @@ func (db *GoDB) handleWisdomMove(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		// Check if user has right to delete this Wisdom
-		_, canEdit := CheckWisdomAccess(user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		// Check if user has right to move this Wisdom
+		_, canEdit := CheckWisdomAccess(user, wisdom, mainDB, db, r)
 		if !canEdit {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -546,7 +517,7 @@ func (db *GoDB) handleWisdomMove(
 		}
 		// Check member and write right
 		_, knowledgeAccess := CheckKnowledgeAccess(
-			user, wisdom.KnowledgeUUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+			user, wisdom.KnowledgeUUID, mainDB, r)
 		if !knowledgeAccess {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -555,7 +526,7 @@ func (db *GoDB) handleWisdomMove(
 		if request.ToUUID != "" {
 			// Check if new box exists and is actually of type box
 			// Get Wisdom
-			respBox, txnBox := db.Get(request.ToUUID)
+			respBox, txnBox := db.Get(WisdomDB, request.ToUUID)
 			if txnBox == nil {
 				http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 				return
@@ -582,20 +553,18 @@ func (db *GoDB) handleWisdomMove(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(txn, wisdomID, jsonEntry, map[string]string{
-			"knowledgeID-type": fmt.Sprintf("%s;%s", wisdom.KnowledgeUUID, wisdom.Type),
-			"refID":            wisdom.ReferenceUUID,
+		err = db.Update(WisdomDB, txn, wisdomID, jsonEntry, map[string]string{
+			"refID-state": fmt.Sprintf("%s;%t", wisdom.ReferenceUUID, wisdom.IsFinished),
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		go NotifyTaskChange(user, wisdom, wisdomID, knowledgeDB, chatMemberDB, connector)
+		go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
 	}
 }
 
-func (db *GoDB) handleWisdomDelete(
-	chatGroupDB, chatMemberDB, knowledgeDB, notificationDB, analyticsDB *GoDB, connector *Connector,
+func (db *GoDB) handleWisdomDelete(mainDB *GoDB, connector *Connector,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -609,7 +578,7 @@ func (db *GoDB) handleWisdomDelete(
 			return
 		}
 		// Get Wisdom
-		resp, txn := db.Get(wisdomID)
+		resp, txn := db.Get(WisdomDB, wisdomID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -622,16 +591,16 @@ func (db *GoDB) handleWisdomDelete(
 			return
 		}
 		// Check if user has right to delete this Wisdom
-		_, canDelete := CheckWisdomAccess(user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		_, canDelete := CheckWisdomAccess(user, wisdom, mainDB, db, r)
 		if canDelete {
 			// Is there an Analytics entry?
 			if wisdom.AnalyticsUUID != "" {
 				go func() {
-					_ = analyticsDB.Delete(wisdom.AnalyticsUUID, []string{})
+					_ = db.Delete(AnaDB, wisdom.AnalyticsUUID, []string{})
 				}()
 			}
 			txn.Discard()
-			err := db.Delete(wisdomID, []string{"knowledgeID-type", "refID"})
+			err := db.Delete(WisdomDB, wisdomID, []string{"knowledgeID-type", "refID-state"})
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
@@ -644,9 +613,9 @@ func (db *GoDB) handleWisdomDelete(
 					user,
 					wisdom,
 					resp.uUID,
-					notificationDB,
+					db,
 					connector)
-				go NotifyTaskChange(user, wisdom, wisdomID, knowledgeDB, chatMemberDB, connector)
+				go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
 			}()
 		} else {
 			txn.Discard()
@@ -656,8 +625,7 @@ func (db *GoDB) handleWisdomDelete(
 	}
 }
 
-func (db *GoDB) handleWisdomFinish(
-	chatGroupDB, chatMemberDB, knowledgeDB, notificationDB *GoDB, connector *Connector,
+func (db *GoDB) handleWisdomFinish(mainDB *GoDB, connector *Connector,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -671,7 +639,7 @@ func (db *GoDB) handleWisdomFinish(
 			return
 		}
 		// Get task
-		resp, txn := db.Get(wisdomID)
+		resp, txn := db.Get(WisdomDB, wisdomID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -684,7 +652,7 @@ func (db *GoDB) handleWisdomFinish(
 			return
 		}
 		// Check if user has right to finish this task
-		_, canFinish := CheckWisdomAccess(user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		_, canFinish := CheckWisdomAccess(user, wisdom, mainDB, db, r)
 		if canFinish {
 			// Set meta data
 			wisdom.TimeFinished = TimeNowIsoString()
@@ -695,9 +663,8 @@ func (db *GoDB) handleWisdomFinish(
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
-			err = db.Update(txn, wisdomID, jsonEntry, map[string]string{
-				"knowledgeID-type": fmt.Sprintf("%s;%s", wisdom.KnowledgeUUID, wisdom.Type),
-				"refID":            wisdom.ReferenceUUID,
+			err = db.Update(WisdomDB, txn, wisdomID, jsonEntry, map[string]string{
+				"refID-state": fmt.Sprintf("%s;%t", wisdom.ReferenceUUID, wisdom.IsFinished),
 			})
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -711,9 +678,9 @@ func (db *GoDB) handleWisdomFinish(
 					user,
 					wisdom,
 					resp.uUID,
-					notificationDB,
+					db,
 					connector)
-				go NotifyTaskChange(user, wisdom, wisdomID, knowledgeDB, chatMemberDB, connector)
+				go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
 			}()
 		} else {
 			txn.Discard()
@@ -723,8 +690,7 @@ func (db *GoDB) handleWisdomFinish(
 	}
 }
 
-func (db *GoDB) handleWisdomReaction(
-	chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB, notificationDB *GoDB, connector *Connector,
+func (db *GoDB) handleWisdomReaction(mainDB *GoDB, connector *Connector,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -747,7 +713,7 @@ func (db *GoDB) handleWisdomReaction(
 		// Sanitize
 		request.Reaction = strings.ToLower(request.Reaction)
 		// Retrieve wisdom and check if there is an Analytics entry available
-		wisdomBytes, txnWis := db.Get(wisdomID)
+		wisdomBytes, txnWis := db.Get(WisdomDB, wisdomID)
 		if txnWis == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -761,7 +727,7 @@ func (db *GoDB) handleWisdomReaction(
 		}
 		// Check if user has right to react
 		// If Wisdom is not public, check member and read right
-		canRead, _ := CheckWisdomAccess(user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		canRead, _ := CheckWisdomAccess(user, wisdom, mainDB, db, r)
 		if !canRead {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -771,7 +737,7 @@ func (db *GoDB) handleWisdomReaction(
 		var analyticsBytes *EntryResponse
 		var txn *badger.Txn
 		if wisdom.AnalyticsUUID != "" {
-			analyticsBytes, txn = analyticsDB.Get(wisdom.AnalyticsUUID)
+			analyticsBytes, txn = db.Get(AnaDB, wisdom.AnalyticsUUID)
 			if txn != nil {
 				defer txn.Discard()
 				analytics = &Analytics{}
@@ -845,14 +811,14 @@ func (db *GoDB) handleWisdomReaction(
 		if analyticsUpdate && analyticsBytes != nil {
 			txnWis.Discard() // Discard wisdom transaction since we're not updating it in this branch anymore
 			// Analytics existed -> Update them
-			err = analyticsDB.Update(txn, analyticsBytes.uUID, analyticsJson, map[string]string{})
+			err = db.Update(AnaDB, txn, analyticsBytes.uUID, analyticsJson, map[string]string{})
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
 		} else {
 			// Insert analytics while returning its UUID to the wisdom for reference
-			wisdom.AnalyticsUUID, err = analyticsDB.Insert(analyticsJson, map[string]string{})
+			wisdom.AnalyticsUUID, err = db.Insert(AnaDB, analyticsJson, map[string]string{})
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
@@ -863,10 +829,7 @@ func (db *GoDB) handleWisdomReaction(
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
-			err = db.Update(txnWis, wisdomBytes.uUID, wisdomJson, map[string]string{
-				"knowledgeID-type": fmt.Sprintf("%s;%s", wisdom.KnowledgeUUID, wisdom.Type),
-				"refID":            wisdom.ReferenceUUID,
-			})
+			err = db.Update(WisdomDB, txnWis, wisdomBytes.uUID, wisdomJson, nil)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
@@ -883,14 +846,14 @@ func (db *GoDB) handleWisdomReaction(
 				user,
 				wisdom,
 				wisdomBytes.uUID,
-				notificationDB,
+				db,
 				connector)
 		}()
 	}
 }
 
 func NotifyWisdomCollaborators(title, message string, user *User, wisdom *Wisdom, wisdomID string,
-	notificationDB *GoDB, connector *Connector,
+	rapidDB *GoDB, connector *Connector,
 ) {
 	usersToNotify := make([]string, len(wisdom.Collaborators)+1)
 	skip := 0
@@ -919,7 +882,7 @@ func NotifyWisdomCollaborators(title, message string, user *User, wisdom *Wisdom
 		if err != nil {
 			continue
 		}
-		notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
+		notificationUUID, err := rapidDB.Insert(NotifyDB, jsonNotification, map[string]string{
 			"usr": FIndex(collab),
 		})
 		if err != nil {
@@ -941,13 +904,13 @@ func NotifyWisdomCollaborators(title, message string, user *User, wisdom *Wisdom
 	}
 }
 
-func NotifyTaskChange(
+func (db *GoDB) NotifyTaskChange(
 	user *User, wisdom *Wisdom, wisdomID string,
-	knowledgeDB, chatMemberDB *GoDB,
+	mainDB *GoDB,
 	connector *Connector,
 ) {
 	// Retrieve users
-	knowledgeBytes, ok := knowledgeDB.Read(wisdom.KnowledgeUUID)
+	knowledgeBytes, ok := mainDB.Read(KnowledgeDB, wisdom.KnowledgeUUID)
 	if !ok {
 		return
 	}
@@ -957,7 +920,7 @@ func NotifyTaskChange(
 		return
 	}
 	query := FIndex(knowledge.ChatGroupUUID)
-	resp, err := chatMemberDB.Select(
+	resp, err := mainDB.Select(MemberDB,
 		map[string]string{
 			"chat-usr": query,
 		}, nil,
@@ -998,7 +961,7 @@ func NotifyTaskChange(
 }
 
 func CheckWisdomAccess(
-	user *User, wisdom *Wisdom, chatGroupDB, chatMemberDB, knowledgeDB *GoDB, r *http.Request,
+	user *User, wisdom *Wisdom, mainDB, rapidDB *GoDB, r *http.Request,
 ) (canRead, canWrite bool) {
 	// Check if write access is possible
 	canWrite = false
@@ -1016,7 +979,7 @@ func CheckWisdomAccess(
 	if wisdom.IsPublic {
 		return true, canWrite
 	}
-	knowledgeBytes, okKnowledge := knowledgeDB.Read(wisdom.KnowledgeUUID)
+	knowledgeBytes, okKnowledge := mainDB.Read(KnowledgeDB, wisdom.KnowledgeUUID)
 	if !okKnowledge {
 		return false, false
 	}
@@ -1027,7 +990,7 @@ func CheckWisdomAccess(
 	}
 	// Check if user has read rights for the specified chat group
 	_, chatMember, chatGroup, err := ReadChatGroupAndMember(
-		chatGroupDB, chatMemberDB, nil, nil,
+		mainDB, rapidDB, nil,
 		knowledge.ChatGroupUUID, user.Username, "", r)
 	if err != nil {
 		return false, false
@@ -1037,9 +1000,9 @@ func CheckWisdomAccess(
 }
 
 func CheckKnowledgeAccess(
-	user *User, knowledgeID string, chatGroupDB, chatMemberDB, knowledgeDB *GoDB, r *http.Request,
+	user *User, knowledgeID string, mainDB *GoDB, r *http.Request,
 ) (canRead bool, canWrite bool) {
-	knowledgeBytes, okKnowledge := knowledgeDB.Read(knowledgeID)
+	knowledgeBytes, okKnowledge := mainDB.Read(KnowledgeDB, knowledgeID)
 	if !okKnowledge {
 		return false, false
 	}
@@ -1050,7 +1013,7 @@ func CheckKnowledgeAccess(
 	}
 	// Check if user has read rights for the specified chat group
 	_, chatMember, chatGroup, err := ReadChatGroupAndMember(
-		chatGroupDB, chatMemberDB, nil, nil,
+		mainDB, nil, nil,
 		knowledge.ChatGroupUUID, user.Username, "", r)
 	if err != nil {
 		return false, false
@@ -1061,7 +1024,7 @@ func CheckKnowledgeAccess(
 }
 
 func (db *GoDB) handleWisdomReply(
-	chatGroupDB, chatMemberDB, knowledgeDB, notificationDB *GoDB, connector *Connector,
+	mainDB *GoDB, connector *Connector,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -1087,13 +1050,13 @@ func (db *GoDB) handleWisdomReply(
 		}
 		// Check member and write right
 		_, knowledgeAccess := CheckKnowledgeAccess(
-			user, request.KnowledgeUUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+			user, request.KnowledgeUUID, mainDB, r)
 		if !knowledgeAccess {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
 		// Does the referenced Wisdom exist?
-		respRef, okRef := db.Read(request.ReferenceUUID)
+		respRef, okRef := db.Read(WisdomDB, request.ReferenceUUID)
 		if !okRef {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
@@ -1127,9 +1090,9 @@ func (db *GoDB) handleWisdomReply(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		uUID, err := db.Insert(jsonEntry, map[string]string{
+		uUID, err := db.Insert(WisdomDB, jsonEntry, map[string]string{
 			"knowledgeID-type": fmt.Sprintf("%s;%s", request.KnowledgeUUID, request.Type),
-			"refID":            request.ReferenceUUID,
+			"refID-state":      fmt.Sprintf("%s;%t", request.ReferenceUUID, request.IsFinished),
 		})
 		// Respond to client
 		_, _ = fmt.Fprintln(w, uUID)
@@ -1140,14 +1103,12 @@ func (db *GoDB) handleWisdomReply(
 			user,
 			wisdomRef,
 			respRef.uUID,
-			notificationDB,
+			db,
 			connector)
 	}
 }
 
-func (db *GoDB) handleWisdomGetTasks(
-	chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB *GoDB,
-) http.HandlerFunc {
+func (db *GoDB) handleWisdomGetTasks(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -1159,7 +1120,7 @@ func (db *GoDB) handleWisdomGetTasks(
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		knowledgeEntry, okKnowledge := knowledgeDB.Read(knowledgeID)
+		knowledgeEntry, okKnowledge := mainDB.Read(KnowledgeDB, knowledgeID)
 		if !okKnowledge {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -1172,14 +1133,14 @@ func (db *GoDB) handleWisdomGetTasks(
 		}
 		// Check member and write right
 		knowledgeAccess, _ := CheckKnowledgeAccess(
-			user, knowledgeEntry.uUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+			user, knowledgeEntry.uUID, mainDB, r)
 		if !knowledgeAccess {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
 		// Now retrieve all boxes (Wisdom with type box)
 		// Boxes contain tasks which we will retrieve afterwards
-		resp, err := db.Select(map[string]string{
+		resp, err := db.Select(WisdomDB, map[string]string{
 			"knowledgeID-type": fmt.Sprintf("%s;box", knowledgeEntry.uUID),
 		}, nil)
 		if err != nil {
@@ -1203,7 +1164,7 @@ func (db *GoDB) handleWisdomGetTasks(
 			// Load analytics if available
 			analytics = &Analytics{}
 			if box.AnalyticsUUID != "" {
-				anaBytes, okAna := analyticsDB.Read(box.AnalyticsUUID)
+				anaBytes, okAna := db.Read(AnaDB, box.AnalyticsUUID)
 				if !okAna {
 					err = json.Unmarshal(anaBytes.Data, analytics)
 					if err != nil {
@@ -1221,13 +1182,20 @@ func (db *GoDB) handleWisdomGetTasks(
 				Tasks: make([]*WisdomContainer, 0),
 			})
 		}
-		// For each box get all tasks (Wisdom with type task) TODO: Make asynchronous
 		// Are we selecting with a predefined status?
 		stateFilter := r.URL.Query().Get("state")
+		if stateFilter == "done" {
+			stateFilter = ";true"
+		} else if stateFilter == "todo" {
+			stateFilter = ";false"
+		} else {
+			stateFilter = ""
+		}
+		// For each box get all tasks (Wisdom with type task) TODO: Make asynchronous
 		var task *Wisdom
 		for bi, boxCon := range boxes.Boxes {
-			respTask, err := db.Select(map[string]string{
-				"refID": boxCon.Box.UUID,
+			respTask, err := db.Select(WisdomDB, map[string]string{
+				"refID-state": boxCon.Box.UUID + stateFilter,
 			}, nil)
 			if err != nil {
 				continue
@@ -1242,15 +1210,10 @@ func (db *GoDB) handleWisdomGetTasks(
 				if err != nil {
 					continue
 				}
-				if stateFilter == "done" && !task.IsFinished {
-					continue
-				} else if stateFilter == "todo" && task.IsFinished {
-					continue
-				}
 				// Load analytics if available
 				analytics = &Analytics{}
 				if task.AnalyticsUUID != "" {
-					anaBytes, okAna := analyticsDB.Read(task.AnalyticsUUID)
+					anaBytes, okAna := db.Read(AnaDB, task.AnalyticsUUID)
 					if !okAna {
 						err = json.Unmarshal(anaBytes.Data, analytics)
 						if err != nil {
@@ -1275,9 +1238,7 @@ func (db *GoDB) handleWisdomGetTasks(
 	}
 }
 
-func (db *GoDB) handleWisdomQuery(
-	chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB *GoDB,
-) http.HandlerFunc {
+func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		timeStart := time.Now()
 		user := r.Context().Value("user").(*User)
@@ -1290,7 +1251,7 @@ func (db *GoDB) handleWisdomQuery(
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		canRead, _ := CheckKnowledgeAccess(user, knowledgeID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		canRead, _ := CheckKnowledgeAccess(user, knowledgeID, mainDB, r)
 		if !canRead {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -1308,7 +1269,7 @@ func (db *GoDB) handleWisdomQuery(
 			typeQuery = ""
 		}
 		ixQuery := fmt.Sprintf("%s;%s", knowledgeID, typeQuery)
-		resp, err := db.Select(map[string]string{
+		resp, err := db.Select(WisdomDB, map[string]string{
 			"knowledgeID-type": ixQuery,
 		}, nil)
 		if err != nil {
@@ -1369,7 +1330,7 @@ func (db *GoDB) handleWisdomQuery(
 			// Load analytics if available
 			analytics = &Analytics{}
 			if wisdom.AnalyticsUUID != "" {
-				anaBytes, okAna := analyticsDB.Read(wisdom.AnalyticsUUID)
+				anaBytes, okAna := db.Read(AnaDB, wisdom.AnalyticsUUID)
 				if okAna {
 					err = json.Unmarshal(anaBytes.Data, analytics)
 					if err != nil {
@@ -1609,8 +1570,7 @@ func GetRegexQuery(query string) (map[string]*QueryWord, *regexp.Regexp) {
 	return wordMap, regexp.MustCompile(builder.String())
 }
 
-func (db *GoDB) handleGetContributors(
-	chatGroupDB, chatMemberDB, knowledgeDB *GoDB,
+func (db *GoDB) handleGetContributors(mainDB *GoDB,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -1623,7 +1583,7 @@ func (db *GoDB) handleGetContributors(
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		knowledgeEntry, okKnowledge := knowledgeDB.Read(knowledgeID)
+		knowledgeEntry, okKnowledge := mainDB.Read(KnowledgeDB, knowledgeID)
 		if !okKnowledge {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -1636,13 +1596,13 @@ func (db *GoDB) handleGetContributors(
 		}
 		// Check member and read right
 		knowledgeAccess, _ := CheckKnowledgeAccess(
-			user, knowledgeEntry.uUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+			user, knowledgeEntry.uUID, mainDB, r)
 		if !knowledgeAccess {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
 		// Now retrieve all wisdom entries and count contributors (authors in this case)
-		resp, err := db.Select(map[string]string{
+		resp, err := db.Select(WisdomDB, map[string]string{
 			"knowledgeID-type": knowledgeEntry.uUID,
 		}, nil)
 		if err != nil {
@@ -1701,8 +1661,8 @@ func (db *GoDB) rearrangeTasks(wisdom *Wisdom, uUID string) {
 		// We still redistribute row indices if the distance becomes too small
 		position = 0
 	}
-	respTask, err := db.Select(map[string]string{
-		"refID": wisdom.ReferenceUUID,
+	respTask, err := db.Select(WisdomDB, map[string]string{
+		"refID-state": fmt.Sprintf("%s;false", wisdom.ReferenceUUID),
 	}, nil)
 	if err == nil {
 		responseTask := <-respTask
@@ -1743,13 +1703,12 @@ func (db *GoDB) rearrangeTasks(wisdom *Wisdom, uUID string) {
 					if err != nil {
 						continue
 					}
-					_, txSeg := db.Get(taskEntry.uUID)
+					_, txSeg := db.Get(WisdomDB, taskEntry.uUID)
 					if txSeg == nil {
 						continue
 					}
-					_ = db.Update(txSeg, taskEntry.uUID, jsonEntry, map[string]string{
-						"knowledgeID-type": fmt.Sprintf("%s;%s", wisdom.KnowledgeUUID, wisdom.Type),
-						"refID":            wisdom.ReferenceUUID,
+					_ = db.Update(WisdomDB, txSeg, taskEntry.uUID, jsonEntry, map[string]string{
+						"refID-state": fmt.Sprintf("%s;%t", wisdom.ReferenceUUID, wisdom.IsFinished),
 					})
 				}
 			}
@@ -1757,8 +1716,7 @@ func (db *GoDB) rearrangeTasks(wisdom *Wisdom, uUID string) {
 	}
 }
 
-func (db *GoDB) handleWisdomInvestigate(
-	chatGroupDB, chatMemberDB, knowledgeDB, analyticsDB *GoDB,
+func (db *GoDB) handleWisdomInvestigate(mainDB *GoDB,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -1771,7 +1729,7 @@ func (db *GoDB) handleWisdomInvestigate(
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, ok := db.Read(wisdomID)
+		response, ok := db.Read(WisdomDB, wisdomID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -1785,13 +1743,13 @@ func (db *GoDB) handleWisdomInvestigate(
 		}
 		// If Wisdom is not public, check member and read right
 		canRead, _ := CheckWisdomAccess(
-			user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
+			user, wisdom, mainDB, db, r)
 		if !canRead {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
-		resp, err := db.Select(map[string]string{
-			"refID": wisdomID,
+		resp, err := db.Select(WisdomDB, map[string]string{
+			"refID-state": wisdomID,
 		}, nil)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -1809,14 +1767,14 @@ func (db *GoDB) handleWisdomInvestigate(
 		}
 		var analytics *Analytics
 		if wisdom.ReferenceUUID != "" {
-			responseReference, ok := db.Read(wisdom.ReferenceUUID)
+			responseReference, ok := db.Read(WisdomDB, wisdom.ReferenceUUID)
 			if ok {
 				wisdomRef := &Wisdom{}
 				err := json.Unmarshal(responseReference.Data, wisdomRef)
 				if err == nil {
 					// Load analytics if available
 					if wisdomRef.AnalyticsUUID != "" {
-						anaBytes, ok := analyticsDB.Read(wisdomRef.AnalyticsUUID)
+						anaBytes, ok := db.Read(AnaDB, wisdomRef.AnalyticsUUID)
 						if ok {
 							analytics = &Analytics{}
 							err = json.Unmarshal(anaBytes.Data, analytics)
@@ -1849,7 +1807,7 @@ func (db *GoDB) handleWisdomInvestigate(
 			// Load analytics if available
 			analytics = &Analytics{}
 			if wisdom.AnalyticsUUID != "" {
-				anaBytes, okAna := analyticsDB.Read(wisdom.AnalyticsUUID)
+				anaBytes, okAna := db.Read(AnaDB, wisdom.AnalyticsUUID)
 				if okAna {
 					err = json.Unmarshal(anaBytes.Data, analytics)
 					if err != nil {
@@ -1883,8 +1841,7 @@ func (db *GoDB) handleWisdomInvestigate(
 	}
 }
 
-func (db *GoDB) handleWisdomModification(
-	chatGroupDB, chatMemberDB, knowledgeDB *GoDB, connector *Connector,
+func (db *GoDB) handleWisdomModification(mainDB *GoDB, connector *Connector,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -1898,7 +1855,7 @@ func (db *GoDB) handleWisdomModification(
 			return
 		}
 		// Get Wisdom
-		resp, txn := db.Get(wisdomID)
+		resp, txn := db.Get(WisdomDB, wisdomID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -1911,7 +1868,7 @@ func (db *GoDB) handleWisdomModification(
 			return
 		}
 		// Check if user has right to delete this Wisdom
-		_, canEdit := CheckWisdomAccess(user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		_, canEdit := CheckWisdomAccess(user, wisdom, mainDB, db, r)
 		if !canEdit {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -1935,21 +1892,20 @@ func (db *GoDB) handleWisdomModification(
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
-			err = db.Update(txn, wisdomID, jsonEntry, map[string]string{
+			err = db.Update(WisdomDB, txn, wisdomID, jsonEntry, map[string]string{
 				"knowledgeID-type": fmt.Sprintf("%s;%s", wisdom.KnowledgeUUID, wisdom.Type),
-				"refID":            wisdom.ReferenceUUID,
+				"refID-state":      fmt.Sprintf("%s;%t", wisdom.ReferenceUUID, wisdom.IsFinished),
 			})
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
-			go NotifyTaskChange(user, wisdom, wisdomID, knowledgeDB, chatMemberDB, connector)
+			go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
 		}
 	}
 }
 
-func (db *GoDB) handleWisdomAcceptAnswer(
-	chatGroupDB, chatMemberDB, knowledgeDB, notificationDB *GoDB, connector *Connector,
+func (db *GoDB) handleWisdomAcceptAnswer(mainDB *GoDB, connector *Connector,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -1963,7 +1919,7 @@ func (db *GoDB) handleWisdomAcceptAnswer(
 			return
 		}
 		// Get reply
-		resp, ok := db.Read(wisdomID)
+		resp, ok := db.Read(WisdomDB, wisdomID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -1979,7 +1935,7 @@ func (db *GoDB) handleWisdomAcceptAnswer(
 			return
 		}
 		// Get referenced question
-		respQ, txnQ := db.Get(wisdom.ReferenceUUID)
+		respQ, txnQ := db.Get(WisdomDB, wisdom.ReferenceUUID)
 		if txnQ == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -1996,7 +1952,7 @@ func (db *GoDB) handleWisdomAcceptAnswer(
 			return
 		}
 		// Check if user has right to accept answers for this question
-		_, canFinish := CheckWisdomAccess(user, wisdomQ, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		_, canFinish := CheckWisdomAccess(user, wisdomQ, mainDB, db, r)
 		if !canFinish {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -2012,16 +1968,16 @@ func (db *GoDB) handleWisdomAcceptAnswer(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(txnQ, wisdom.ReferenceUUID, jsonEntry, map[string]string{
+		err = db.Update(WisdomDB, txnQ, wisdom.ReferenceUUID, jsonEntry, map[string]string{
 			"knowledgeID-type": fmt.Sprintf("%s;%s", wisdomQ.KnowledgeUUID, wisdomQ.Type),
-			"refID":            wisdomQ.ReferenceUUID,
+			"refID-state":      fmt.Sprintf("%s;%t", wisdomQ.ReferenceUUID, wisdomQ.IsFinished),
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 		// ...now save answer
-		_, txn := db.Get(wisdomID)
+		_, txn := db.Get(WisdomDB, wisdomID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -2032,9 +1988,9 @@ func (db *GoDB) handleWisdomAcceptAnswer(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(txn, wisdomID, jsonEntry, map[string]string{
+		err = db.Update(WisdomDB, txn, wisdomID, jsonEntry, map[string]string{
 			"knowledgeID-type": fmt.Sprintf("%s;%s", wisdom.KnowledgeUUID, wisdom.Type),
-			"refID":            wisdom.ReferenceUUID,
+			"refID-state":      fmt.Sprintf("%s;%t", wisdom.ReferenceUUID, wisdom.IsFinished),
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -2048,9 +2004,9 @@ func (db *GoDB) handleWisdomAcceptAnswer(
 				user,
 				wisdomQ,
 				respQ.uUID,
-				notificationDB,
+				db,
 				connector)
-			go NotifyTaskChange(user, wisdomQ, respQ.uUID, knowledgeDB, chatMemberDB, connector)
+			go db.NotifyTaskChange(user, wisdomQ, respQ.uUID, mainDB, connector)
 		}()
 		// Notify answerer
 		go func() {
@@ -2060,15 +2016,14 @@ func (db *GoDB) handleWisdomAcceptAnswer(
 				user,
 				wisdom,
 				resp.uUID,
-				notificationDB,
+				db,
 				connector)
-			go NotifyTaskChange(user, wisdom, wisdomID, knowledgeDB, chatMemberDB, connector)
+			go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
 		}()
 	}
 }
 
-func (db *GoDB) handleWisdomMetaRetrieval(
-	chatGroupDB, chatMemberDB, knowledgeDB *GoDB,
+func (db *GoDB) handleWisdomMetaRetrieval(mainDB *GoDB,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -2087,7 +2042,7 @@ func (db *GoDB) handleWisdomMetaRetrieval(
 			return
 		}
 		queryType = strings.ToLower(queryType)
-		knowledgeEntry, okKnowledge := knowledgeDB.Read(knowledgeID)
+		knowledgeEntry, okKnowledge := mainDB.Read(KnowledgeDB, knowledgeID)
 		if !okKnowledge {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -2100,7 +2055,7 @@ func (db *GoDB) handleWisdomMetaRetrieval(
 		}
 		// Check member and read right
 		knowledgeAccess, _ := CheckKnowledgeAccess(
-			user, knowledgeEntry.uUID, chatGroupDB, chatMemberDB, knowledgeDB, r)
+			user, knowledgeEntry.uUID, mainDB, r)
 		if !knowledgeAccess {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -2113,7 +2068,7 @@ func (db *GoDB) handleWisdomMetaRetrieval(
 }
 
 func (db *GoDB) retrieveWisdomKeys(w http.ResponseWriter, r *http.Request, knowledgeID string) {
-	resp, err := db.Select(map[string]string{
+	resp, err := db.Select(WisdomDB, map[string]string{
 		"knowledgeID-type": FIndex(knowledgeID),
 	}, &SelectOptions{
 		MaxResults: 1_000,
@@ -2150,8 +2105,7 @@ func (db *GoDB) retrieveWisdomKeys(w http.ResponseWriter, r *http.Request, knowl
 	render.JSON(w, r, keys)
 }
 
-func (db *GoDB) handleWisdomReminderRequest(
-	chatGroupDB, chatMemberDB, knowledgeDB, periodicDB *GoDB,
+func (db *GoDB) handleWisdomReminderRequest(mainDB *GoDB,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -2165,7 +2119,7 @@ func (db *GoDB) handleWisdomReminderRequest(
 			return
 		}
 		// Get Wisdom
-		resp, ok := db.Read(wisdomID)
+		resp, ok := db.Read(WisdomDB, wisdomID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -2177,7 +2131,7 @@ func (db *GoDB) handleWisdomReminderRequest(
 			return
 		}
 		// Check if user has right to delete this Wisdom
-		canRead, _ := CheckWisdomAccess(user, wisdom, chatGroupDB, chatMemberDB, knowledgeDB, r)
+		canRead, _ := CheckWisdomAccess(user, wisdom, mainDB, db, r)
 		if !canRead {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
@@ -2236,7 +2190,7 @@ func (db *GoDB) handleWisdomReminderRequest(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		_, err = periodicDB.Insert(jsonEntry, map[string]string{
+		_, err = db.Insert(PeriodDB, jsonEntry, map[string]string{
 			"usr": FIndex(user.Username),
 			"due": action.TriggerDateTime,
 			"ref": fmt.Sprintf("%s;%s", wisdom.Type, resp.uUID),

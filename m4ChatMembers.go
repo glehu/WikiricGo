@@ -7,6 +7,8 @@ import (
 	"sort"
 )
 
+const MemberDB = "m4"
+
 type ChatMemberList struct {
 	ChatMembers []*ChatMember `json:"members"`
 }
@@ -28,11 +30,6 @@ type ChatMember struct {
 	BannerAnimatedURL    string   `json:"burla"`
 	FCMToken             string   `json:"fcm"`
 	DateCreated          string   `json:"ts"`
-}
-
-func OpenChatMemberDatabase() *GoDB {
-	db := OpenDB("chatMembers")
-	return db
 }
 
 func (member *ChatMember) GetRoleInformation(group *ChatGroup) *ChatRole {
@@ -62,7 +59,7 @@ func (member *ChatMember) GetRoleInformation(group *ChatGroup) *ChatRole {
 
 func (db *GoDB) CheckFriendGroupExist(selfUser, friendUser string) (string, error) {
 	query := fmt.Sprintf("%s;%s", selfUser, friendUser)
-	resp, err := db.Select(map[string]string{
+	resp, err := db.Select(MemberDB, map[string]string{
 		"user-friend": query,
 	}, &SelectOptions{
 		MaxResults: 1,

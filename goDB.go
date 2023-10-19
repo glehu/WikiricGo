@@ -90,7 +90,9 @@ func (db *GoDB) CloseDB() error {
 // ### DB Functions ###
 
 // Insert adds an entry to the database
-func (db *GoDB) Insert(data []byte, indices map[string]string) (string, error) {
+func (db *GoDB) Insert(
+	mod string, data []byte, indices map[string]string,
+) (string, error) {
 	indicesClean, _ := db.validateIndices(indices, false)
 	// Generate UUID for main index entry
 	uUIDTmp, err := uuid.NewV7()
@@ -98,7 +100,7 @@ func (db *GoDB) Insert(data []byte, indices map[string]string) (string, error) {
 		return "", nil
 	}
 	uUID := uUIDTmp.String()
-	err = db.doInsert([]byte(uUID), data, indicesClean)
+	err = db.doInsert(mod, []byte(uUID), data, indicesClean)
 	if err != nil {
 		return "", err
 	}
@@ -106,91 +108,26 @@ func (db *GoDB) Insert(data []byte, indices map[string]string) (string, error) {
 }
 
 // Update overrides an existing entry and its sub-indices if provided
-func (db *GoDB) Update(txn *badger.Txn, uUID string, data []byte, indices map[string]string) error {
+func (db *GoDB) Update(
+	mod string, txn *badger.Txn, uUID string, data []byte, indices map[string]string,
+) error {
 	indicesClean, _ := db.validateIndices(indices, false)
-	err := db.doUpdate(txn, []byte(uUID), data, indicesClean)
+	err := db.doUpdate(mod, txn, []byte(uUID), data, indicesClean)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (db *GoDB) doInsert(uUID []byte, data []byte, indices map[string]string) error {
-	err := db.db.Update(func(txn *badger.Txn) error {
-		// Create main index entry
-		err := txn.Set(uUID, data)
-		if err != nil {
-			return err
-		}
-		// Create sub index entries (using the provided indices)
-		// The whole purpose of sub index entries is to point to the main index entry
-		// E.G.:
-		//				   	|      Index      |        Data        |
-		//            | --------------- | ------------------ |
-		// 		Main:	 	|	12345 					|	User1, Sample Name |
-		// 		Sub:		|	usr:User1;12345	|	12345							 |
-		for k, v := range indices {
-			err := txn.Set([]byte(fmt.Sprintf("%s:%s;%s", k, v, uUID)), uUID)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	return err
-}
-
-func (db *GoDB) doUpdate(txn *badger.Txn, uUID []byte, data []byte, indices map[string]string) error {
-	defer txn.Discard()
-	// Create main index entry
-	err := txn.Set(uUID, data)
-	if err != nil {
-		return err
-	}
-	// Create sub index entries (using the provided indices)
-	// The whole purpose of sub index entries is to point to the main index entry
-	// E.G.:
-	//				   	|      Index      |        Data        |
-	//            | --------------- | ------------------ |
-	// 		Main:	 	|	12345 					|	User1, Sample Name |
-	// 		Sub:		|	usr:User1;12345	|	12345							 |
-	for k, v := range indices {
-		// Delete existing index
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		opts.Reverse = true
-		it := txn.NewIterator(opts)
-		prefix := []byte(fmt.Sprintf("%s:", k))
-		for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
-			// Match!
-			item := it.Item()
-			_ = item.Value(func(val []byte) error {
-				if bytes.Equal(val, uUID) {
-					_ = txn.Delete(item.KeyCopy(nil))
-				}
-				return nil
-			})
-		}
-		it.Close()
-		// Set new index
-		err := txn.Set([]byte(fmt.Sprintf("%s:%s;%s", k, v, uUID)), uUID)
-		if err != nil {
-			return err
-		}
-	}
-	err = txn.Commit()
-	return err
-}
-
 // Delete removes an entry from the database
-func (db *GoDB) Delete(uUID string, indices []string) error {
+func (db *GoDB) Delete(mod string, uUID string, indices []string) error {
 	if uUID == "" {
 		return errors.New("missing uuid")
 	}
 	bUUID := []byte(uUID)
 	err := db.db.Update(func(txn *badger.Txn) error {
 		// Delete main index entry
-		err := txn.Delete([]byte(uUID))
+		err := txn.Delete([]byte(fmt.Sprintf("%s:uid:%s", mod, uUID)))
 		if err != nil {
 			return err
 		}
@@ -200,7 +137,7 @@ func (db *GoDB) Delete(uUID string, indices []string) error {
 			opts.PrefetchValues = false
 			opts.Reverse = true
 			it := txn.NewIterator(opts)
-			prefix := []byte(fmt.Sprintf("%s:", k))
+			prefix := []byte(fmt.Sprintf("%s:%s:", mod, k))
 			for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
 				// Match!
 				item := it.Item()
@@ -218,11 +155,11 @@ func (db *GoDB) Delete(uUID string, indices []string) error {
 	return err
 }
 
-func (db *GoDB) Get(uUID string) (*EntryResponse, *badger.Txn) {
+func (db *GoDB) Get(mod, uUID string) (*EntryResponse, *badger.Txn) {
 	var ixEntry []byte
 	err := db.db.View(func(txn *badger.Txn) error {
 		// Get main index entry
-		ix, err := txn.Get([]byte(uUID))
+		ix, err := txn.Get([]byte(fmt.Sprintf("%s:uid:%s", mod, uUID)))
 		if err != nil {
 			return err
 		}
@@ -239,11 +176,11 @@ func (db *GoDB) Get(uUID string) (*EntryResponse, *badger.Txn) {
 	return entryResponse, db.db.NewTransaction(true)
 }
 
-func (db *GoDB) Read(uUID string) (*EntryResponse, bool) {
+func (db *GoDB) Read(mod, uUID string) (*EntryResponse, bool) {
 	var ixEntry []byte
 	err := db.db.View(func(txn *badger.Txn) error {
 		// Delete main index entry
-		ix, err := txn.Get([]byte(uUID))
+		ix, err := txn.Get([]byte(fmt.Sprintf("%s:uid:%s", mod, uUID)))
 		if err != nil {
 			return err
 		}
@@ -261,7 +198,9 @@ func (db *GoDB) Read(uUID string) (*EntryResponse, bool) {
 }
 
 // Select returns entries from the database
-func (db *GoDB) Select(indices map[string]string, options *SelectOptions) (chan []*EntryResponse, error) {
+func (db *GoDB) Select(
+	mod string, indices map[string]string, options *SelectOptions,
+) (chan []*EntryResponse, error) {
 	indicesClean, err := db.validateIndices(indices, true)
 	if err != nil {
 		return nil, err
@@ -295,7 +234,7 @@ func (db *GoDB) Select(indices map[string]string, options *SelectOptions) (chan 
 	// Launch index search goroutines
 	for key, value := range indicesClean {
 		wg.Add(1)
-		go db.singleIndexQuery(key, value, responsesInternal, &wg, ctx)
+		go db.singleIndexQuery(mod, key, value, responsesInternal, &wg, ctx)
 	}
 	// Start goroutine awaiting a cancellation
 	go func() {
@@ -354,8 +293,84 @@ func (db *GoDB) Select(indices map[string]string, options *SelectOptions) (chan 
 	return responsesExternal, nil
 }
 
+func (db *GoDB) doInsert(
+	mod string, uUID []byte, data []byte, indices map[string]string,
+) error {
+	err := db.db.Update(func(txn *badger.Txn) error {
+		// Create main index entry
+		err := txn.Set([]byte(fmt.Sprintf("%s:uid:%s", mod, uUID)), data)
+		if err != nil {
+			return err
+		}
+		// Create sub index entries (using the provided indices)
+		// The whole purpose of sub index entries is to point to the main index entry
+		// E.G.: (DB: UserDB = m1; IX: Username = usr)
+		//				   	|      Index          |        Data        |
+		//            | ------------------- | ------------------ |
+		// 		Main:	 	|	m1:12345				    |	User1, Sample Name |
+		// 		Sub:		|	m1:usr:User1;12345	|	12345							 |
+		var ival string
+		for k, v := range indices {
+			ival = fmt.Sprintf("%s:%s:%s;%s", mod, k, v, uUID)
+			err := txn.Set([]byte(ival), uUID)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return err
+}
+
+func (db *GoDB) doUpdate(
+	mod string, txn *badger.Txn, uUID []byte, data []byte, indices map[string]string,
+) error {
+	defer txn.Discard()
+	// Create main index entry
+	err := txn.Set([]byte(fmt.Sprintf("%s:uid:%s", mod, uUID)), data)
+	if err != nil {
+		return err
+	}
+	// Create sub index entries (using the provided indices)
+	// The whole purpose of sub index entries is to point to the main index entry
+	// E.G.: (DB: UserDB = m1; IX: Username = usr)
+	//				   	|      Index         |        Data        |
+	//            | ------------------ | ------------------ |
+	// 		Main:	 	|	m1:12345           | User1, Sample Name |
+	// 		Sub:		|	m1:usr:User1;12345 | 12345              |
+	var ival string
+	for k, v := range indices {
+		// Delete existing index
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Reverse = true
+		it := txn.NewIterator(opts)
+		ival = fmt.Sprintf("%s:%s:", mod, k)
+		prefix := []byte(ival)
+		for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
+			// Match!
+			item := it.Item()
+			_ = item.Value(func(val []byte) error {
+				if bytes.Equal(val, uUID) {
+					_ = txn.Delete(item.KeyCopy(nil))
+				}
+				return nil
+			})
+		}
+		it.Close()
+		// Set new index
+		ival = fmt.Sprintf("%s:%s:%s;%s", mod, k, v, uUID)
+		err := txn.Set([]byte(ival), uUID)
+		if err != nil {
+			return err
+		}
+	}
+	err = txn.Commit()
+	return err
+}
+
 func (db *GoDB) singleIndexQuery(
-	index, value string, responses chan *EntryResponse, wg *sync.WaitGroup, ctx context.Context,
+	mod, index, value string, responses chan *EntryResponse, wg *sync.WaitGroup, ctx context.Context,
 ) {
 	noResults := true
 	// Prefix Iteration
@@ -365,7 +380,8 @@ func (db *GoDB) singleIndexQuery(
 		opts.Reverse = true
 		it := txn.NewIterator(opts)
 		defer it.Close()
-		prefix := []byte(fmt.Sprintf("%s:%s", index, value))
+		ival := fmt.Sprintf("%s:%s:%s", mod, index, value)
+		prefix := []byte(ival)
 		for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
 			// Listen to the Done-chanel to make sure we're not wasting resources
 			select {
@@ -378,7 +394,7 @@ func (db *GoDB) singleIndexQuery(
 				err := item.Value(func(v []byte) error {
 					// Since sub index entries' values point to the main index entry's uuid,
 					// we need to get the main index entry now
-					ix, err := txn.Get(v)
+					ix, err := txn.Get([]byte(fmt.Sprintf("%s:uid:%s", mod, v)))
 					if err != nil {
 						return nil
 					}

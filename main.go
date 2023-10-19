@@ -10,7 +10,6 @@ import (
 	"google.golang.org/api/option"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 )
 
@@ -30,42 +29,33 @@ type Databases struct {
 }
 
 func main() {
-	// RUNTIME
-	runtime.GOMAXPROCS(128)
-	// Debug
+	// #### RUNTIME
+	// runtime.GOMAXPROCS(128)
+	// #### Debug
 	dbug()
-	// Create wait group and done channels
+	// #### Create wait group and done channels
 	wg := sync.WaitGroup{}
 	doneServer := make(chan bool)
 	donePeriodic := make(chan bool)
-	// Setup
+	// #### Setup
 	config, err := getConfig()
 	if err != nil {
 		fmt.Println(":: Could not retrieve config.json")
 	} else {
 		fmt.Println(":: config.json loaded")
 	}
-	// Setup Databases
+	// #### Setup Databases
+	// #### Instances for each database will be no more as it requires too many resources
 	dbList := &Databases{Map: map[string]*GoDB{}}
-	dbList.Map["users"] = OpenUserDatabase()
-	dbList.Map["chats"] = OpenChatGroupDatabase()
-	dbList.Map["members"] = OpenChatMemberDatabase()
-	dbList.Map["msg"] = OpenChatMessageDatabase()
-	dbList.Map["files"] = OpenFilesDatabase()
-	dbList.Map["analytics"] = OpenAnalyticsDatabase()
-	dbList.Map["notifications"] = OpenNotificationDatabase()
-	dbList.Map["knowledge"] = OpenKnowledgeDatabase()
-	dbList.Map["wisdom"] = OpenWisdomDatabase()
-	dbList.Map["process"] = OpenProcessDatabase()
-	dbList.Map["periodic"] = OpenPeriodicDatabase()
-	dbList.Map["stores"] = OpenStoresDatabase()
-	dbList.Map["items"] = OpenItemsDatabase()
-	dbList.Map["orders"] = OpenOrdersDatabase()
+	// The main database will store most data that is not subject to rapid changes
+	dbList.Map["main"] = OpenDB("main")
+	// The rapid database will store data being subject to rapid and frequent changes
+	dbList.Map["rapid"] = OpenDB("rapid")
 	// Chat Server
-	chatServer := CreateChatServer(dbList.Map["msg"])
+	chatServer := CreateChatServer(dbList.Map["rapid"])
 	// Connector
-	connector := CreateConnector(dbList.Map["notifications"])
-	// Firebase Cloud Messaging
+	connector := CreateConnector(dbList.Map["rapid"])
+	// #### Firebase Cloud Messaging
 	fmt.Println(":: Checking for fbcm.json")
 	var fcmClient *messaging.Client
 	fcmClient = nil
@@ -88,7 +78,7 @@ func main() {
 	} else {
 		fmt.Println(":: fbcm.json missing")
 	}
-	// Initialize Emailer
+	// #### Initialize Emailer
 	fmt.Println(":: Initializing Emailer")
 	emailClient, err := GetEmailClient(config)
 	if err != nil || emailClient == nil {
@@ -96,12 +86,12 @@ func main() {
 	} else {
 		fmt.Println(":: Emailer initialized")
 	}
-	// Start Server (with wait group delta)
+	// #### Start Server (with wait group delta)
 	wg.Add(1)
 	go StartServer(doneServer, &wg, config, dbList, chatServer, connector, fcmClient, emailClient)
-	// Start periodic actions loop
-	dbList.Map["periodic"].StartPeriodicLoop(donePeriodic, dbList, connector, fcmClient)
-	// Wait for all processes to end
+	// #### Start periodic actions loop
+	dbList.Map["rapid"].StartPeriodicLoop(donePeriodic, dbList, connector, fcmClient)
+	// #### Wait for all processes to end
 	wg.Wait()
 }
 

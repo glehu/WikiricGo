@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const DebugDB = "debug"
+
 type SampleEntry struct {
 	Field       string
 	Description string
@@ -57,7 +59,7 @@ func testStore(db *GoDB) {
 			log.Panic(":: DEBUG ERROR serializing", err)
 		}
 		// Insert into db
-		_, err = db.Insert(data, map[string]string{
+		_, err = db.Insert(DebugDB, data, map[string]string{
 			"count": count,
 		})
 		if err != nil {
@@ -77,7 +79,7 @@ func testSelect(db *GoDB) string {
 	time.Sleep(time.Second)
 	start := time.Now()
 	// Retrieve data from database
-	resp, err := db.Select(map[string]string{
+	resp, err := db.Select(DebugDB, map[string]string{
 		"count": "1",
 	}, &SelectOptions{
 		MaxResults: 1,
@@ -111,7 +113,7 @@ func testDelete(db *GoDB, uUID string) {
 	time.Sleep(time.Second)
 	start := time.Now()
 	// Delete entry from database
-	err := db.Delete(uUID, []string{"count"})
+	err := db.Delete(DebugDB, uUID, []string{"count"})
 	if err != nil {
 		log.Panic(err)
 	}
@@ -124,7 +126,7 @@ func testUpdate(db *GoDB, uUID string) {
 	time.Sleep(time.Second)
 	start := time.Now()
 	// Update entry in database
-	_, txn := db.Get(uUID)
+	_, txn := db.Get(DebugDB, uUID)
 	defer txn.Discard()
 	// Serialize data
 	data, err := json.Marshal(&SampleEntry{
@@ -138,7 +140,7 @@ func testUpdate(db *GoDB, uUID string) {
 		log.Panic(":: DEBUG ERROR serializing", err)
 	}
 	// Insert into db
-	err = db.Update(txn, uUID, data, map[string]string{
+	err = db.Update(DebugDB, txn, uUID, data, map[string]string{
 		"count": "1337",
 	})
 	if err != nil {

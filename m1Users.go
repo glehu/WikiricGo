@@ -15,6 +15,8 @@ import (
 	"strings"
 )
 
+const UserDB = "m1"
+
 type User struct {
 	Username    string       `json:"usr"`
 	DisplayName string       `json:"name"`
@@ -72,17 +74,12 @@ type UserStatus struct {
 	Status   string `json:"status"`
 }
 
-func OpenUserDatabase() *GoDB {
-	db := OpenDB("users")
-	return db
-}
-
-func (db *GoDB) PublicUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, notificationDB *GoDB) {
+func (db *GoDB) PublicUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, rapidDB *GoDB) {
 	r.Route("/users/public", func(r chi.Router) {
 		// ############
 		// ### POST ###
 		// ############
-		r.Post("/signup", db.handleUserRegistration(notificationDB))
+		r.Post("/signup", db.handleUserRegistration(rapidDB))
 		// ###########
 		// ### GET ###
 		// ###########
@@ -99,14 +96,15 @@ func (db *GoDB) BasicProtectedUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWT
 	})
 }
 
-func (db *GoDB) ProtectedUserEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
-	chatGroupDB, chatMemberDB, notificationDB *GoDB, connector *Connector) {
+func (db *GoDB) ProtectedUserEndpoints(
+	r chi.Router, tokenAuth *jwtauth.JWTAuth, rapidDB *GoDB, connector *Connector,
+) {
 	r.Route("/users/private", func(r chi.Router) {
 		// ############
 		// ### POST ###
 		// ############
 		r.Post("/mod", db.handleUserModification())
-		r.Post("/befriend", db.handleUserFriendRequest(chatGroupDB, chatMemberDB, notificationDB, connector))
+		r.Post("/befriend", db.handleUserFriendRequest(rapidDB, connector))
 		r.Post("/status", db.handleUserGetStatus(connector))
 		// ###########
 		// ### GET ###
@@ -160,7 +158,7 @@ func (db *GoDB) handleUserLogin() http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleUserRegistration(rapidDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Retrieve POST payload
 		request := &RegisterRequest{}
@@ -183,7 +181,7 @@ func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
 		}
 		// Check if this user exists already
 		query := FIndex(request.Username)
-		resp, err := db.Select(map[string]string{
+		resp, err := db.Select(UserDB, map[string]string{
 			"usr": query,
 		}, &SelectOptions{
 			MaxResults: 1,
@@ -220,7 +218,7 @@ func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		uUID, err := db.Insert(jsonEntry, map[string]string{
+		uUID, err := db.Insert(UserDB, jsonEntry, map[string]string{
 			"usr": FIndex(request.Username),
 		})
 		if err != nil {
@@ -241,7 +239,7 @@ func (db *GoDB) handleUserRegistration(notificationDB *GoDB) http.HandlerFunc {
 		}
 		jsonNotification, err := json.Marshal(notification)
 		if err == nil {
-			_, _ = notificationDB.Insert(jsonNotification, map[string]string{
+			_, _ = rapidDB.Insert(NotifyDB, jsonNotification, map[string]string{
 				"usr": FIndex(request.Username),
 			})
 		}
@@ -311,14 +309,14 @@ func (db *GoDB) handleUserModification() http.HandlerFunc {
 }
 
 func (db *GoDB) changeUserDisplayName(user *User, userUUID string, request *UserModification) error {
-	_, txn := db.Get(userUUID)
+	_, txn := db.Get(UserDB, userUUID)
 	defer txn.Discard()
 	user.DisplayName = request.NewValue
 	userBytes, err := json.Marshal(user)
 	if err != nil {
 		return err
 	}
-	err = db.Update(txn, userUUID, userBytes, map[string]string{
+	err = db.Update(UserDB, txn, userUUID, userBytes, map[string]string{
 		"usr": FIndex(user.Username),
 	})
 	if err != nil {
@@ -328,7 +326,7 @@ func (db *GoDB) changeUserDisplayName(user *User, userUUID string, request *User
 }
 
 func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserModification) error {
-	_, txn := db.Get(userUUID)
+	_, txn := db.Get(UserDB, userUUID)
 	defer txn.Discard()
 	hOld := sha256.New()
 	hOld.Write([]byte(request.OldValue))
@@ -347,7 +345,7 @@ func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserMod
 	if err != nil {
 		return err
 	}
-	err = db.Update(txn, userUUID, userBytes, map[string]string{
+	err = db.Update(UserDB, txn, userUUID, userBytes, map[string]string{
 		"usr": FIndex(user.Username),
 	})
 	if err != nil {
@@ -357,10 +355,9 @@ func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserMod
 }
 
 func (db *GoDB) GetUserFromUsername(username string) *User {
-	userQuery := FIndex(username)
-	resp, err := db.Select(
+	resp, err := db.Select(UserDB,
 		map[string]string{
-			"usr": userQuery,
+			"usr": FIndex(username),
 		}, nil,
 	)
 	if err != nil {
@@ -380,8 +377,7 @@ func (db *GoDB) GetUserFromUsername(username string) *User {
 	return userFromDB
 }
 
-func (db *GoDB) handleUserFriendRequest(
-	chatGroupDB, chatMemberDB, notificationDB *GoDB, connector *Connector) http.HandlerFunc {
+func (db *GoDB) handleUserFriendRequest(rapidDB *GoDB, connector *Connector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -395,7 +391,7 @@ func (db *GoDB) handleUserFriendRequest(
 			return
 		}
 		// Check if there's already a friend group
-		chatID, err := chatMemberDB.CheckFriendGroupExist(user.Username, request.Username)
+		chatID, err := db.CheckFriendGroupExist(user.Username, request.Username)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -447,7 +443,7 @@ func (db *GoDB) handleUserFriendRequest(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		uUID, err := chatGroupDB.Insert(jsonEntry, map[string]string{})
+		uUID, err := db.Insert(GroupDB, jsonEntry, map[string]string{})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -475,7 +471,7 @@ func (db *GoDB) handleUserFriendRequest(
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
+		notificationUUID, err := rapidDB.Insert(NotifyDB, jsonNotification, map[string]string{
 			"usr": FIndex(request.Username),
 		})
 		if err != nil {

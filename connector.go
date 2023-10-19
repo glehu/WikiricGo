@@ -49,23 +49,19 @@ func CreateConnector(notificationDB *GoDB) *Connector {
 func (connector *Connector) PublicConnectorEndpoint(
 	r chi.Router,
 	tokenAuth *jwtauth.JWTAuth,
-	userDB, chatGroupDB, chatMessagesDB, chatMemberDB *GoDB,
+	dbList *Databases,
 ) {
 	connector.tokenAuth = tokenAuth
 	// Route
 	r.HandleFunc(
 		"/ws/connector",
 		connector.handleConnectorEndpoint(
-			userDB,
-			chatGroupDB,
-			chatMessagesDB,
-			chatMemberDB,
+			dbList,
 		),
 	)
 }
 
-func (connector *Connector) handleConnectorEndpoint(
-	userDB, chatGroupDB, chatMessagesDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (connector *Connector) handleConnectorEndpoint(dbList *Databases) http.HandlerFunc {
 	return func(
 		w http.ResponseWriter,
 		r *http.Request,
@@ -101,7 +97,7 @@ func (connector *Connector) handleConnectorEndpoint(
 		}
 		// Retrieve user
 		username := usernameTmp.(string)
-		user := userDB.GetUserFromUsername(username)
+		user := dbList.Map["main"].GetUserFromUsername(username)
 		if user == nil {
 			_ = c.Close(
 				http.StatusUnauthorized,

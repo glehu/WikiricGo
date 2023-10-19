@@ -24,6 +24,8 @@ import (
 	"strings"
 )
 
+const FileDB = "m7"
+
 const (
 	_ = 1 << (10 * iota)
 	KiB
@@ -69,25 +71,20 @@ func (db *GoDB) PublicFileEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth) {
 }
 
 func (db *GoDB) ProtectedFileEndpoints(
-	r chi.Router, tokenAuth *jwtauth.JWTAuth, userDB, chatGroupDB, chatMemberDB *GoDB,
+	r chi.Router, tokenAuth *jwtauth.JWTAuth, mainDB *GoDB,
 ) {
 	r.Route("/files/private", func(r chi.Router) {
 		// ############
 		// ### POST ###
 		// ############
-		r.Post("/create", db.handleFileCreate(userDB, chatGroupDB, chatMemberDB))
+		r.Post("/create", db.handleFileCreate(mainDB))
 		// ###########
 		// ### GET ###
 		// ###########
-		r.Get("/meta/{fileID}", db.handleFileMetaGet(chatGroupDB, chatMemberDB))
-		r.Get("/chat/{chatID}", db.handleFilesGetFromChat(chatGroupDB, chatMemberDB))
+		r.Get("/meta/{fileID}", db.handleFileMetaGet(mainDB))
+		r.Get("/chat/{chatID}", db.handleFilesGetFromChat(mainDB))
 		r.Get("/delete/{fileID}", db.handleFileDelete())
 	})
-}
-
-func OpenFilesDatabase() *GoDB {
-	db := OpenDB("files")
-	return db
 }
 
 func GetBase64BinaryLength(b64 string) int {
@@ -362,7 +359,7 @@ func (db *GoDB) saveBase64AsFile(
 	if err != nil {
 		return "", err
 	}
-	uUID, err := db.Insert(jsonEntry, map[string]string{"chatID": request.ChatGroupUUID})
+	uUID, err := db.Insert(FileDB, jsonEntry, map[string]string{"chatID": request.ChatGroupUUID})
 	return uUID, nil
 }
 
@@ -401,7 +398,7 @@ func (a *FileSubmission) Bind(_ *http.Request) error {
 	return nil
 }
 
-func (db *GoDB) handleFileCreate(userDB, chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleFileCreate(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -418,7 +415,7 @@ func (db *GoDB) handleFileCreate(userDB, chatGroupDB, chatMemberDB *GoDB) http.H
 		// Is a chat group referenced?
 		if request.ChatGroupUUID != "" {
 			chatGroup, chatMember, _, err := ReadChatGroupAndMember(
-				chatGroupDB, chatMemberDB, nil, nil,
+				mainDB, db, nil,
 				request.ChatGroupUUID, user.Username, "", r)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
@@ -454,7 +451,7 @@ func (db *GoDB) handleFileGet() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, ok := db.Read(fileID)
+		response, ok := db.Read(FileDB, fileID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -472,7 +469,7 @@ func (db *GoDB) handleFileGet() http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handleFileMetaGet(chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleFileMetaGet(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -484,7 +481,7 @@ func (db *GoDB) handleFileMetaGet(chatGroupDB, chatMemberDB *GoDB) http.HandlerF
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, ok := db.Read(fileID)
+		response, ok := db.Read(FileDB, fileID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -498,7 +495,7 @@ func (db *GoDB) handleFileMetaGet(chatGroupDB, chatMemberDB *GoDB) http.HandlerF
 		// Is the file protected?
 		if fileMeta.IsPrivate && fileMeta.ChatGroupUUID != "" {
 			chatGroup, chatMember, _, err := ReadChatGroupAndMember(
-				chatGroupDB, chatMemberDB, nil, nil,
+				mainDB, db, nil,
 				fileMeta.ChatGroupUUID, user.Username, "", r)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
@@ -520,7 +517,7 @@ func (db *GoDB) handleFileMetaGet(chatGroupDB, chatMemberDB *GoDB) http.HandlerF
 	}
 }
 
-func (db *GoDB) handleFilesGetFromChat(chatGroupDB, chatMemberDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleFilesGetFromChat(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -532,7 +529,7 @@ func (db *GoDB) handleFilesGetFromChat(chatGroupDB, chatMemberDB *GoDB) http.Han
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, ok := chatGroupDB.Read(chatID)
+		response, ok := mainDB.Read(GroupDB, chatID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -545,7 +542,7 @@ func (db *GoDB) handleFilesGetFromChat(chatGroupDB, chatMemberDB *GoDB) http.Han
 		}
 		// Is the file protected?
 		chatGroup, chatMember, _, err := ReadChatGroupAndMember(
-			chatGroupDB, chatMemberDB, nil, nil,
+			mainDB, db, nil,
 			chatID, user.Username, "", r)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
@@ -558,7 +555,7 @@ func (db *GoDB) handleFilesGetFromChat(chatGroupDB, chatMemberDB *GoDB) http.Han
 		}
 		files := &FileList{Files: make([]*FileMetaEntry, 0)}
 		// Retrieve all files
-		respFiles, err := db.Select(map[string]string{"chatID": chatID}, nil)
+		respFiles, err := db.Select(FileDB, map[string]string{"chatID": chatID}, nil)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -600,7 +597,7 @@ func (db *GoDB) handleFileDelete() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, ok := db.Read(fileID)
+		response, ok := db.Read(FileDB, fileID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -615,7 +612,7 @@ func (db *GoDB) handleFileDelete() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
-		err = db.Delete(fileID, []string{"chatID"})
+		err = db.Delete(FileDB, fileID, []string{"chatID"})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return

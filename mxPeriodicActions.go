@@ -15,6 +15,8 @@ import (
 	"time"
 )
 
+const PeriodDB = "mxpa"
+
 type PeriodicAction struct {
 	NotificationTemplate Notification            `json:"tmpl"`
 	Username             string                  `json:"usr"`
@@ -51,13 +53,8 @@ type Webhook struct {
 	WithMessage bool   `json:"msg"`
 }
 
-func OpenPeriodicDatabase() *GoDB {
-	db := OpenDB("periodic")
-	return db
-}
-
 func (db *GoDB) ProtectedPeriodicActionsEndpoints(
-	r chi.Router, tokenAuth *jwtauth.JWTAuth, dbList *Databases, connector *Connector,
+	r chi.Router, tokenAuth *jwtauth.JWTAuth, mainDB *GoDB, connector *Connector,
 ) {
 	r.Route("/periodic/private", func(r chi.Router) {
 		// ############
@@ -99,7 +96,7 @@ func (db *GoDB) tickLoop(
 
 func (db *GoDB) triggerActions(dbList *Databases, connector *Connector, fcmClient *messaging.Client) {
 	// Actions:
-	go db.periodicCheck(dbList, connector, fcmClient)
+	go db.periodicCheck(connector, fcmClient)
 	go dbList.Map["msg"].periodicCheckMessages()
 }
 
@@ -107,7 +104,7 @@ func (db *GoDB) periodicCheckMessages() {
 	return
 }
 
-func (db *GoDB) periodicCheck(dbList *Databases, connector *Connector, fcmClient *messaging.Client) {
+func (db *GoDB) periodicCheck(connector *Connector, fcmClient *messaging.Client) {
 	var respNow, respLast chan []*EntryResponse
 	var response []*EntryResponse
 	var err error
@@ -141,12 +138,12 @@ func (db *GoDB) periodicCheck(dbList *Databases, connector *Connector, fcmClient
 	nowQuery := nowISO[0:13] // YYYY-MM-DDTHH
 	if twoQueries {
 		lastQuery := lastISO[0:13] // YYYY-MM-DDTHH
-		respLast, err = db.Select(map[string]string{"due": lastQuery}, nil)
+		respLast, err = db.Select(PeriodDB, map[string]string{"due": lastQuery}, nil)
 		if err != nil {
 			return
 		}
 	}
-	respNow, err = db.Select(map[string]string{"due": nowQuery}, nil)
+	respNow, err = db.Select(PeriodDB, map[string]string{"due": nowQuery}, nil)
 	if err != nil {
 		return
 	}
@@ -161,23 +158,23 @@ func (db *GoDB) periodicCheck(dbList *Databases, connector *Connector, fcmClient
 	response = <-respNow
 	periodicActions = checkAndAddDuePeriodicActions(response, periodicActions, action, now)
 	// Process
-	db.processPeriodicActions(periodicActions, dbList.Map["notifications"], connector, fcmClient)
+	db.processPeriodicActions(periodicActions, connector, fcmClient)
 	return
 }
 
 func (db *GoDB) processPeriodicActions(
-	list []*PeriodicActionEntry, notificationDB *GoDB, connector *Connector, fcmClient *messaging.Client,
+	list []*PeriodicActionEntry, connector *Connector, fcmClient *messaging.Client,
 ) {
 	if len(list) < 1 {
 		return
 	}
 	for _, action := range list {
-		go db.processSinglePeriodicAction(action, notificationDB, connector, fcmClient)
+		go db.processSinglePeriodicAction(action, connector, fcmClient)
 	}
 }
 
 func (db *GoDB) processSinglePeriodicAction(
-	action *PeriodicActionEntry, notificationDB *GoDB, connector *Connector, fcmClient *messaging.Client,
+	action *PeriodicActionEntry, connector *Connector, fcmClient *messaging.Client,
 ) {
 	if action.NotificationTemplate.Type != "" {
 		// Create notification for each recipient
@@ -201,7 +198,7 @@ func (db *GoDB) processSinglePeriodicAction(
 			if err != nil {
 				continue
 			}
-			notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
+			notificationUUID, err := db.Insert(NotifyDB, jsonNotification, map[string]string{
 				"usr": FIndex(recip.Username),
 			})
 			if err != nil {
@@ -251,14 +248,14 @@ func (db *GoDB) processSinglePeriodicAction(
 				// Check if errors occurred
 				if httpErr != nil || (httpResp.StatusCode >= 400 && httpResp.StatusCode < 600) {
 					// Error or HTTP error code occurred -> Notify action owner
-					notifyWebhookFailed(webhook, action, notificationDB, connector, fcmClient)
+					db.notifyWebhookFailed(webhook, action, connector, fcmClient)
 				}
 			}
 		}
 	}
 	// Is this action reoccurring? If not, then delete it now
 	if action.IsReoccurring == false || action.ReoccurringAmount < 1 {
-		_ = db.Delete(action.UUID, []string{"usr", "due", "ref"})
+		_ = db.Delete(PeriodDB, action.UUID, []string{"usr", "due", "ref"})
 		return
 	}
 	// Replace current trigger date with next period specified
@@ -276,12 +273,12 @@ func (db *GoDB) processSinglePeriodicAction(
 	action.ReoccurringAmount -= 1
 	// Update action
 	jsonAction, err := json.Marshal(action)
-	_, txn := db.Get(action.UUID)
-	_ = db.Update(txn, action.UUID, jsonAction, map[string]string{"due": action.TriggerDateTime})
+	_, txn := db.Get(PeriodDB, action.UUID)
+	_ = db.Update(PeriodDB, txn, action.UUID, jsonAction, map[string]string{"due": action.TriggerDateTime})
 }
 
-func notifyWebhookFailed(
-	webhook Webhook, action *PeriodicActionEntry, notificationDB *GoDB,
+func (db *GoDB) notifyWebhookFailed(
+	webhook Webhook, action *PeriodicActionEntry,
 	connector *Connector, fcmClient *messaging.Client,
 ) {
 	// Create notification for each recipient
@@ -309,7 +306,7 @@ func notifyWebhookFailed(
 		if err != nil {
 			continue
 		}
-		notificationUUID, err := notificationDB.Insert(jsonNotification, map[string]string{
+		notificationUUID, err := db.Insert(NotifyDB, jsonNotification, map[string]string{
 			"usr": FIndex(recip.Username),
 		})
 		if err != nil {
@@ -397,7 +394,7 @@ func (db *GoDB) handlePeriodicActionsGet() http.HandlerFunc {
 		// TODO: More filters
 		actions := PeriodicActionsResponse{PeriodicActions: make([]*PeriodicActionEntry, 0)}
 		// Retrieve all files
-		respActions, err := db.Select(map[string]string{"usr": FIndex(user.Username)}, nil)
+		respActions, err := db.Select(PeriodDB, map[string]string{"usr": FIndex(user.Username)}, nil)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -436,7 +433,7 @@ func (db *GoDB) handlePeriodicActionDelete() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		response, ok := db.Read(periodicID)
+		response, ok := db.Read(PeriodDB, periodicID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -449,7 +446,7 @@ func (db *GoDB) handlePeriodicActionDelete() http.HandlerFunc {
 		}
 		// If we're the owner of this action, delete it...
 		if user.Username == action.Username {
-			_ = db.Delete(periodicID, []string{"usr", "due", "ref"})
+			_ = db.Delete(PeriodDB, periodicID, []string{"usr", "due", "ref"})
 			return
 		}
 		// ...otherwise check if we're a recipient and remove us from this
@@ -465,7 +462,7 @@ func (db *GoDB) handlePeriodicActionDelete() http.HandlerFunc {
 		if !isRecipient {
 			return
 		}
-		response, txn := db.Get(periodicID)
+		response, txn := db.Get(PeriodDB, periodicID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -483,7 +480,7 @@ func (db *GoDB) handlePeriodicActionDelete() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		_ = db.Update(txn, periodicID, jsonEntry, map[string]string{})
+		_ = db.Update(PeriodDB, txn, periodicID, jsonEntry, map[string]string{})
 	}
 }
 
@@ -500,7 +497,7 @@ func (db *GoDB) handlePeriodicActionModification() http.HandlerFunc {
 			return
 		}
 		// Get Periodic Action
-		resp, txn := db.Get(periodicID)
+		resp, txn := db.Get(PeriodDB, periodicID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -541,7 +538,7 @@ func (db *GoDB) handlePeriodicActionModification() http.HandlerFunc {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
-			err = db.Update(txn, periodicID, jsonEntry, map[string]string{})
+			err = db.Update(PeriodDB, txn, periodicID, jsonEntry, map[string]string{})
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
@@ -617,7 +614,7 @@ func (db *GoDB) handlePeriodicActionCreate() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		_, err = db.Insert(jsonEntry, map[string]string{
+		_, err = db.Insert(PeriodDB, jsonEntry, map[string]string{
 			"usr": FIndex(user.Username),
 			"due": request.TriggerDateTime,
 		})

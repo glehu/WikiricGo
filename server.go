@@ -66,7 +66,7 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
 	// Routes -> Public
 	setPublicRoutes(r, dbList, chatServer, connector, callCounter, startTime, fcmClient, emailClient)
 	// Routes -> Basic Auth
-	setBasicProtectedRoutes(r, dbList.Map["users"])
+	setBasicProtectedRoutes(r, dbList.Map["main"])
 	// Routes -> JWT Bearer Auth
 	setJWTProtectedRoutes(r, dbList, chatServer, connector)
 	// PWA (Progressive Web App)
@@ -169,30 +169,25 @@ func setPublicRoutes(r chi.Router, dbList *Databases,
 ) {
 	r.Get("/sample", sampleMessage)
 	r.Get("/debug", handleDebugEndpoint(dbList, chatServer, connector, callCounter, startTime))
+	// *** MAIN DATABASE ***                                                                                              *** MAIN
 	// #### Users
-	dbList.Map["users"].PublicUserEndpoints(r, tokenAuth, dbList.Map["notifications"])
-	// #### Chat WS Server
-	chatServer.PublicChatEndpoint(r, tokenAuth,
-		dbList.Map["users"], dbList.Map["chats"], dbList.Map["msg"],
-		dbList.Map["members"], dbList.Map["notifications"], dbList.Map["analytics"],
-		connector, fcmClient)
-	// #### Files
-	dbList.Map["files"].PublicFileEndpoints(r, tokenAuth)
-	// #### Connector WS Server
-	connector.PublicConnectorEndpoint(r, tokenAuth,
-		dbList.Map["users"], dbList.Map["chats"], dbList.Map["msg"], dbList.Map["members"])
+	dbList.Map["main"].PublicUserEndpoints(r, tokenAuth, dbList.Map["rapid"])
+	// #### Connector + Chat (WS Servers)
+	connector.PublicConnectorEndpoint(r, tokenAuth, dbList)
+	chatServer.PublicChatEndpoint(r, tokenAuth, dbList, connector, fcmClient)
 	// #### Stores
-	dbList.Map["stores"].PublicStoreEndpoints(r, tokenAuth,
-		dbList.Map["items"], dbList.Map["orders"], dbList.Map["notifications"], dbList.Map["analytics"],
-		connector, emailClient)
+	dbList.Map["main"].PublicStoreEndpoints(r, tokenAuth, dbList.Map["rapid"], connector, emailClient)
+	// *** RAPID DATABASE ***                                                                                             *** RAPID
+	// #### Files
+	dbList.Map["rapid"].PublicFileEndpoints(r, tokenAuth)
 	// #### Items
-	dbList.Map["items"].PublicItemsEndpoints(r, tokenAuth, dbList.Map["stores"], dbList.Map["analytics"])
+	dbList.Map["rapid"].PublicItemsEndpoints(r, tokenAuth, dbList.Map["main"])
 }
 
-func setBasicProtectedRoutes(r chi.Router, userDB *GoDB) {
+func setBasicProtectedRoutes(r chi.Router, mainDB *GoDB) {
 	r.Group(
 		func(r chi.Router) {
-			r.Use(BasicAuth(userDB))
+			r.Use(BasicAuth(mainDB))
 			// Debug/Testing Route
 			r.Get(
 				"/basic", func(w http.ResponseWriter, r *http.Request) {
@@ -202,7 +197,7 @@ func setBasicProtectedRoutes(r chi.Router, userDB *GoDB) {
 			)
 			// Protected routes
 			// #### Users
-			userDB.BasicProtectedUserEndpoints(r, tokenAuth)
+			mainDB.BasicProtectedUserEndpoints(r, tokenAuth)
 		},
 	)
 }
@@ -215,7 +210,7 @@ func setJWTProtectedRoutes(
 			// Seek, verify and validate JWT tokens
 			r.Use(jwtauth.Verifier(tokenAuth))
 			r.Use(jwtauth.Authenticator)
-			r.Use(BearerAuth(dbList.Map["users"]))
+			r.Use(BearerAuth(dbList.Map["main"]))
 			// Debug/Testing Route
 			r.Get(
 				"/jwt", func(w http.ResponseWriter, r *http.Request) {
@@ -224,43 +219,32 @@ func setJWTProtectedRoutes(
 				},
 			)
 			// Protected routes
+			// *** MAIN DATABASE ***                                                                                          *** MAIN
 			// #### Users
-			dbList.Map["users"].ProtectedUserEndpoints(r, tokenAuth,
-				dbList.Map["chats"], dbList.Map["members"], dbList.Map["notifications"], connector)
+			dbList.Map["main"].ProtectedUserEndpoints(r, tokenAuth, dbList.Map["rapid"], connector)
 			// #### Chat Groups
-			dbList.Map["chats"].ProtectedChatGroupEndpoints(r, tokenAuth,
-				dbList.Map["users"], dbList.Map["chats"], dbList.Map["members"], dbList.Map["files"], chatServer)
-			// #### Chat Messages
-			dbList.Map["msg"].ProtectedChatMessagesEndpoints(r, tokenAuth, chatServer,
-				dbList.Map["chats"], dbList.Map["members"], dbList.Map["analytics"])
-			// #### Files
-			dbList.Map["files"].ProtectedFileEndpoints(r, tokenAuth,
-				dbList.Map["users"], dbList.Map["chats"], dbList.Map["members"])
-			// #### Notifications
-			dbList.Map["notifications"].ProtectedNotificationEndpoints(r, tokenAuth)
+			dbList.Map["main"].ProtectedChatGroupEndpoints(r, tokenAuth, dbList.Map["rapid"], chatServer)
 			// #### Knowledge
-			dbList.Map["knowledge"].ProtectedKnowledgeEndpoints(r, tokenAuth,
-				dbList.Map["chats"], dbList.Map["members"], chatServer)
-			// #### Wisdom
-			dbList.Map["wisdom"].ProtectedWisdomEndpoints(r, tokenAuth,
-				dbList.Map["chats"], dbList.Map["members"], dbList.Map["notifications"],
-				dbList.Map["knowledge"], dbList.Map["analytics"], dbList.Map["periodic"], connector)
-			// #### Processes
-			dbList.Map["process"].ProtectedProcessEndpoints(r, tokenAuth,
-				dbList.Map["chats"], dbList.Map["members"], dbList.Map["notifications"],
-				dbList.Map["knowledge"], dbList.Map["analytics"], connector)
-			// #### Periodic Actions
-			dbList.Map["periodic"].ProtectedPeriodicActionsEndpoints(r, tokenAuth, dbList, connector)
+			dbList.Map["main"].ProtectedKnowledgeEndpoints(r, tokenAuth, dbList.Map["rapid"], chatServer)
 			// #### Stores
-			dbList.Map["stores"].ProtectedStoreEndpoints(r, tokenAuth,
-				dbList.Map["users"], dbList.Map["notifications"], dbList.Map["files"], connector)
+			dbList.Map["main"].ProtectedStoreEndpoints(r, tokenAuth, dbList.Map["rapid"], connector)
+			// *** RAPID DATABASE ***                                                                                         *** RAPID
+			// #### Chat Messages
+			dbList.Map["rapid"].ProtectedChatMessagesEndpoints(r, tokenAuth, chatServer, dbList.Map["main"])
+			// #### Files
+			dbList.Map["rapid"].ProtectedFileEndpoints(r, tokenAuth, dbList.Map["main"])
+			// #### Notifications
+			dbList.Map["rapid"].ProtectedNotificationEndpoints(r, tokenAuth)
+			// #### Wisdom
+			dbList.Map["rapid"].ProtectedWisdomEndpoints(r, tokenAuth, dbList.Map["main"], connector)
+			// #### Processes
+			dbList.Map["rapid"].ProtectedProcessEndpoints(r, tokenAuth, dbList.Map["main"], connector)
+			// #### Periodic Actions
+			dbList.Map["rapid"].ProtectedPeriodicActionsEndpoints(r, tokenAuth, dbList.Map["main"], connector)
 			// #### Items
-			dbList.Map["items"].ProtectedItemEndpoints(r, tokenAuth,
-				dbList.Map["stores"], dbList.Map["users"], dbList.Map["notifications"],
-				dbList.Map["analytics"], dbList.Map["files"])
+			dbList.Map["rapid"].ProtectedItemEndpoints(r, tokenAuth, dbList.Map["main"])
 			// #### Orders
-			dbList.Map["orders"].ProtectedOrdersEndpoints(r, tokenAuth,
-				dbList.Map["users"], dbList.Map["notifications"], dbList.Map["stores"], connector)
+			dbList.Map["rapid"].ProtectedOrdersEndpoints(r, tokenAuth, dbList.Map["main"], connector)
 		},
 	)
 }
@@ -293,7 +277,7 @@ func vueJSWikiricEndpoint(r chi.Router) {
 	})
 }
 
-func BasicAuth(userDB *GoDB) func(next http.Handler) http.Handler {
+func BasicAuth(mainDB *GoDB) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(
 			func(w http.ResponseWriter, r *http.Request) {
@@ -304,10 +288,9 @@ func BasicAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 					return
 				}
 				// Check if user exists in the database then compare passwords
-				query := FIndex(user)
-				resp, err := userDB.Select(
+				resp, err := mainDB.Select(UserDB,
 					map[string]string{
-						"usr": query,
+						"usr": FIndex(user),
 					}, nil,
 				)
 				if err != nil {
@@ -351,7 +334,7 @@ func basicAuthFailed(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusUnauthorized)
 }
 
-func BearerAuth(userDB *GoDB) func(next http.Handler) http.Handler {
+func BearerAuth(mainDB *GoDB) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(
 			func(w http.ResponseWriter, r *http.Request) {
@@ -359,10 +342,9 @@ func BearerAuth(userDB *GoDB) func(next http.Handler) http.Handler {
 				// Get client user
 				_, claims, _ := jwtauth.FromContext(r.Context())
 				username := claims["u_name"].(string)
-				userQuery := FIndex(username)
-				resp, err := userDB.Select(
+				resp, err := mainDB.Select(UserDB,
 					map[string]string{
-						"usr": userQuery,
+						"usr": FIndex(username),
 					}, nil,
 				)
 				if err != nil {
