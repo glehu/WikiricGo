@@ -24,6 +24,7 @@ type Store struct {
 	BannerURL            string      `json:"burl"`
 	BannerAnimatedURL    string      `json:"burla"`
 	BankDetails          BankDetails `json:"bank"`
+	AnalyticsUUID        string      `json:"ana"` // Views, likes etc. will be stored in a separate database
 }
 
 type BankDetails struct {
@@ -62,7 +63,7 @@ func (db *GoDB) PublicStoreEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 		// ###########
 		// ### GET ###
 		// ###########
-		r.Get("/get/{storeID}", db.handleStoreVisit())
+		r.Get("/get/{storeID}", db.handleStoreVisit(analyticsDB))
 	})
 }
 
@@ -105,6 +106,23 @@ func (db *GoDB) handleStoreCreate(notificationDB *GoDB, connector *Connector) ht
 		user := r.Context().Value("user").(*User)
 		if user == nil {
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		// Check if user has a store already
+		resp, err := db.Select(map[string]string{
+			"usr": FIndex(user.Username),
+		}, &SelectOptions{
+			MaxResults: 1,
+			Page:       0,
+			Skip:       0,
+		})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		response := <-resp
+		if len(response) > 0 {
+			http.Error(w, http.StatusText(http.StatusConflict), http.StatusConflict)
 			return
 		}
 		// Retrieve POST payload
@@ -160,9 +178,8 @@ func (db *GoDB) handleStoreGet() http.HandlerFunc {
 			return
 		}
 		// Retrieve user's store
-		query := FIndex(user.Username)
 		resp, err := db.Select(map[string]string{
-			"usr": query,
+			"usr": FIndex(user.Username),
 		}, &SelectOptions{
 			MaxResults: 1,
 			Page:       0,
@@ -191,7 +208,7 @@ func (db *GoDB) handleStoreGet() http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handleStoreVisit() http.HandlerFunc {
+func (db *GoDB) handleStoreVisit(analyticsDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		storeID := chi.URLParam(r, "storeID")
 		if storeID == "" {
@@ -215,6 +232,52 @@ func (db *GoDB) handleStoreVisit() http.HandlerFunc {
 			Store: store,
 			UUID:  storeID,
 		})
+		// Is there an analytics entry?
+		analytics := &Analytics{}
+		if store.AnalyticsUUID != "" {
+			anaBytes, txn := analyticsDB.Get(store.AnalyticsUUID)
+			if txn != nil {
+				err := json.Unmarshal(anaBytes.Data, analytics)
+				if err != nil {
+					txn.Discard()
+					analytics = &Analytics{}
+				} else {
+					analytics.Views += 1
+					// Asynchronously update view count in database
+					go func() {
+						defer txn.Discard()
+						jsonAna, err := json.Marshal(analytics)
+						if err == nil {
+							_ = analyticsDB.Update(txn, store.AnalyticsUUID, jsonAna, map[string]string{})
+						}
+					}()
+				}
+			}
+		} else {
+			// Create an analytics entry to keep track of the views
+			analytics = &Analytics{}
+			analytics.Views = 1
+			jsonAna, err := json.Marshal(analytics)
+			if err == nil {
+				// Insert analytics while returning its UUID to the store for reference
+				storeBytes, txnWis := db.Get(storeID)
+				defer txnWis.Discard()
+				store.AnalyticsUUID, err = analyticsDB.Insert(jsonAna, map[string]string{})
+				if err != nil {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+				// Update store
+				storeJson, err := json.Marshal(store)
+				if err != nil {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+				err = db.Update(txnWis, storeBytes.uUID, storeJson, map[string]string{
+					"usr": FIndex(store.Username),
+				})
+			}
+		}
 	}
 }
 

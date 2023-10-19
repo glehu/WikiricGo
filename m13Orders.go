@@ -20,7 +20,7 @@ const OrderStateCancelled = "cancelled"
 const OrderBillingStateOpen = "open"
 const OrderBillingStatePaidPartially = "partially"
 const OrderBillingStatePaid = "paid"
-const OrderBillingState = ""
+const OrderBillingStateRefund = "refund"
 
 const OrderDeliveryStateOpen = "open"
 const OrderDeliveryStateInDelivery = "delivery"
@@ -248,6 +248,39 @@ func NotifyBuyerOrderConfirmation(store *Store, order *Order, orderID string,
 	return nil
 }
 
+func NotifyBuyerOrderStateChange(
+	stateType, stateValue, message string,
+	store *Store, order *Order, orderID string,
+	notificationDB *GoDB, connector *Connector, emailClient *EmailClient,
+) error {
+	to := []string{order.Billing.Email}
+	subject := fmt.Sprintf("Order %s State Changed to %s", stateType, stateValue)
+	msg := &strings.Builder{}
+	msg.WriteString(fmt.Sprintf("<h1>%s</h1>", message))
+	appendOrderEmail(msg, order, orderID)
+	appendOrderBankDetails(msg, store)
+	// Send mail
+	_ = emailClient.sendMail(to, []byte(subject), []byte(msg.String()))
+	// Notification
+	notification := &Notification{
+		Title:             fmt.Sprintf("Order %s State Changed to %s", stateType, stateValue),
+		Description:       message,
+		Type:              "info",
+		TimeCreated:       TimeNowIsoString(),
+		RecipientUsername: order.Username,
+		ClickAction:       "",
+		ClickModule:       "",
+		ClickUUID:         "",
+	}
+	jsonNotification, err := json.Marshal(notification)
+	if err == nil {
+		_, _ = notificationDB.Insert(jsonNotification, map[string]string{
+			"usr": FIndex(order.Username),
+		})
+	}
+	return nil
+}
+
 func NotifyStoreOwnerOrderConfirmation(store *Store, order *Order, orderID string,
 	notificationDB *GoDB, connector *Connector, emailClient *EmailClient,
 ) error {
@@ -270,11 +303,27 @@ func NotifyStoreOwnerOrderConfirmation(store *Store, order *Order, orderID strin
 		ClickUUID:         "",
 	}
 	jsonNotification, err := json.Marshal(notification)
-	if err == nil {
-		_, _ = notificationDB.Insert(jsonNotification, map[string]string{
-			"usr": FIndex(store.Username),
-		})
+	if err != nil {
+		return nil
 	}
+	notificationUUID, _ := notificationDB.Insert(jsonNotification, map[string]string{
+		"usr": FIndex(store.Username),
+	})
+	// Now send a message via the connector
+	connector.SessionsMu.RLock()
+	defer connector.SessionsMu.RUnlock()
+	session, ok := connector.Sessions.Get(store.Username)
+	if !ok {
+		return nil
+	}
+	cMSG := &ConnectorMsg{
+		Type:          "[s:NOTIFICATION]",
+		Action:        "commission",
+		ReferenceUUID: notificationUUID,
+		Username:      store.Username,
+		Message:       "A new commission came in!",
+	}
+	_ = WSSendJSON(session.Conn, session.Ctx, cMSG)
 	return nil
 }
 
@@ -295,14 +344,18 @@ func appendOrderEmail(msg *strings.Builder, order *Order, orderID string) {
 	msg.WriteString("<th>#</th>")
 	msg.WriteString("<th>Amount</th>")
 	msg.WriteString("<th>Description</th>")
+	msg.WriteString("<th>Gross Total</th>")
 	msg.WriteString("<th>Net Total</th>")
 	msg.WriteString("<tr>") // POS TABLE HEADER END
+	var gross float64
 	for ix, item := range order.ItemPositions {
+		gross = item.NetPrice * (1 + item.VATPercent)
 		msg.WriteString("<tr>") // POS TABLE POS START
 		msg.WriteString(fmt.Sprintf("<td>%d</td>", ix))
-		msg.WriteString(fmt.Sprintf("<td>%.0f</td>", item.Amount))
+		msg.WriteString(fmt.Sprintf("<td>%.1f</td>", item.Amount))
 		msg.WriteString(fmt.Sprintf("<td>%s</td>", item.Name))
-		msg.WriteString(fmt.Sprintf("<td>%f</td>", item.NetPrice))
+		msg.WriteString(fmt.Sprintf("<td>%f</td>", gross))
+		msg.WriteString(fmt.Sprintf("<td>%f (%f %s VAT)</td>", item.NetPrice, item.VATPercent*100, "%"))
 		msg.WriteString("<tr>") // POS TABLE POS END
 	}
 	msg.WriteString("</table>") // POS TABLE END
@@ -417,7 +470,7 @@ func (db *GoDB) handleOrdersGetCommissions(storeDB *GoDB) http.HandlerFunc {
 		for _, orderResp := range response {
 			order = &Order{}
 			err = json.Unmarshal(orderResp.Data, order)
-			if err != nil || order.State == "cancel" { // TODO: Allow cancelled with query parameter
+			if err != nil || order.State == OrderStateCancelled { // TODO: Allow cancelled with query parameter
 				continue
 			}
 			orderList.Orders = append(orderList.Orders, &OrderEntry{
@@ -472,8 +525,7 @@ func (db *GoDB) handleOrderCancel(storeDB *GoDB) http.HandlerFunc {
 			}
 		}
 		// Cancel order
-		order.State = "cancel"
-		// TODO: Notify
+		order.State = OrderStateCancelled
 		// Update
 		jsonEntry, err := json.Marshal(order)
 		if err != nil {
@@ -484,5 +536,7 @@ func (db *GoDB) handleOrderCancel(storeDB *GoDB) http.HandlerFunc {
 			"usr": FIndex(user.Username),
 			"pid": order.StoreUUID,
 		})
+		// err = NotifyBuyerOrderStateChange("Commission", "Cancelled",
+		//  store, request, uUID, notificationDB, connector, emailClient)
 	}
 }
