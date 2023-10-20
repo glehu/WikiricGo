@@ -4,14 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	firebase "firebase.google.com/go"
-	"firebase.google.com/go/messaging"
 	"fmt"
-	"google.golang.org/api/option"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
+
+	firebase "firebase.google.com/go"
+	"firebase.google.com/go/messaging"
+	"google.golang.org/api/option"
 )
 
 type Config struct {
@@ -23,6 +24,7 @@ type Config struct {
 	EmailPass string `json:"smtpPass"`
 	EmailHost string `json:"smtpHost"`
 	EmailPort string `json:"smtpPort"`
+	Docker    bool   `json:"docker"`
 }
 
 type Databases struct {
@@ -45,6 +47,13 @@ func main() {
 	} else {
 		fmt.Println(":: config.json loaded")
 	}
+
+	// Docker related init here
+	if config.Docker == true {
+		fmt.Println("::Starting in Docker ENV")
+		// TODO: User (Docker) ENV instated of config.json values (e.g. jwtSecret)
+	}
+
 	// Setup Databases
 	dbList := &Databases{Map: map[string]*GoDB{}}
 	dbList.Map["users"] = OpenUserDatabase()
