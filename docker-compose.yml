@@ -1,0 +1,7 @@
+version: "3.9"
+services:
+  wikiric_go_server:
+    build:
+      dockerfile: Dockerfile
+      context: .
+      target: dev

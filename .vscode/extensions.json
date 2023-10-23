@@ -1,0 +1,7 @@
+{
+  "recommendations": [
+    "johnpapa.vscode-peacock",
+    "ms-azuretools.vscode-docker",
+    "golang.go"
+  ]
+}
