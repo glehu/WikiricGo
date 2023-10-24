@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
+	"github.com/tidwall/btree"
 	"net/http"
 	"strings"
 	"time"
@@ -105,6 +106,10 @@ type VATCalculationMap struct {
 	Positions map[float64]float64 // Key: VATPercent, Value: Slice of NetPrice
 }
 
+type CommissionsDashboard struct {
+	Items []ItemPosition `json:"items"`
+}
+
 func (db *GoDB) ProtectedOrdersEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 	mainDB *GoDB, connector *Connector,
 ) {
@@ -117,6 +122,7 @@ func (db *GoDB) ProtectedOrdersEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAut
 		// ###########
 		r.Get("/orders", db.handleOrdersGetOwn())
 		r.Get("/commissions", db.handleOrdersGetCommissions(mainDB))
+		r.Get("/dashboard", db.handleOrdersGetDashboard(mainDB))
 		r.Get("/cancel/{orderID}", db.handleOrderCancel(mainDB))
 	})
 }
@@ -534,5 +540,96 @@ func (db *GoDB) handleOrderCancel(mainDB *GoDB) http.HandlerFunc {
 		})
 		// err = NotifyBuyerOrderStateChange("Commission", "Cancelled",
 		//  store, request, uUID, notificationDB, connector, emailClient)
+	}
+}
+
+func (db *GoDB) handleOrdersGetDashboard(mainDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		// Retrieve user's store
+		resp, err := mainDB.Select(StoreDB, map[string]string{
+			"usr": FIndex(user.Username),
+		}, &SelectOptions{
+			MaxResults: 1,
+			Page:       0,
+			Skip:       0,
+		})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		response := <-resp
+		if len(response) < 1 {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		store := &Store{}
+		err = json.Unmarshal(response[0].Data, store)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Retrieve commissions
+		query := fmt.Sprintf("%s;%s", response[0].uUID, OrderStateOpen)
+		resp, err = db.Select(OrderDB, map[string]string{
+			"pid-state": query}, nil)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// We will return the dashboard to the user later
+		dashboard := &CommissionsDashboard{Items: make([]ItemPosition, 0)}
+		// This map will contain all ordered item positions with aggregated variations
+		items := btree.NewMap[string, *ItemPosition](3)
+		// Retrieve orders to iterate over their items
+		response = <-resp
+		if len(response) < 1 {
+			render.JSON(w, r, dashboard)
+			return
+		}
+		// Set up useful variables
+		var order *Order
+		var tmpPos *ItemPosition
+		var hasVariation bool
+		// Iterate all orders
+		for _, orderResp := range response {
+			order = &Order{}
+			err = json.Unmarshal(orderResp.Data, order)
+			if err != nil || order.State == OrderStateCancelled {
+				continue
+			}
+			// Iterate all order's items
+			for _, pos := range order.ItemPositions {
+				// Add unique items -> if not unique, check for variations
+				if _, ok := items.Get(pos.ItemUUID); ok != true {
+					items.Set(pos.ItemUUID, &pos)
+					tmpPos = &pos
+				} else {
+					if len(pos.Variations) < 1 {
+						continue
+					}
+					tmpPos, ok = items.Get(pos.ItemUUID)
+					if !ok {
+						continue
+					}
+					// Check variations as we aggregate all variations of the same item type
+					hasVariation = false
+					for _, variation := range pos.Variations {
+						for _, tmpVar := range tmpPos.Variations {
+							if variation.Name == tmpVar.Name {
+								// Same name variation found
+								hasVariation = true
+							}
+						}
+					}
+				}
+			}
+		}
+		render.JSON(w, r, dashboard)
 	}
 }
