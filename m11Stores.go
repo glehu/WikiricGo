@@ -461,9 +461,9 @@ func (db *GoDB) changeStoreImage(
 	var filename string
 	// Construct filename
 	if isBanner {
-		filename = "banner-chat"
+		filename = "banner-store"
 	} else {
-		filename = "thumbnail-chat"
+		filename = "thumbnail-store"
 	}
 	// Save image
 	fileRequest := &FileSubmission{

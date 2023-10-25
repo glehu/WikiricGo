@@ -627,6 +627,9 @@ func (db *GoDB) handleOrdersGetDashboard(mainDB *GoDB) http.HandlerFunc {
 							}
 						}
 					}
+					if hasVariation { // TODO REMOVE
+						return
+					}
 				}
 			}
 		}
