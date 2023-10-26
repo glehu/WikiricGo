@@ -122,7 +122,7 @@ func (db *GoDB) ProtectedOrdersEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAut
 		// ###########
 		r.Get("/orders", db.handleOrdersGetOwn())
 		r.Get("/commissions", db.handleOrdersGetCommissions(mainDB))
-		r.Get("/dashboard", db.handleOrdersGetDashboard(mainDB))
+		r.Get("/possum", db.handleOrdersGetDashboard(mainDB))
 		r.Get("/cancel/{orderID}", db.handleOrderCancel(mainDB))
 	})
 }
@@ -585,7 +585,7 @@ func (db *GoDB) handleOrdersGetDashboard(mainDB *GoDB) http.HandlerFunc {
 		// We will return the dashboard to the user later
 		dashboard := &CommissionsDashboard{Items: make([]ItemPosition, 0)}
 		// This map will contain all ordered item positions with aggregated variations
-		items := btree.NewMap[string, *ItemPosition](3)
+		items := btree.NewMap[string, ItemPosition](3)
 		// Retrieve orders to iterate over their items
 		response = <-resp
 		if len(response) < 1 {
@@ -594,8 +594,9 @@ func (db *GoDB) handleOrdersGetDashboard(mainDB *GoDB) http.HandlerFunc {
 		}
 		// Set up useful variables
 		var order *Order
-		var tmpPos *ItemPosition
-		var hasVariation bool
+		var tmpPos ItemPosition
+		var hasMainVariation, hasSubVariation bool
+		var ix int
 		// Iterate all orders
 		for _, orderResp := range response {
 			order = &Order{}
@@ -605,34 +606,86 @@ func (db *GoDB) handleOrdersGetDashboard(mainDB *GoDB) http.HandlerFunc {
 			}
 			// Iterate all order's items
 			for _, pos := range order.ItemPositions {
-				// Add unique items -> if not unique, check for variations
+				// Check if we encountered this item yet
 				if _, ok := items.Get(pos.ItemUUID); ok != true {
-					items.Set(pos.ItemUUID, &pos)
-					tmpPos = &pos
-				} else {
-					if len(pos.Variations) < 1 {
-						continue
-					}
-					tmpPos, ok = items.Get(pos.ItemUUID)
-					if !ok {
-						continue
-					}
-					// Check variations as we aggregate all variations of the same item type
-					hasVariation = false
-					for _, variation := range pos.Variations {
-						for _, tmpVar := range tmpPos.Variations {
-							if variation.Name == tmpVar.Name {
-								// Same name variation found
-								hasVariation = true
+					// Unique item -> Add to item list
+					// First we set all variation's counters to this pos amount
+					if len(pos.Variations) > 0 {
+						for ixMain, variation := range pos.Variations {
+							for ixSub := range variation.Variations {
+								pos.Variations[ixMain].Variations[ixSub].NumberValue = pos.Amount
 							}
 						}
 					}
-					if hasVariation { // TODO REMOVE
-						return
+					items.Set(pos.ItemUUID, pos)
+				} else {
+					// Duplicate Item
+					// Retrieve stored item to compare variations and increment its amount
+					tmpPos, _ = items.Get(pos.ItemUUID)
+					tmpPos.Amount += pos.Amount
+					tmpPos.NetPrice += pos.NetPrice
+					// Check for variations
+					if len(pos.Variations) < 1 {
+						// Continue if there are no variations
+						continue
 					}
+					// If we encounter unique variations, we add them
+					// If we find duplicate variations, we increment their amount
+					hasMainVariation = false
+					for _, variation := range pos.Variations {
+						if variation.Name == "" {
+							continue
+						}
+						// Check if main variation exists
+						for ixTmp, oriVariation := range tmpPos.Variations {
+							if oriVariation.Name == variation.Name {
+								ix = ixTmp
+								hasMainVariation = true
+								break
+							}
+						}
+						// If we did not encounter the main variation, add it and all it's children
+						if !hasMainVariation {
+							// Set sub variation counter to pos amount
+							for ixSub := range variation.Variations {
+								variation.Variations[ixSub].NumberValue = pos.Amount
+							}
+							tmpPos.Variations = append(tmpPos.Variations, variation)
+						} else {
+							// We did encounter the main variation, so compare the children now
+							hasSubVariation = false
+							for _, subVariation := range variation.Variations {
+								if subVariation.StringValue == "" {
+									continue
+								}
+								// Check if sub variation exists
+								for ixTmp, oriSubVariation := range tmpPos.Variations[ix].Variations {
+									if oriSubVariation.StringValue == subVariation.StringValue {
+										// We found the sub variation, so we increment its counter
+										tmpPos.Variations[ix].Variations[ixTmp].NumberValue += pos.Amount
+										hasSubVariation = true
+										break
+									}
+								}
+								// if we did not encounter the sub variation, add it
+								if !hasSubVariation {
+									// Set sub variation counter to pos amount
+									subVariation.NumberValue = pos.Amount
+									tmpPos.Variations[ix].Variations = append(tmpPos.Variations[ix].Variations, subVariation)
+								}
+							}
+						}
+					}
+					// Add tmpPos back to the map
+					items.Set(pos.ItemUUID, tmpPos)
 				}
 			}
 		}
+		// Add all items to the dashboard to be returned to the requester
+		for _, item := range items.Values() {
+			dashboard.Items = append(dashboard.Items, item)
+		}
+		// Respond
 		render.JSON(w, r, dashboard)
 	}
 }
