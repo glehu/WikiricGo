@@ -31,19 +31,21 @@ const OrderDeliveryStateFailed = "failed"
 const OrderDeliveryStateReturn = "return"
 
 type Order struct {
-	StoreUUID      string          `json:"pid"`
-	Username       string          `json:"usr"`
-	Billing        BillingAddress  `json:"billing"`
-	Delivery       DeliveryAddress `json:"delivery"`
-	TimeCreated    string          `json:"ts"`
-	State          string          `json:"state"`
-	BillingState   string          `json:"bstate"`
-	DeliveryState  string          `json:"dstate"`
-	ItemPositions  []ItemPosition  `json:"items"`
-	CustomerNote   string          `json:"cnote"`
-	NetTotal       float64         `json:"net"`
-	GrossTotal     float64         `json:"gross"`
-	BillingHistory []BillingEntry  `json:"bhist"`
+	StoreUUID      string              `json:"pid"`
+	Username       string              `json:"usr"`
+	Billing        BillingAddress      `json:"billing"`
+	Delivery       DeliveryAddress     `json:"delivery"`
+	TimeCreated    string              `json:"ts"`
+	State          string              `json:"state"`
+	BillingState   string              `json:"bstate"`
+	DeliveryState  string              `json:"dstate"`
+	ItemPositions  []ItemPosition      `json:"items"`
+	CustomerNote   string              `json:"cnote"`
+	Note           string              `json:"note"`
+	NetTotal       float64             `json:"net"`
+	GrossTotal     float64             `json:"gross"`
+	BillingHistory []BillingEntry      `json:"bhist"`
+	History        []OrderHistoryEntry `json:"hist"`
 }
 
 type OrderEntry struct {
@@ -102,12 +104,31 @@ type BillingEntry struct {
 	Total    float64 `json:"total"`
 }
 
+type OrderHistoryEntry struct {
+	DateTime string `json:"ts"`
+	Type     string `json:"type"`
+	State    string `json:"state"`
+	Username string `json:"usr"`
+}
+
 type VATCalculationMap struct {
 	Positions map[float64]float64 // Key: VATPercent, Value: Slice of NetPrice
 }
 
 type CommissionsDashboard struct {
 	Items []ItemPosition `json:"items"`
+}
+
+type OrderDeliveryStateModification struct {
+	NewValue string `json:"new"`
+}
+
+type OrderBillingStateModification struct {
+	NewValue string `json:"new"`
+}
+
+type OrderNote struct {
+	Note string `json:"note"`
 }
 
 func (db *GoDB) ProtectedOrdersEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
@@ -117,12 +138,18 @@ func (db *GoDB) ProtectedOrdersEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAut
 		// ############
 		// ### POST ###
 		// ############
+		r.Route("/process", func(r chi.Router) {
+			r.Post("/delivery/{orderID}", db.handleProcessOrderDelivery(mainDB))
+			r.Post("/billing/{orderID}", db.handleProcessOrderBilling(mainDB))
+		})
+		r.Post("/comment/{orderID}", db.handleOrderEditNote(mainDB))
 		// ###########
 		// ### GET ###
 		// ###########
 		r.Get("/orders", db.handleOrdersGetOwn())
 		r.Get("/commissions", db.handleOrdersGetCommissions(mainDB))
 		r.Get("/possum", db.handleOrdersGetDashboard(mainDB))
+		// State Changes
 		r.Get("/cancel/{orderID}", db.handleOrderCancel(mainDB))
 	})
 }
@@ -137,6 +164,24 @@ func (a *Order) Bind(_ *http.Request) error {
 	if a.Billing.LastName == "" && a.Delivery.LastName == "" {
 		return errors.New("missing name")
 	}
+	return nil
+}
+
+func (a *OrderDeliveryStateModification) Bind(_ *http.Request) error {
+	if a.NewValue == "" {
+		return errors.New("missing new")
+	}
+	return nil
+}
+
+func (a *OrderBillingStateModification) Bind(_ *http.Request) error {
+	if a.NewValue == "" {
+		return errors.New("missing new")
+	}
+	return nil
+}
+
+func (a *OrderNote) Bind(_ *http.Request) error {
 	return nil
 }
 
@@ -528,6 +573,13 @@ func (db *GoDB) handleOrderCancel(mainDB *GoDB) http.HandlerFunc {
 		}
 		// Cancel order
 		order.State = OrderStateCancelled
+		// Add to history
+		order.History = append(order.History, OrderHistoryEntry{
+			DateTime: TimeNowIsoString(),
+			Type:     "state",
+			State:    OrderStateCancelled,
+			Username: user.Username,
+		})
 		// Update
 		jsonEntry, err := json.Marshal(order)
 		if err != nil {
@@ -574,7 +626,7 @@ func (db *GoDB) handleOrdersGetDashboard(mainDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		// Retrieve commissions
+		// Retrieve unfinished commissions
 		query := fmt.Sprintf("%s;%s", response[0].uUID, OrderStateOpen)
 		resp, err = db.Select(OrderDB, map[string]string{
 			"pid-state": query}, nil)
@@ -601,7 +653,8 @@ func (db *GoDB) handleOrdersGetDashboard(mainDB *GoDB) http.HandlerFunc {
 		for _, orderResp := range response {
 			order = &Order{}
 			err = json.Unmarshal(orderResp.Data, order)
-			if err != nil || order.State == OrderStateCancelled {
+			// We skip all orders that are already being shipped
+			if err != nil || order.DeliveryState != OrderDeliveryStateOpen {
 				continue
 			}
 			// Iterate all order's items
@@ -687,5 +740,216 @@ func (db *GoDB) handleOrdersGetDashboard(mainDB *GoDB) http.HandlerFunc {
 		}
 		// Respond
 		render.JSON(w, r, dashboard)
+	}
+}
+
+func (db *GoDB) handleProcessOrderDelivery(mainDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		orderID := chi.URLParam(r, "orderID")
+		if orderID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve order
+		response, txn := db.Get(OrderDB, orderID)
+		if response == nil || txn == nil {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		order := &Order{}
+		err := json.Unmarshal(response.Data, order)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if order belongs to caller's store
+		if order.StoreUUID != "" {
+			orderResp, ok := mainDB.Read(StoreDB, order.StoreUUID)
+			if !ok {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			store := &Store{}
+			err = json.Unmarshal(orderResp.Data, order)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			if store.Username != user.Username {
+				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+				return
+			}
+		}
+		// Retrieve POST payload
+		request := &OrderDeliveryStateModification{}
+		if err = render.Bind(r, request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Change state
+		order.DeliveryState = request.NewValue
+		// Add to history
+		order.History = append(order.History, OrderHistoryEntry{
+			DateTime: TimeNowIsoString(),
+			Type:     "delivery",
+			State:    request.NewValue,
+			Username: user.Username,
+		})
+		// Update
+		jsonEntry, err := json.Marshal(order)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		err = db.Update(OrderDB, txn, response.uUID, jsonEntry, map[string]string{})
+		// err = NotifyBuyerOrderStateChange("Commission", "Cancelled",
+		//  store, request, uUID, notificationDB, connector, emailClient)
+	}
+}
+
+func (db *GoDB) handleProcessOrderBilling(mainDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		orderID := chi.URLParam(r, "orderID")
+		if orderID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve order
+		response, txn := db.Get(OrderDB, orderID)
+		if response == nil || txn == nil {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		order := &Order{}
+		err := json.Unmarshal(response.Data, order)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if order belongs to caller's store
+		if order.StoreUUID != "" {
+			orderResp, ok := mainDB.Read(StoreDB, order.StoreUUID)
+			if !ok {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			store := &Store{}
+			err = json.Unmarshal(orderResp.Data, order)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			if store.Username != user.Username {
+				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+				return
+			}
+		}
+		// Retrieve POST payload
+		request := &OrderBillingStateModification{}
+		if err = render.Bind(r, request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Avoid setting same state
+		if request.NewValue == order.State {
+			return
+		}
+		// Change state
+		order.BillingState = request.NewValue
+		// Add to history
+		order.History = append(order.History, OrderHistoryEntry{
+			DateTime: TimeNowIsoString(),
+			Type:     "delivery",
+			State:    request.NewValue,
+			Username: user.Username,
+		})
+		// Do we need to update billing history?
+		if request.NewValue == OrderBillingStatePaid {
+			order.BillingHistory = append(order.BillingHistory, BillingEntry{
+				DateTime: TimeNowIsoString(),
+				Total:    order.GrossTotal,
+			})
+		}
+		// Update
+		jsonEntry, err := json.Marshal(order)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		err = db.Update(OrderDB, txn, response.uUID, jsonEntry, map[string]string{
+			"usr":       FIndex(user.Username),
+			"pid-state": fmt.Sprintf("%s;%s", order.StoreUUID, order.State),
+		})
+		// err = NotifyBuyerOrderStateChange("Commission", "Cancelled",
+		//  store, request, uUID, notificationDB, connector, emailClient)
+	}
+}
+
+func (db *GoDB) handleOrderEditNote(mainDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		orderID := chi.URLParam(r, "orderID")
+		if orderID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve order
+		response, txn := db.Get(OrderDB, orderID)
+		if response == nil || txn == nil {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		order := &Order{}
+		err := json.Unmarshal(response.Data, order)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if order belongs to caller's store
+		if order.StoreUUID != "" {
+			orderResp, ok := mainDB.Read(StoreDB, order.StoreUUID)
+			if !ok {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			store := &Store{}
+			err = json.Unmarshal(orderResp.Data, order)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			if store.Username != user.Username {
+				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+				return
+			}
+		}
+		// Retrieve POST payload
+		request := &OrderNote{}
+		if err = render.Bind(r, request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		order.Note = request.Note
+		// Update
+		jsonEntry, err := json.Marshal(order)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		err = db.Update(OrderDB, txn, response.uUID, jsonEntry, map[string]string{})
 	}
 }
