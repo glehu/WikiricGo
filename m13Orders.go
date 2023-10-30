@@ -141,6 +141,7 @@ func (db *GoDB) ProtectedOrdersEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAut
 		r.Route("/process", func(r chi.Router) {
 			r.Post("/delivery/{orderID}", db.handleProcessOrderDelivery(mainDB))
 			r.Post("/billing/{orderID}", db.handleProcessOrderBilling(mainDB))
+
 		})
 		r.Post("/comment/{orderID}", db.handleOrderEditNote(mainDB))
 		// ###########
@@ -151,6 +152,7 @@ func (db *GoDB) ProtectedOrdersEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAut
 		r.Get("/possum", db.handleOrdersGetDashboard(mainDB))
 		// State Changes
 		r.Get("/cancel/{orderID}", db.handleOrderCancel(mainDB))
+		r.Get("/finish/{orderID}", db.handleOrderFinish(mainDB))
 	})
 }
 
@@ -561,7 +563,7 @@ func (db *GoDB) handleOrderCancel(mainDB *GoDB) http.HandlerFunc {
 				return
 			}
 			store := &Store{}
-			err = json.Unmarshal(orderResp.Data, order)
+			err = json.Unmarshal(orderResp.Data, store)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
@@ -578,6 +580,72 @@ func (db *GoDB) handleOrderCancel(mainDB *GoDB) http.HandlerFunc {
 			DateTime: TimeNowIsoString(),
 			Type:     "state",
 			State:    OrderStateCancelled,
+			Username: user.Username,
+		})
+		// Update
+		jsonEntry, err := json.Marshal(order)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		err = db.Update(OrderDB, txn, response.uUID, jsonEntry, map[string]string{
+			"usr":       FIndex(user.Username),
+			"pid-state": fmt.Sprintf("%s;%s", order.StoreUUID, order.State),
+		})
+		// err = NotifyBuyerOrderStateChange("Commission", "Cancelled",
+		//  store, request, uUID, notificationDB, connector, emailClient)
+	}
+}
+
+func (db *GoDB) handleOrderFinish(mainDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		orderID := chi.URLParam(r, "orderID")
+		if orderID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve order
+		response, txn := db.Get(OrderDB, orderID)
+		if response == nil || txn == nil {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		order := &Order{}
+		err := json.Unmarshal(response.Data, order)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if order belongs to caller's store
+		if order.StoreUUID != "" {
+			orderResp, ok := mainDB.Read(StoreDB, order.StoreUUID)
+			if !ok {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			store := &Store{}
+			err = json.Unmarshal(orderResp.Data, store)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			if store.Username != user.Username {
+				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+				return
+			}
+		}
+		// Finish order
+		order.State = OrderStateDone
+		// Add to history
+		order.History = append(order.History, OrderHistoryEntry{
+			DateTime: TimeNowIsoString(),
+			Type:     "state",
+			State:    OrderStateDone,
 			Username: user.Username,
 		})
 		// Update
@@ -644,6 +712,12 @@ func (db *GoDB) handleOrdersGetDashboard(mainDB *GoDB) http.HandlerFunc {
 			render.JSON(w, r, dashboard)
 			return
 		}
+		// Check if a full summary (default) or combination based summary is needed
+		mode := r.URL.Query().Get("summary")
+		if mode == "combinations" {
+			db.handleOrdersGetDashboardCombinations(w, r, response, dashboard, items)
+			return
+		}
 		// Set up useful variables
 		var order *Order
 		var tmpPos ItemPosition
@@ -679,6 +753,8 @@ func (db *GoDB) handleOrdersGetDashboard(mainDB *GoDB) http.HandlerFunc {
 					tmpPos.NetPrice += pos.NetPrice
 					// Check for variations
 					if len(pos.Variations) < 1 {
+						// Add tmpPos back to the map
+						items.Set(pos.ItemUUID, tmpPos)
 						// Continue if there are no variations
 						continue
 					}
@@ -741,6 +817,134 @@ func (db *GoDB) handleOrdersGetDashboard(mainDB *GoDB) http.HandlerFunc {
 		// Respond
 		render.JSON(w, r, dashboard)
 	}
+}
+
+func (db *GoDB) handleOrdersGetDashboardCombinations(
+	w http.ResponseWriter, r *http.Request, response []*EntryResponse,
+	dashboard *CommissionsDashboard, items *btree.Map[string, ItemPosition],
+) {
+	// Set up useful variables
+	var err error
+	var order *Order
+	var tmpPos ItemPosition
+	var hasMainVariation bool
+	var ix int
+	var groupKey string
+	var tmpVariation *ItemVariation
+	// Iterate all orders
+	for _, orderResp := range response {
+		order = &Order{}
+		err = json.Unmarshal(orderResp.Data, order)
+		// We skip all orders that are already being shipped
+		if err != nil || order.DeliveryState != OrderDeliveryStateOpen {
+			continue
+		}
+		// Iterate all order's items
+		for _, pos := range order.ItemPositions {
+			// Check if we encountered this item yet
+			if _, ok := items.Get(pos.ItemUUID); ok != true {
+				// Unique item -> Add to item list
+				// Combine all variations of this item to a single variation
+				// e.g.: Two variations (Color Blue and Size XL) become one (ColorBlueSizeXL)
+				// This way we take care of all combinations, rather than individual variations
+				if len(pos.Variations) > 0 {
+					groupKey = ""
+					tmpVariation = &ItemVariation{Variations: make([]ItemVariationEntry, 0)}
+					for _, variation := range pos.Variations {
+						// Ignore variation if it does not have sub variations
+						if len(variation.Variations) < 1 {
+							continue
+						}
+						groupKey += fmt.Sprintf("%s%s",
+							variation.Name, variation.Variations[0].StringValue)
+						for _, subVariation := range variation.Variations {
+							if subVariation.StringValue == "" {
+								continue
+							}
+							tmpVariation.Variations = append(tmpVariation.Variations, ItemVariationEntry{
+								Description: subVariation.Description,
+								NumberValue: 0,
+								StringValue: fmt.Sprintf("%s: %s",
+									variation.Name, subVariation.StringValue),
+								NetPrice: subVariation.NetPrice,
+							})
+						}
+					}
+					tmpVariation.GroupingKey = groupKey
+					tmpVariation.NumberValue = pos.Amount
+					pos.Variations = make([]ItemVariation, 1)
+					pos.Variations[0] = *tmpVariation
+				}
+				items.Set(pos.ItemUUID, pos)
+			} else {
+				// Duplicate Item
+				// Retrieve stored item to compare variations and increment its amount
+				tmpPos, _ = items.Get(pos.ItemUUID)
+				tmpPos.Amount += pos.Amount
+				tmpPos.NetPrice += pos.NetPrice
+				// Check for variations
+				if len(pos.Variations) < 1 {
+					// Add tmpPos back to the map
+					items.Set(pos.ItemUUID, tmpPos)
+					// Continue if there are no variations
+					continue
+				}
+				// If we encounter unique variation combinations, we add them
+				// If we find duplicate variation combinations, we increment their amount
+				hasMainVariation = false
+				groupKey = ""
+				tmpVariation = &ItemVariation{Variations: make([]ItemVariationEntry, 0)}
+				// Build group key for this order item's variation combination
+				for _, variation := range pos.Variations {
+					// Ignore variation if it does not have sub variations
+					if len(variation.Variations) < 1 {
+						continue
+					}
+					groupKey += fmt.Sprintf("%s%s",
+						variation.Name, variation.Variations[0].StringValue)
+					// Generate variation entry just in case as it could save time
+					// (we won't need this if the existing item has the variation combination)
+					for _, subVariation := range variation.Variations {
+						if subVariation.StringValue == "" {
+							continue
+						}
+						tmpVariation.Variations = append(tmpVariation.Variations, ItemVariationEntry{
+							Description: subVariation.Description,
+							NumberValue: 0,
+							StringValue: fmt.Sprintf("%s: %s",
+								variation.Name, subVariation.StringValue),
+							NetPrice: subVariation.NetPrice,
+						})
+					}
+				}
+				// Check if existing item has combination
+				for ixMain, variation := range tmpPos.Variations {
+					if variation.GroupingKey == groupKey {
+						hasMainVariation = true
+						ix = ixMain
+						break
+					}
+				}
+				if hasMainVariation {
+					// Variation combination exists -> Increment amount
+					tmpPos.Variations[ix].NumberValue += pos.Amount
+				} else {
+					// Variation combination is unique -> Add
+					tmpVariation.GroupingKey = groupKey
+					tmpVariation.NumberValue = pos.Amount
+					tmpPos.Variations = append(tmpPos.Variations, *tmpVariation)
+				}
+				// Add tmpPos back to the map
+				items.Set(pos.ItemUUID, tmpPos)
+			}
+		}
+	}
+	// Add all items to the dashboard to be returned to the requester
+	for _, item := range items.Values() {
+		dashboard.Items = append(dashboard.Items, item)
+	}
+	// Respond
+	render.JSON(w, r, dashboard)
 }
 
 func (db *GoDB) handleProcessOrderDelivery(mainDB *GoDB) http.HandlerFunc {

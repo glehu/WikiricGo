@@ -61,6 +61,8 @@ type ItemAttribute struct {
 type ItemVariation struct {
 	Name        string               `json:"t"`
 	Description string               `json:"desc"`
+	GroupingKey string               `json:"key"`
+	NumberValue float64              `json:"nval"`
 	Optional    bool                 `json:"opt"`
 	Variations  []ItemVariationEntry `json:"vars"`
 }
