@@ -2,5 +2,8 @@
   "jwtSecret": "75439fh329f4h92gh542",
   "ip": "localhost",
   "port": "9999",
-  "docker": false
+  "smtpFrom": "wikiricg@gmail.com",
+  "smtpPass": "euko anbp mqvp zuda",
+  "smtpHost": "smtp.gmail.com",
+  "smtpPort": "587"
 }

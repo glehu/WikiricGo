@@ -24,6 +24,7 @@ type User struct {
 	PassHash    string       `json:"pwhash"`
 	Badges      []*UserBadge `json:"badges"`
 	DateCreated string       `json:"ts"`
+	ChatGroupId string       `json:"chatId"`
 }
 
 type UserBadge struct {
@@ -59,6 +60,7 @@ type LoginResponse struct {
 	ExpiresInMs int64  `json:"expiresInMs"`
 	Username    string `json:"username"`
 	DisplayName string `json:"displayName"`
+	ChatGroupId string `json:"chatID"`
 }
 
 type UserStatusRequest struct {
@@ -146,6 +148,9 @@ func (db *GoDB) getUserCount() int64 {
 func (db *GoDB) handleUserLogin() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
+		// Post Login Actions
+		db.handlePostLoginActions(user)
+		// Generate token
 		token, expiresInMs := generateToken(user)
 		response := &LoginResponse{
 			HttpCode:    200,
@@ -153,6 +158,7 @@ func (db *GoDB) handleUserLogin() http.HandlerFunc {
 			ExpiresInMs: expiresInMs,
 			Username:    user.Username,
 			DisplayName: user.DisplayName,
+			ChatGroupId: user.ChatGroupId,
 		}
 		render.JSON(w, r, response)
 	}
@@ -354,11 +360,15 @@ func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserMod
 	return nil
 }
 
-func (db *GoDB) GetUserFromUsername(username string) *User {
+func (db *GoDB) ReadUserFromUsername(username string) *User {
 	resp, err := db.Select(UserDB,
 		map[string]string{
 			"usr": FIndex(username),
-		}, nil,
+		}, &SelectOptions{
+			MaxResults: 1,
+			Page:       0,
+			Skip:       0,
+		},
 	)
 	if err != nil {
 		fmt.Println(err)
@@ -555,4 +565,128 @@ func handleUserSetState(connector *Connector) http.HandlerFunc {
 		connector.Sessions.Set(user.Username, usr)
 		connector.SessionsMu.Unlock()
 	}
+}
+
+func (db *GoDB) handlePostLoginActions(user *User) {
+	// Check if home was set up already
+	if user.ChatGroupId == "" {
+		// Create home (Personal chat group and knowledge)
+		db.createUserHome(user)
+	}
+}
+
+func (db *GoDB) createUserHome(user *User) {
+	chatGroup := &ChatGroup{}
+	// Basic set up
+	chatGroup.Name = user.Username
+	chatGroup.Description = ""
+	chatGroup.TimeCreated = TimeNowIsoString()
+	chatGroup.Type = "home"
+	chatGroup.IsEncrypted = true
+	// Sanitize
+	length := len(chatGroup.Name)
+	if length > 50 {
+		length = 50
+	}
+	chatGroup.Name = chatGroup.Name[0:length]
+	// Initialize chat group
+	chatGroup.Roles = make([]ChatRole, 0)
+	chatGroup.Roles = append(chatGroup.Roles,
+		ChatRole{
+			Name:     "owner",
+			Index:    20_000,
+			ColorHex: "",
+			IsAdmin:  true,
+		},
+		ChatRole{
+			Name:     "member",
+			Index:    40_000,
+			ColorHex: "",
+			IsAdmin:  false,
+		})
+	chatGroup.Subchatrooms = make([]SubChatroom, 0)
+	chatGroup.RulesWrite = make([]string, 0)
+	chatGroup.RulesWrite = append(chatGroup.RulesWrite, "member")
+	chatGroup.RulesRead = make([]string, 0)
+	chatGroup.RulesRead = append(chatGroup.RulesRead, "member")
+	// Save it
+	newChatGroup, err := json.Marshal(chatGroup)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	uUID, err := db.Insert(GroupDB, newChatGroup, map[string]string{})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	// Set up Knowledge
+	knowledge := &Knowledge{}
+	knowledge.Name = user.Username
+	knowledge.Description = ""
+	knowledge.ChatGroupUUID = uUID
+	// Sanitize
+	knowledge.TimeCreated = TimeNowIsoString()
+	knowledge.Categories = make([]Category, 0)
+	// Create new knowledge now
+	jsonEntry, err := json.Marshal(knowledge)
+	if err != nil {
+		return
+	}
+	_, err = db.Insert(KnowledgeDB, jsonEntry, map[string]string{
+		"chatID": knowledge.ChatGroupUUID,
+	})
+	if err != nil {
+		return
+	}
+	// Add the chat member
+	chatMember := &ChatMember{
+		Username:             user.Username,
+		ChatGroupUUID:        uUID,
+		DisplayName:          user.DisplayName,
+		Roles:                []string{"owner", "member"},
+		PublicKey:            "",
+		ThumbnailURL:         "",
+		ThumbnailAnimatedURL: "",
+		BannerURL:            "",
+		BannerAnimatedURL:    "",
+		DateCreated:          TimeNowIsoString(),
+	}
+	newMember, err := json.Marshal(chatMember)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	_, err = db.Insert(MemberDB,
+		newMember, map[string]string{
+			"chat-usr": fmt.Sprintf("%s;%s;", uUID, user.Username),
+		},
+	)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	// Update user
+	resp, err := db.Select(UserDB,
+		map[string]string{
+			"usr": FIndex(user.Username),
+		}, nil,
+	)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	response := <-resp
+	if len(response) < 1 {
+		return
+	}
+	_, txn := db.Get(UserDB, response[0].uUID)
+	defer txn.Discard()
+	user.ChatGroupId = uUID
+	userBytes, err := json.Marshal(user)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	err = db.Update(UserDB, txn, response[0].uUID, userBytes, map[string]string{})
 }

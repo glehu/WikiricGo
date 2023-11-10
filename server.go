@@ -177,6 +177,8 @@ func setPublicRoutes(r chi.Router, dbList *Databases,
 	chatServer.PublicChatEndpoint(r, tokenAuth, dbList, connector, fcmClient)
 	// #### Stores
 	dbList.Map["main"].PublicStoreEndpoints(r, tokenAuth, dbList.Map["rapid"], connector, emailClient)
+	// #### Mockingbird
+	dbList.Map["main"].PublicMockingbirdEndpoints(r, tokenAuth, dbList.Map["rapid"], connector)
 	// *** RAPID DATABASE ***                                                                                             *** RAPID
 	// #### Files
 	dbList.Map["rapid"].PublicFileEndpoints(r, tokenAuth)
@@ -228,6 +230,8 @@ func setJWTProtectedRoutes(
 			dbList.Map["main"].ProtectedKnowledgeEndpoints(r, tokenAuth, dbList.Map["rapid"], chatServer)
 			// #### Stores
 			dbList.Map["main"].ProtectedStoreEndpoints(r, tokenAuth, dbList.Map["rapid"], connector)
+			// #### Mockingbird
+			dbList.Map["main"].ProtectedMockingbirdEndpoints(r, tokenAuth, dbList.Map["rapid"], connector)
 			// *** RAPID DATABASE ***                                                                                         *** RAPID
 			// #### Chat Messages
 			dbList.Map["rapid"].ProtectedChatMessagesEndpoints(r, tokenAuth, chatServer, dbList.Map["main"])
@@ -264,11 +268,11 @@ func sampleMessage(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// vueJSWikiricEndpoint serves the wikiric vueJS PWA website
+// vueJSWikiricEndpoint serves the wikiric Vue.js PWA website
 func vueJSWikiricEndpoint(r chi.Router) {
-	workDir, _ := os.Getwd()
-	filesDir := filepath.Join(workDir, "vue", "dist")
 	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+		workDir, _ := os.Getwd()
+		filesDir := filepath.Join(workDir, "vue", "dist")
 		if _, err := os.Stat(filesDir + r.URL.Path); errors.Is(err, os.ErrNotExist) {
 			http.ServeFile(w, r, filepath.Join(filesDir, "index.html"))
 		} else {
@@ -291,7 +295,11 @@ func BasicAuth(mainDB *GoDB) func(next http.Handler) http.Handler {
 				resp, err := mainDB.Select(UserDB,
 					map[string]string{
 						"usr": FIndex(user),
-					}, nil,
+					}, &SelectOptions{
+						MaxResults: 1,
+						Page:       0,
+						Skip:       0,
+					},
 				)
 				if err != nil {
 					basicAuthFailed(w)

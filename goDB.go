@@ -394,6 +394,10 @@ func (db *GoDB) singleIndexQuery(
 				err := item.Value(func(v []byte) error {
 					// Since sub index entries' values point to the main index entry's uuid,
 					// we need to get the main index entry now
+					sTmp := fmt.Sprintf("%s", v)
+					if sTmp != "" {
+						sTmp = ""
+					}
 					ix, err := txn.Get([]byte(fmt.Sprintf("%s:uid:%s", mod, v)))
 					if err != nil {
 						return nil
@@ -430,8 +434,8 @@ func (db *GoDB) singleIndexQuery(
 func (db *GoDB) validateIndices(indices map[string]string, isSelect bool) (map[string]string, error) {
 	indicesClean := make(map[string]string)
 	for key, value := range indices {
-		// Skip uuid unless we're selecting
-		if key == "uuid" && !isSelect {
+		// Skip uid unless we're selecting
+		if key == "uid" && !isSelect {
 			continue
 		}
 		// Check if index value exceeds maximum

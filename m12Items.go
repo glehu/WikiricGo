@@ -80,12 +80,19 @@ type ItemImage struct {
 }
 
 type ItemQuery struct {
-	Query   string  `json:"query"`
-	Type    string  `json:"type"`
-	Fields  string  `json:"fields"`
-	State   string  `json:"state"`
-	MinCost float64 `json:"minCost"`
-	MaxCost float64 `json:"maxCost"`
+	Query      string           `json:"query"`
+	Type       string           `json:"type"`
+	Fields     string           `json:"fields"`
+	State      string           `json:"state"`
+	MinCost    float64          `json:"minCost"`
+	MaxCost    float64          `json:"maxCost"`
+	Variations []VariationQuery `json:"vars"`
+}
+
+type VariationQuery struct {
+	Name         string   `json:"t"`
+	StringValues []string `json:"svals"`
+	Csv          string
 }
 
 type ItemQueryResponse struct {
@@ -101,6 +108,13 @@ type ItemModification struct {
 	MetaValue string `json:"meta"`
 }
 
+type ItemFilters struct {
+	Variations []ItemVariation `json:"vars"`
+	MinCost    float64         `json:"min"`
+	MaxCost    float64         `json:"max"`
+	AvgCost    float64         `json:"avg"`
+}
+
 func (db *GoDB) PublicItemsEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, mainDB *GoDB) {
 	r.Route("/items/public", func(r chi.Router) {
 		// ############
@@ -111,6 +125,7 @@ func (db *GoDB) PublicItemsEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, m
 		// ### GET ###
 		// ###########
 		r.Get("/get/{itemID}", db.handleItemGet())
+		r.Get("/filters/{storeID}", db.handleItemGetFilters())
 	})
 }
 
@@ -410,35 +425,56 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 			TimeSeconds: 0,
 			Items:       make([]*ItemContainer, 0),
 		}
-		response := <-resp
-		if len(response) < 1 {
-			render.JSON(w, r, queryResponse)
-			return
-		}
 		// Turn query text into a full regex pattern
 		words, p := GetRegexQuery(request.Query)
+		// Build csv (comma seperated values) content for variations query if provided
+		if len(request.Variations) > 0 {
+			for ix, variation := range request.Variations {
+				if len(variation.StringValues) > 0 {
+					for i := 0; i < len(variation.StringValues); i++ {
+						request.Variations[ix].Csv += fmt.Sprintf("|%s|", request.Variations[ix].StringValues[i])
+					}
+				}
+			}
+		}
+		// Set up variables
 		var container *ItemContainer
 		var item *Item
 		var analytics *Analytics
 		var points int64
 		var accuracy float64
 		b := false
+		// Await response as late as possible
+		response := <-resp
+		if len(response) < 1 {
+			render.JSON(w, r, queryResponse)
+			return
+		}
+		// Iterate over all items found
 		for _, entry := range response {
 			item = &Item{}
 			err = json.Unmarshal(entry.Data, item)
 			if err != nil {
 				continue
 			}
-			if request.MinCost != 0.0 && item.NetPrice < request.MinCost {
+			// Compare cost if provided
+			if request.MinCost != 0.0 && item.NetPrice*(1+item.VATPercent) < request.MinCost {
 				continue
 			}
-			if request.MaxCost != 0.0 && item.NetPrice > request.MaxCost {
+			if request.MaxCost != 0.0 && item.NetPrice*(1+item.VATPercent) > request.MaxCost {
 				continue
+			}
+			// Compare variations if provided
+			if len(request.Variations) > 0 {
+				points = GetItemVariationPoints(item, request)
+				if points <= 0 {
+					continue
+				}
 			}
 			// Flip boolean on each iteration
 			b = !b
 			accuracy, points = GetItemQueryPoints(item, request, p, words, b)
-			if points <= 0.0 {
+			if points <= 0 {
 				continue
 			}
 			// Truncate item description
@@ -580,6 +616,47 @@ func GetItemQueryPoints(
 	}
 	accuracy = float64(points) / float64(pointsMax)
 	return accuracy, points
+}
+
+func GetItemVariationPoints(
+	item *Item, query *ItemQuery,
+) int64 {
+	// Check if item has main variation
+	var found bool
+	for _, variation := range query.Variations {
+		found = false
+		for _, itemVariation := range item.Variations {
+			if itemVariation.Name == variation.Name {
+				// Main variation exists, check if sub variation exists
+				if len(itemVariation.Variations) < 1 {
+					// If item variation has no sub variation exit since we will be comparing sub variations
+					return 0
+				}
+				for _, itemSubVariation := range itemVariation.Variations {
+					if strings.Contains(variation.Csv, fmt.Sprintf("|%s|", itemSubVariation.StringValue)) {
+						// Return upon finding the first sub variation match to avoid unnecessary computing
+						found = true
+						break
+					}
+				}
+				if found {
+					break
+				}
+				// Exit if we have not found a sub variation
+				return 0
+			}
+		}
+		if found {
+			continue
+		}
+		// Exit if we have not found the first variation
+		return 0
+	}
+	if found {
+		return 1
+	}
+	// Exit if we have not found a variation
+	return 0
 }
 
 func (db *GoDB) handleItemDelete(mainDB *GoDB) http.HandlerFunc {
@@ -984,5 +1061,120 @@ func (db *GoDB) handleItemEdit(mainDB *GoDB) http.HandlerFunc {
 		err = db.Update(ItemDB, txn, itemID, jsonEntry, map[string]string{
 			"pid": FIndex(request.StoreUUID),
 		})
+	}
+}
+
+func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		storeID := chi.URLParam(r, "storeID")
+		if storeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve all Item entries
+		resp, err := db.Select(ItemDB, map[string]string{
+			"pid": storeID,
+		}, nil)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		queryResponse := &ItemFilters{
+			Variations: make([]ItemVariation, 0),
+			MinCost:    0,
+			MaxCost:    0,
+			AvgCost:    0,
+		}
+		response := <-resp
+		if len(response) < 1 {
+			render.JSON(w, r, queryResponse)
+			return
+		}
+		var item *Item
+		var gross float64
+		var count int
+		var groupKey string
+		variMap := map[string]bool{}
+		var groupKeyExists bool
+		var ix int
+		for _, entry := range response {
+			item = &Item{}
+			err = json.Unmarshal(entry.Data, item)
+			if err != nil {
+				continue
+			}
+			// Cost
+			if item.NetPrice > 0 {
+				count += 1
+				gross = item.NetPrice * (1 + item.VATPercent)
+				// We will divide the average cost by the amount later on to get the actual average
+				queryResponse.AvgCost += gross
+				// Min/Max?
+				if queryResponse.MinCost == 0 || gross < queryResponse.MinCost {
+					queryResponse.MinCost = gross
+				}
+				if queryResponse.MaxCost == 0 || gross > queryResponse.MaxCost {
+					queryResponse.MaxCost = gross
+				}
+			}
+			// Variations
+			if len(item.Variations) > 0 {
+				for _, variation := range item.Variations {
+					// Check if main variation exists yet
+					groupKeyExists = variMap[variation.Name]
+					if !groupKeyExists {
+						// Doesn't exist -> Add
+						variMap[variation.Name] = true
+						queryResponse.Variations = append(queryResponse.Variations, variation)
+						for _, subVariation := range variation.Variations {
+							groupKey = fmt.Sprintf("%s;%s", variation.Name, subVariation.StringValue)
+							variMap[groupKey] = true
+						}
+					} else {
+						// Exists -> Check for missing sub variations
+						for i, tVariation := range queryResponse.Variations {
+							if tVariation.Name == variation.Name {
+								ix = i
+								break
+							}
+						}
+						for _, subVariation := range variation.Variations {
+							groupKey = fmt.Sprintf("%s;%s", variation.Name, subVariation.StringValue)
+							groupKeyExists = variMap[groupKey]
+							if !groupKeyExists {
+								// Doesn't exist -> Add
+								variMap[groupKey] = true
+								queryResponse.Variations[ix].Variations = append(
+									queryResponse.Variations[ix].Variations, subVariation)
+							}
+						}
+					}
+				}
+			}
+		}
+		// Actually calculate average cost
+		if count > 0 && queryResponse.AvgCost != 0 {
+			queryResponse.AvgCost = queryResponse.AvgCost / float64(count)
+		}
+		// Sort main variations
+		if len(queryResponse.Variations) > 0 {
+			sort.SliceStable(
+				queryResponse.Variations, func(i, j int) bool {
+					return queryResponse.Variations[i].Name < queryResponse.Variations[j].Name
+				},
+			)
+			// Sort sub variations
+			for ix := range queryResponse.Variations {
+				if len(queryResponse.Variations[ix].Variations) > 0 {
+					sort.SliceStable(
+						queryResponse.Variations[ix].Variations, func(i, j int) bool {
+							return queryResponse.Variations[ix].Variations[i].StringValue <
+								queryResponse.Variations[ix].Variations[j].StringValue
+						},
+					)
+				}
+			}
+		}
+		render.JSON(w, r, queryResponse)
 	}
 }

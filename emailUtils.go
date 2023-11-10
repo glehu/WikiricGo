@@ -26,7 +26,7 @@ func (client *EmailClient) sendMail(to []string, subject []byte, message []byte)
 	}
 	// Construct authentication
 	auth := smtp.PlainAuth(
-		"", client.Config.EmailFrom, client.Config.EmailPass, client.Config.EmailPort)
+		"", client.Config.EmailFrom, client.Config.EmailPass, client.Config.EmailHost)
 	// Construct email
 	mime := "MIME-version: 1.0;\r\nContent-Type: text/html; charset=\"UTF-8\""
 	emailPayload := []byte(fmt.Sprintf(

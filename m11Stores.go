@@ -8,6 +8,9 @@ import (
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
 	"net/http"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -27,6 +30,7 @@ type Store struct {
 	BannerAnimatedURL    string      `json:"burla"`
 	BankDetails          BankDetails `json:"bank"`
 	AnalyticsUUID        string      `json:"ana"` // Views, likes etc. will be stored in a separate database
+	IsShiny              bool        `json:"shiny"`
 }
 
 type BankDetails struct {
@@ -39,6 +43,7 @@ type BankDetails struct {
 type StoreEntry struct {
 	UUID string `json:"uid"`
 	*Store
+	*Analytics
 }
 
 type StoreModification struct {
@@ -46,6 +51,22 @@ type StoreModification struct {
 	Field    string `json:"field"`
 	OldValue string `json:"old"`
 	NewValue string `json:"new"`
+}
+
+type StoreQuery struct {
+	Query  string `json:"query"`
+	Fields string `json:"fields"`
+}
+
+type StoreQueryResponse struct {
+	Stores []StoreContainer `json:"stores"`
+}
+
+type StoreContainer struct {
+	UUID string `json:"uid"`
+	*Store
+	*Analytics
+	Accuracy float64 `json:"accuracy"`
 }
 
 func (db *GoDB) PublicStoreEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
@@ -57,10 +78,12 @@ func (db *GoDB) PublicStoreEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 		// ############
 		r.Post("/order/{storeID}", db.handleStoreOrder(
 			rapidDB, connector, emailClient))
+		r.Post("/discover", db.handleStoreQuery(rapidDB))
 		// ###########
 		// ### GET ###
 		// ###########
-		r.Get("/get/{storeID}", db.handleStoreVisit(rapidDB))
+		r.Get("/get/{storeID}", db.handleStoreVisit(rapidDB, false))
+		r.Get("/usr/{storeID}", db.handleStoreVisit(rapidDB, true))
 	})
 }
 
@@ -77,7 +100,7 @@ func (db *GoDB) ProtectedStoreEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth
 		// ###########
 		// ### GET ###
 		// ###########
-		r.Get("/get", db.handleStoreGet())
+		r.Get("/get", db.handleStoreGet(rapidDB))
 	})
 }
 
@@ -94,6 +117,13 @@ func (a *StoreModification) Bind(_ *http.Request) error {
 	}
 	if a.Field == "" {
 		return errors.New("missing field")
+	}
+	return nil
+}
+
+func (a *StoreQuery) Bind(_ *http.Request) error {
+	if a.Query == "" {
+		return errors.New("missing query")
 	}
 	return nil
 }
@@ -167,7 +197,7 @@ func (db *GoDB) handleStoreCreate(rapidDB *GoDB, connector *Connector) http.Hand
 	}
 }
 
-func (db *GoDB) handleStoreGet() http.HandlerFunc {
+func (db *GoDB) handleStoreGet(rapidDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -198,14 +228,27 @@ func (db *GoDB) handleStoreGet() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
+		// Is there an analytics entry?
+		analytics := &Analytics{}
+		if store.AnalyticsUUID != "" {
+			anaBytes, txn := rapidDB.Get(AnaDB, store.AnalyticsUUID)
+			if txn != nil {
+				err = json.Unmarshal(anaBytes.Data, analytics)
+				if err != nil {
+					txn.Discard()
+					analytics = &Analytics{}
+				}
+			}
+		}
 		render.JSON(w, r, &StoreEntry{
-			Store: store,
-			UUID:  response[0].uUID,
+			Store:     store,
+			UUID:      response[0].uUID,
+			Analytics: analytics,
 		})
 	}
 }
 
-func (db *GoDB) handleStoreVisit(rapidDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleStoreVisit(rapidDB *GoDB, user bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		storeID := chi.URLParam(r, "storeID")
 		if storeID == "" {
@@ -213,7 +256,28 @@ func (db *GoDB) handleStoreVisit(rapidDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Retrieve store
-		response, ok := db.Read(StoreDB, storeID)
+		var response *EntryResponse
+		var ok bool
+		if !user {
+			response, ok = db.Read(StoreDB, storeID)
+		} else {
+			ok = false
+			resp, err := db.Select(StoreDB, map[string]string{
+				"usr": FIndex(storeID),
+			}, &SelectOptions{
+				MaxResults: 1,
+				Page:       0,
+				Skip:       0,
+			})
+			if err == nil {
+				tmp := <-resp
+				if len(tmp) > 0 {
+					response = tmp[0]
+					storeID = response.uUID
+					ok = true
+				}
+			}
+		}
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -227,7 +291,7 @@ func (db *GoDB) handleStoreVisit(rapidDB *GoDB) http.HandlerFunc {
 		}
 		render.JSON(w, r, &StoreEntry{
 			Store: store,
-			UUID:  storeID,
+			UUID:  response.uUID,
 		})
 		// Is there an analytics entry?
 		analytics := &Analytics{}
@@ -399,6 +463,8 @@ func (db *GoDB) handleStoreModification(rapidDB *GoDB) http.HandlerFunc {
 				err = db.changeStoreImage(rapidDB, user, storeID, request, true, false)
 			} else if request.Field == "bank" {
 				err = db.changeStoreBankDetails(user, storeID, request)
+			} else if request.Field == "shiny" {
+				err = db.changeStoreAppearance(user, storeID, request, "shiny")
 			}
 		}
 		if err != nil {
@@ -433,6 +499,43 @@ func (db *GoDB) changeStoreBankDetails(
 		return err
 	}
 	store.BankDetails = *bank
+	// Save
+	jsonEntry, err := json.Marshal(store)
+	if err != nil {
+		return err
+	}
+	err = db.Update(StoreDB, txn, response.uUID, jsonEntry, map[string]string{
+		"usr": FIndex(store.Username),
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (db *GoDB) changeStoreAppearance(
+	user *User, storeID string, request *StoreModification, appearance string,
+) error {
+	// Retrieve store
+	response, txn := db.Get(StoreDB, storeID)
+	if txn == nil {
+		return nil
+	}
+	defer txn.Discard()
+	store := &Store{}
+	err := json.Unmarshal(response.Data, store)
+	if err != nil {
+		return err
+	}
+	// Check rights
+	if store.Username != user.Username {
+		return errors.New("forbidden")
+	}
+	if request.NewValue == "true" {
+		store.IsShiny = true
+	} else {
+		store.IsShiny = false
+	}
 	// Save
 	jsonEntry, err := json.Marshal(store)
 	if err != nil {
@@ -516,6 +619,11 @@ func (db *GoDB) handleStoreOrder(rapidDB *GoDB,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// We do not retrieve the user as usual since this is an unauthorized endpoint
+		storeID := chi.URLParam(r, "storeID")
+		if storeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
 		// Retrieve POST payload
 		request := &Order{}
 		if err := render.Bind(r, request); err != nil {
@@ -524,7 +632,7 @@ func (db *GoDB) handleStoreOrder(rapidDB *GoDB,
 		}
 		// Retrieve store
 		var ok bool
-		storeResp, ok := db.Read(StoreDB, request.StoreUUID)
+		storeResp, ok := db.Read(StoreDB, storeID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
@@ -537,6 +645,7 @@ func (db *GoDB) handleStoreOrder(rapidDB *GoDB,
 		}
 		// Sanitize
 		// request.Username = user.Username
+		request.StoreUUID = storeID
 		request.TimeCreated = TimeToIsoString(time.Now().UTC())
 		request.State = OrderStateOpen
 		request.BillingState = OrderBillingStateOpen
@@ -587,11 +696,155 @@ func (db *GoDB) handleStoreOrder(rapidDB *GoDB,
 		})
 		// Respond
 		_, _ = fmt.Fprintln(w, uUID)
-		// Notify buyer
-		err = NotifyBuyerOrderConfirmation(
-			store, request, uUID, rapidDB, connector, emailClient)
-		// Notify store owner
-		err = NotifyStoreOwnerOrderConfirmation(
-			store, request, uUID, rapidDB, connector, emailClient)
+		go func() {
+			// Notify buyer
+			err = NotifyBuyerOrderConfirmation(
+				store, request, uUID, rapidDB, connector, emailClient)
+			// Notify store owner
+			err = db.NotifyStoreOwnerOrderConfirmation(
+				store, request, uUID, rapidDB, connector, emailClient)
+		}()
 	}
+}
+
+func (db *GoDB) handleStoreQuery(rapidDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// We do not retrieve the user as usual since this is an unauthorized endpoint
+		// Retrieve POST payload
+		request := &StoreQuery{}
+		if err := render.Bind(r, request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Get all stores
+		resp, err := db.Select(StoreDB, map[string]string{
+			"usr": "",
+		}, nil)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Prepare response
+		storeList := StoreQueryResponse{make([]StoreContainer, 0)}
+		response := <-resp
+		if len(response) < 1 {
+			render.JSON(w, r, storeList)
+			return
+		}
+		// Iterate over all items found
+		var store *Store
+		var analytics *Analytics
+		var container *StoreContainer
+		var points int64
+		var accuracy float64
+		b := false
+		// Turn query text into a full regex pattern
+		words, p := GetRegexQuery(request.Query)
+		for _, entry := range response {
+			store = &Store{}
+			err = json.Unmarshal(entry.Data, store)
+			if err != nil {
+				continue
+			}
+			// Flip boolean on each iteration
+			b = !b
+			accuracy, points = GetStoreQueryPoints(store, request, p, words, b)
+			if points <= 0 {
+				continue
+			}
+			// Load analytics if available
+			analytics = &Analytics{}
+			if store.AnalyticsUUID != "" {
+				anaBytes, okAna := rapidDB.Read(AnaDB, store.AnalyticsUUID)
+				if okAna {
+					err = json.Unmarshal(anaBytes.Data, analytics)
+					if err != nil {
+						analytics = &Analytics{}
+					}
+				}
+			}
+			container = &StoreContainer{
+				UUID:      entry.uUID,
+				Store:     store,
+				Analytics: analytics,
+				Accuracy:  accuracy,
+			}
+			storeList.Stores = append(storeList.Stores, *container)
+		}
+		// Sort entries by accuracy
+		if len(storeList.Stores) > 1 {
+			sort.SliceStable(
+				storeList.Stores, func(i, j int) bool {
+					return storeList.Stores[i].Accuracy > storeList.Stores[j].Accuracy
+				},
+			)
+		}
+		render.JSON(w, r, storeList)
+	}
+}
+
+func GetStoreQueryPoints(
+	store *Store, query *StoreQuery, p *regexp.Regexp, words map[string]*QueryWord, b bool,
+) (float64, int64) {
+	// Get all matches in selected fields
+	var mName, mDesc, mUser []string
+	if query.Fields == "" || strings.Contains(query.Fields, "title") {
+		mName = p.FindAllString(store.Name, -1)
+	}
+	if query.Fields == "" || strings.Contains(query.Fields, "desc") {
+		mDesc = p.FindAllString(store.Description, -1)
+	}
+	if query.Fields == "" || strings.Contains(query.Fields, "usr") {
+		mUser = p.FindAllString(store.Username, -1)
+	}
+	if len(mName) < 1 && len(mDesc) < 1 && len(mUser) < 1 {
+		// Return 0 if there were no matches
+		return 0.0, 0
+	}
+	// Clean up
+	for _, word := range words {
+		word.B = !b
+	}
+	// Calculate points
+	points := int64(0)
+	pointsMax := len(words)
+	accuracy := 0.0
+	for _, word := range mName {
+		if words[strings.ToLower(word)] != nil {
+			words[strings.ToLower(word)].B = b
+		} else {
+			words[strings.ToLower(word)] = &QueryWord{
+				B:      b,
+				Points: 1,
+			}
+		}
+	}
+	for _, word := range mDesc {
+		if words[strings.ToLower(word)] != nil {
+			words[strings.ToLower(word)].B = b
+		} else {
+			words[strings.ToLower(word)] = &QueryWord{
+				B:      b,
+				Points: 1,
+			}
+		}
+	}
+	for _, word := range mUser {
+		if words[strings.ToLower(word)] != nil {
+			words[strings.ToLower(word)].B = b
+		} else {
+			words[strings.ToLower(word)] = &QueryWord{
+				B:      b,
+				Points: 1,
+			}
+		}
+	}
+	// How many words were matched?
+	for _, word := range words {
+		if word.B == b {
+			points += word.Points
+		}
+	}
+	accuracy = float64(points) / float64(pointsMax)
+	return accuracy, points
 }

@@ -70,6 +70,7 @@ type BillingAddress struct {
 	CompanyName  string `json:"company"`
 	Email        string `json:"email"`
 	CustomerNote string `json:"cnote"`
+	Telephone    string `json:"phone"`
 }
 
 type DeliveryAddress struct {
@@ -85,6 +86,7 @@ type DeliveryAddress struct {
 	CompanyName  string `json:"company"`
 	Email        string `json:"email"`
 	CustomerNote string `json:"cnote"`
+	Telephone    string `json:"phone"`
 }
 
 type ItemPosition struct {
@@ -252,9 +254,7 @@ func CalculateOrder(rapidDB *GoDB, order *Order, sanitize bool) error {
 		// Add to sum
 		netTotal += order.ItemPositions[ix].NetPrice
 		// VAT?
-		if item.VATPercent > 0 {
-			vatCalc.Positions[item.VATPercent] += order.ItemPositions[ix].NetPrice
-		}
+		vatCalc.Positions[item.VATPercent] += order.ItemPositions[ix].NetPrice
 	}
 	// ### CALCULATION Second run: Calculate gross prices and add to sum
 	for vat, net := range vatCalc.Positions {
@@ -272,10 +272,10 @@ func NotifyBuyerOrderConfirmation(store *Store, order *Order, orderID string,
 	subject := "Order Confirmation"
 	msg := &strings.Builder{}
 	msg.WriteString("<h1>Your order has been confirmed!</h1>")
-	appendOrderEmail(msg, order, orderID)
 	appendOrderBankDetails(msg, store)
+	appendOrderEmail(msg, order, orderID)
 	// Send mail
-	_ = emailClient.sendMail(to, []byte(subject), []byte(msg.String()))
+	err := emailClient.sendMail(to, []byte(subject), []byte(msg.String()))
 	// Notification
 	notification := &Notification{
 		Title: "Order Confirmed",
@@ -306,8 +306,8 @@ func NotifyBuyerOrderStateChange(
 	subject := fmt.Sprintf("Order %s State Changed to %s", stateType, stateValue)
 	msg := &strings.Builder{}
 	msg.WriteString(fmt.Sprintf("<h1>%s</h1>", message))
-	appendOrderEmail(msg, order, orderID)
 	appendOrderBankDetails(msg, store)
+	appendOrderEmail(msg, order, orderID)
 	// Send mail
 	_ = emailClient.sendMail(to, []byte(subject), []byte(msg.String()))
 	// Notification
@@ -330,10 +330,15 @@ func NotifyBuyerOrderStateChange(
 	return nil
 }
 
-func NotifyStoreOwnerOrderConfirmation(store *Store, order *Order, orderID string,
+func (db *GoDB) NotifyStoreOwnerOrderConfirmation(store *Store, order *Order, orderID string,
 	rapidDB *GoDB, connector *Connector, emailClient *EmailClient,
 ) error {
-	to := []string{order.Billing.Email}
+	// Get store owner
+	owner := db.ReadUserFromUsername(store.Username)
+	if owner.Email == "" {
+		return nil
+	}
+	to := []string{owner.Email}
 	subject := "New Order"
 	msg := &strings.Builder{}
 	msg.WriteString("<h1>A new order has been commissioned!</h1>")
@@ -385,37 +390,67 @@ func appendOrderEmail(msg *strings.Builder, order *Order, orderID string) {
 	msg.WriteString("<br>")
 	msg.WriteString(fmt.Sprintf("<p>Order number: %s</p>", orderID))
 	msg.WriteString(fmt.Sprintf("<p>Order date: %s</p>", orderDate))
-	msg.WriteString("<br>")
-	msg.WriteString("<p>Order Positions:</p>")
-	msg.WriteString("<br>")
-	msg.WriteString("<table>") // POS TABLE START
-	msg.WriteString("<tr>")    // POS TABLE HEADER START
+	msg.WriteString("<br><h3>Order Positions:</h3>")
+	msg.WriteString("<table style=\"border-spacing: 12px; width: 100%;\">") // POS TABLE START
+	msg.WriteString("<tr>")                                                 // POS TABLE HEADER START
 	msg.WriteString("<th>#</th>")
 	msg.WriteString("<th>Amount</th>")
 	msg.WriteString("<th>Description</th>")
-	msg.WriteString("<th>Gross Total</th>")
-	msg.WriteString("<th>Net Total</th>")
+	msg.WriteString("<th>Total</th>")
 	msg.WriteString("<tr>") // POS TABLE HEADER END
 	var gross float64
 	for ix, item := range order.ItemPositions {
 		gross = item.NetPrice * (1 + item.VATPercent)
 		msg.WriteString("<tr>") // POS TABLE POS START
-		msg.WriteString(fmt.Sprintf("<td>%d</td>", ix))
-		msg.WriteString(fmt.Sprintf("<td>%.1f</td>", item.Amount))
-		msg.WriteString(fmt.Sprintf("<td>%s</td>", item.Name))
-		msg.WriteString(fmt.Sprintf("<td>%f</td>", gross))
-		msg.WriteString(fmt.Sprintf("<td>%f (%f %s VAT)</td>", item.NetPrice, item.VATPercent*100, "%"))
+		msg.WriteString(fmt.Sprintf("<td>%d</td>", ix+1))
+		msg.WriteString(fmt.Sprintf("<td>%.1f x</td>", item.Amount))
+		if len(item.Variations) < 1 {
+			msg.WriteString(fmt.Sprintf("<td>%s</td>", item.Name))
+		} else {
+			msg.WriteString(fmt.Sprintf("<td>%s<br><br>Variations:", item.Name))
+			for _, variation := range item.Variations {
+				if len(variation.Variations) < 1 || variation.Variations[0].StringValue == "" {
+					continue
+				}
+				msg.WriteString(fmt.Sprintf("<br>* %s: %s", variation.Name, variation.Variations[0].StringValue))
+			}
+			msg.WriteString("</td>")
+		}
+		msg.WriteString(fmt.Sprintf("<td>%.2f €<br>(%.2f € with %.2f %s VAT)</td>",
+			gross, item.NetPrice, item.VATPercent*100, "%"))
 		msg.WriteString("<tr>") // POS TABLE POS END
 	}
 	msg.WriteString("</table>") // POS TABLE END
 	msg.WriteString("<br>")
-	msg.WriteString(fmt.Sprintf("<p>Net Total: %.2f</p>", order.NetTotal))
-	msg.WriteString(fmt.Sprintf("<p>VAT Total: %.2f</p>", order.GrossTotal-order.NetTotal))
+	msg.WriteString(fmt.Sprintf("<p>Net Total: %.2f €</p>", order.NetTotal))
+	msg.WriteString(fmt.Sprintf("<p>VAT Total: %.2f €</p>", order.GrossTotal-order.NetTotal))
+	msg.WriteString(fmt.Sprintf("<h2>Gross Total: %.2f €</h2>", order.GrossTotal))
 	msg.WriteString("<br>")
-	msg.WriteString(fmt.Sprintf("<p>Gross Total: %.2f</p>", order.GrossTotal))
-	msg.WriteString("<br>")
-	msg.WriteString("<br>")
-	msg.WriteString("<p>Disclaimer: This is an order confirmation email, not an invoice." +
+	msg.WriteString("<br><h3>Delivery:</h3>")
+	msg.WriteString("<p>")
+	msg.WriteString(fmt.Sprintf("Email: %s<br>", order.Delivery.Email))
+	msg.WriteString(fmt.Sprintf("Phone: %s<br>", order.Delivery.Telephone))
+	msg.WriteString(fmt.Sprintf("Name: %s %s<br>", order.Delivery.FirstName, order.Delivery.LastName))
+	msg.WriteString(fmt.Sprintf("Company: %s<br>", order.Delivery.CompanyName))
+	msg.WriteString(fmt.Sprintf("Country: %s<br>", order.Delivery.Country))
+	msg.WriteString(fmt.Sprintf("State: %s<br>", order.Delivery.StateArea))
+	msg.WriteString(fmt.Sprintf("Street: %s<br>", order.Delivery.Street))
+	msg.WriteString(fmt.Sprintf("City: %s<br>", order.Delivery.City))
+	msg.WriteString(fmt.Sprintf("ZIP Code: %s", order.Delivery.PostalCode))
+	msg.WriteString("</p>")
+	msg.WriteString("<br><h3>Billing:</h3>")
+	msg.WriteString("<p>")
+	msg.WriteString(fmt.Sprintf("Email: %s<br>", order.Billing.Email))
+	msg.WriteString(fmt.Sprintf("Phone: %s<br>", order.Billing.Telephone))
+	msg.WriteString(fmt.Sprintf("Name: %s %s<br>", order.Billing.FirstName, order.Billing.LastName))
+	msg.WriteString(fmt.Sprintf("Company: %s<br>", order.Billing.CompanyName))
+	msg.WriteString(fmt.Sprintf("Country: %s<br>", order.Billing.Country))
+	msg.WriteString(fmt.Sprintf("State: %s<br>", order.Billing.StateArea))
+	msg.WriteString(fmt.Sprintf("Street: %s<br>", order.Billing.Street))
+	msg.WriteString(fmt.Sprintf("City: %s<br>", order.Billing.City))
+	msg.WriteString(fmt.Sprintf("ZIP Code: %s", order.Billing.PostalCode))
+	msg.WriteString("</p><br>")
+	msg.WriteString("<p>Disclaimer: This is an order confirmation email, not an invoice. " +
 		"wikiric stores are being implemented at this moment " +
 		"thus making this email not an official invoice to be used legally. " +
 		"Please ask the store owner for a real invoice if needed. Thank you.</p>")
@@ -424,12 +459,13 @@ func appendOrderEmail(msg *strings.Builder, order *Order, orderID string) {
 
 func appendOrderBankDetails(msg *strings.Builder, store *Store) {
 	msg.WriteString("<br>")
-	msg.WriteString("<p>Store Bank Details:</p>")
-	msg.WriteString(fmt.Sprintf("<p>Name: %s</p>", store.BankDetails.Name))
-	msg.WriteString(fmt.Sprintf("<p>Bank Name: %s</p>", store.BankDetails.BankName))
-	msg.WriteString(fmt.Sprintf("<p>IBAN: %s</p>", store.BankDetails.IBAN))
-	msg.WriteString(fmt.Sprintf("<p>SWIFT Code: %s</p>", store.BankDetails.SwiftCode))
-	msg.WriteString("<br>")
+	msg.WriteString("<h3>Payment</h3>")
+	msg.WriteString("<p>Please transfer the requested money (gross total) to this bank account:</p><p>")
+	msg.WriteString(fmt.Sprintf("Name: %s<br>", store.BankDetails.Name))
+	msg.WriteString(fmt.Sprintf("Bank Name: %s<br>", store.BankDetails.BankName))
+	msg.WriteString(fmt.Sprintf("IBAN: %s<br>", store.BankDetails.IBAN))
+	msg.WriteString(fmt.Sprintf("SWIFT Code: %s", store.BankDetails.SwiftCode))
+	msg.WriteString("</p><br>")
 }
 
 func (db *GoDB) handleOrdersGetOwn() http.HandlerFunc {
@@ -979,7 +1015,7 @@ func (db *GoDB) handleProcessOrderDelivery(mainDB *GoDB) http.HandlerFunc {
 				return
 			}
 			store := &Store{}
-			err = json.Unmarshal(orderResp.Data, order)
+			err = json.Unmarshal(orderResp.Data, store)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
@@ -993,6 +1029,10 @@ func (db *GoDB) handleProcessOrderDelivery(mainDB *GoDB) http.HandlerFunc {
 		request := &OrderDeliveryStateModification{}
 		if err = render.Bind(r, request); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Avoid setting same state
+		if request.NewValue == order.DeliveryState {
 			return
 		}
 		// Change state
@@ -1048,7 +1088,7 @@ func (db *GoDB) handleProcessOrderBilling(mainDB *GoDB) http.HandlerFunc {
 				return
 			}
 			store := &Store{}
-			err = json.Unmarshal(orderResp.Data, order)
+			err = json.Unmarshal(orderResp.Data, store)
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
@@ -1065,7 +1105,7 @@ func (db *GoDB) handleProcessOrderBilling(mainDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Avoid setting same state
-		if request.NewValue == order.State {
+		if request.NewValue == order.BillingState {
 			return
 		}
 		// Change state
@@ -1073,7 +1113,7 @@ func (db *GoDB) handleProcessOrderBilling(mainDB *GoDB) http.HandlerFunc {
 		// Add to history
 		order.History = append(order.History, OrderHistoryEntry{
 			DateTime: TimeNowIsoString(),
-			Type:     "delivery",
+			Type:     "billing",
 			State:    request.NewValue,
 			Username: user.Username,
 		})

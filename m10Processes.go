@@ -1062,6 +1062,10 @@ func (db *GoDB) handleProcessQuery(mainDB *GoDB) http.HandlerFunc {
 					}
 				}
 			}
+			// Truncate wisdom description
+			if process.Description != "" {
+				process.Description = EllipticalTruncate(process.Description, 200)
+			}
 			queryResponse.Processes = append(queryResponse.Processes, &ProcessContainer{
 				UUID:      entry.uUID,
 				Process:   process,

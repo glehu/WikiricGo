@@ -97,7 +97,7 @@ func (connector *Connector) handleConnectorEndpoint(dbList *Databases) http.Hand
 		}
 		// Retrieve user
 		username := usernameTmp.(string)
-		user := dbList.Map["main"].GetUserFromUsername(username)
+		user := dbList.Map["main"].ReadUserFromUsername(username)
 		if user == nil {
 			_ = c.Close(
 				http.StatusUnauthorized,
