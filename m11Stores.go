@@ -17,20 +17,21 @@ import (
 const StoreDB = "m11"
 
 type Store struct {
-	Name                 string      `json:"t"`
-	Username             string      `json:"usr"`
-	Description          string      `json:"desc"`
-	Categories           []Category  `json:"cats"`
-	TimeCreated          string      `json:"ts"`
-	IsPrivate            bool        `json:"priv"`
-	ParentUUID           string      `json:"pid"`
-	ThumbnailURL         string      `json:"iurl"`
-	ThumbnailAnimatedURL string      `json:"iurla"`
-	BannerURL            string      `json:"burl"`
-	BannerAnimatedURL    string      `json:"burla"`
-	BankDetails          BankDetails `json:"bank"`
-	AnalyticsUUID        string      `json:"ana"` // Views, likes etc. will be stored in a separate database
-	IsShiny              bool        `json:"shiny"`
+	Name                 string          `json:"t"`
+	Username             string          `json:"usr"`
+	Description          string          `json:"desc"`
+	Categories           []Category      `json:"cats"`
+	TimeCreated          string          `json:"ts"`
+	IsPrivate            bool            `json:"priv"`
+	ParentUUID           string          `json:"pid"`
+	ThumbnailURL         string          `json:"iurl"`
+	ThumbnailAnimatedURL string          `json:"iurla"`
+	BannerURL            string          `json:"burl"`
+	BannerAnimatedURL    string          `json:"burla"`
+	BankDetails          BankDetails     `json:"bank"`
+	AnalyticsUUID        string          `json:"ana"` // Views, likes etc. will be stored in a separate database
+	IsShiny              bool            `json:"shiny"`
+	Appearance           StoreAppearance `json:"visual"`
 }
 
 type BankDetails struct {
@@ -67,6 +68,10 @@ type StoreContainer struct {
 	*Store
 	*Analytics
 	Accuracy float64 `json:"accuracy"`
+}
+
+type StoreAppearance struct {
+	ImageBackgroundColor string `json:"imgBGColor"`
 }
 
 func (db *GoDB) PublicStoreEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,

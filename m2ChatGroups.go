@@ -66,6 +66,7 @@ type FriendList struct {
 type FriendGroup struct {
 	*ChatMemberEntry `json:"friend"`
 	*ChatGroupEntry  `json:"chat"`
+	*ChatMessage     `json:"msg"`
 }
 
 type PublicKeyRequest struct {
@@ -106,7 +107,7 @@ func (db *GoDB) ProtectedChatGroupEndpoints(r chi.Router, tokenAuth *jwtauth.JWT
 		r.Route("/users", func(r chi.Router) {
 			r.Post("/roles/mod/{chatID}", db.handleChatMemberRoleModification())
 			r.Get("/members/{chatID}", db.handleChatGroupGetMembers())
-			r.Get("/friends", db.handleGetFriends())
+			r.Get("/friends", db.handleGetFriends(rapidDB))
 			r.Get("/active/{chatID}", db.handleChatGroupGetActiveMembers(chatServer))
 		})
 		// Self Actions
@@ -967,7 +968,7 @@ func notifyJoin(selfName string, mainDB, rapidDB *GoDB, connector *Connector, ch
 	return nil
 }
 
-func (db *GoDB) handleGetFriends() http.HandlerFunc {
+func (db *GoDB) handleGetFriends(rapidDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -1000,12 +1001,36 @@ func (db *GoDB) handleGetFriends() http.HandlerFunc {
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					return
 				}
+				// Retrieve last message sent
+				msgResp, err := rapidDB.Select(MessageDB, map[string]string{
+					"chatID": chatMember.ChatGroupUUID,
+				}, &SelectOptions{
+					MaxResults: 1,
+					Page:       0,
+					Skip:       0,
+				})
+				if err != nil {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+				msgResponse := <-msgResp
+				var lastMessage *ChatMessage
+				if len(msgResponse) > 0 {
+					lastMessage = &ChatMessage{}
+					err = json.Unmarshal(msgResponse[0].Data, lastMessage)
+					if err != nil {
+						lastMessage = nil
+					}
+				}
+				// Sanitize
+				chatGroup.Password = ""
 				members.Friends = append(members.Friends, &FriendGroup{
 					ChatMemberEntry: &ChatMemberEntry{
 						ChatMember: chatMember,
 						UUID:       entry.uUID,
 					},
 					ChatGroupEntry: chatGroup,
+					ChatMessage:    lastMessage,
 				})
 			}
 		}
@@ -1137,6 +1162,8 @@ func (db *GoDB) handleChatGroupModification(rapidDB *GoDB) http.HandlerFunc {
 				err = db.changeChatGroupImage(rapidDB, user, chatID, request, true, false)
 			} else if request.Field == "pw" {
 				err = db.changeChatGroupAccess(user, chatID, request, r)
+			} else if request.Field == "t" {
+				err = db.changeChatGroupName(user, chatID, request, r)
 			}
 		}
 		if err != nil {
@@ -1397,6 +1424,103 @@ func (db *GoDB) changeChatGroupAccess(
 	err = db.Update(GroupDB, txn, response.uUID, jsonEntry, map[string]string{})
 	if err != nil {
 		return errors.New(http.StatusText(http.StatusInternalServerError))
+	}
+	return nil
+}
+
+func (db *GoDB) changeChatGroupName(
+	user *User, chatID string, request *ChatGroupModification, r *http.Request,
+) error {
+	// Check if user is admin
+	chatGroupTmp, chatMember, _, _ := ReadChatGroupAndMember(db, nil, nil,
+		chatID, user.Username, "", r)
+	if chatGroupTmp == nil || chatMember == nil {
+		return errors.New(http.StatusText(http.StatusForbidden))
+	}
+	userRole := chatMember.GetRoleInformation(chatGroupTmp.ChatGroup)
+	if !userRole.IsAdmin {
+		return errors.New(http.StatusText(http.StatusForbidden))
+	}
+	// Retrieve chat group
+	response, txn := db.Get(GroupDB, chatID)
+	if txn == nil {
+		return nil
+	}
+	defer txn.Discard()
+	chatGroup := &ChatGroup{}
+	var err error
+	err = json.Unmarshal(response.Data, chatGroup)
+	if err != nil {
+		return err
+	}
+	// Are we deleting or modifying?
+	var jsonEntry []byte
+	if request.NewValue == "" {
+		// Delete
+		txn.Discard()
+		err = db.Delete(GroupDB, response.uUID, []string{})
+		// We need to remove this chat group from its parent if there is one
+		if chatGroup.ParentUUID != "" {
+			responseMain, txnMain := db.Get(GroupDB, chatGroup.ParentUUID)
+			if txnMain == nil {
+				return nil
+			}
+			defer txnMain.Discard()
+			chatGroupMain := &ChatGroup{}
+			err = json.Unmarshal(responseMain.Data, chatGroupMain)
+			if err != nil {
+				return err
+			}
+			for i := 0; i < len(chatGroupMain.Subchatrooms); i++ {
+				if chatGroupMain.Subchatrooms[i].UUID == response.uUID {
+					chatGroupMain.Subchatrooms = append(chatGroupMain.Subchatrooms[:i], chatGroupMain.Subchatrooms[i+1:]...)
+					break
+				}
+			}
+			// Save main group
+			jsonEntry, err = json.Marshal(chatGroupMain)
+			if err != nil {
+				return err
+			}
+			err = db.Update(GroupDB, txnMain, chatGroup.ParentUUID, jsonEntry, map[string]string{})
+		}
+	} else {
+		// Modify
+		chatGroup.Name = request.NewValue
+		// Save
+		jsonEntry, err = json.Marshal(chatGroup)
+		if err != nil {
+			return err
+		}
+		err = db.Update(GroupDB, txn, response.uUID, jsonEntry, map[string]string{})
+		// We need to modify this chat group's name for its parent if there is one
+		if chatGroup.ParentUUID != "" {
+			responseMain, txnMain := db.Get(GroupDB, chatGroup.ParentUUID)
+			if txnMain == nil {
+				return nil
+			}
+			defer txnMain.Discard()
+			chatGroupMain := &ChatGroup{}
+			err = json.Unmarshal(responseMain.Data, chatGroupMain)
+			if err != nil {
+				return err
+			}
+			for i := 0; i < len(chatGroupMain.Subchatrooms); i++ {
+				if chatGroupMain.Subchatrooms[i].UUID == response.uUID {
+					chatGroupMain.Subchatrooms[i].Name = request.NewValue
+					break
+				}
+			}
+			// Save main group
+			jsonEntry, err = json.Marshal(chatGroupMain)
+			if err != nil {
+				return err
+			}
+			err = db.Update(GroupDB, txnMain, chatGroup.ParentUUID, jsonEntry, map[string]string{})
+		}
+	}
+	if err != nil {
+		return err
 	}
 	return nil
 }

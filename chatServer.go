@@ -324,8 +324,8 @@ func (server *ChatServer) handleIncomingMessage(
 
 func (server *ChatServer) DistributeChatMessageJSON(msg *ChatMessageContainer) {
 	server.ChatGroupsMu.RLock()
-	defer server.ChatGroupsMu.RUnlock()
 	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
+	server.ChatGroupsMu.RUnlock()
 	if ok {
 		for _, value := range sessions {
 			_ = WSSendJSON(value.Conn, value.Ctx, msg) // TODO: Drop connection?
@@ -335,8 +335,8 @@ func (server *ChatServer) DistributeChatMessageJSON(msg *ChatMessageContainer) {
 
 func (server *ChatServer) DistributeChatActionMessageJSON(msg *ChatActionMessage) {
 	server.ChatGroupsMu.RLock()
-	defer server.ChatGroupsMu.RUnlock()
 	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
+	server.ChatGroupsMu.RUnlock()
 	if ok {
 		for _, value := range sessions {
 			_ = WSSendJSON(value.Conn, value.Ctx, msg) // TODO: Drop connection?

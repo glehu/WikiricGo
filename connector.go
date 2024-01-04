@@ -206,7 +206,7 @@ func (connector *Connector) handleIncomingMessage(
 		return
 	}
 	// Forward?
-	if cMsg.Type == CForward {
+	if cMsg.Action == CForward {
 		connector.SessionsMu.RLock()
 		defer connector.SessionsMu.RUnlock()
 		user, ok := connector.Sessions.Get(cMsg.Username)

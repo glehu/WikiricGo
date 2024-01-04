@@ -73,10 +73,11 @@ type QueryResponse struct {
 }
 
 type WisdomQuery struct {
-	Query  string `json:"query"`
-	Type   string `json:"type"`
-	Fields string `json:"fields"`
-	State  string `json:"state"`
+	Query      string `json:"query"`
+	Type       string `json:"type"`
+	Fields     string `json:"fields"`
+	State      string `json:"state"`
+	MaxResults int    `json:"results"`
 }
 
 type QueryWord struct {
@@ -147,6 +148,7 @@ func (db *GoDB) ProtectedWisdomEndpoints(
 		r.Get("/investigate/{wisdomID}", db.handleWisdomInvestigate(mainDB))
 		r.Get("/accept/{wisdomID}", db.handleWisdomAcceptAnswer(mainDB, connector))
 		r.Get("/meta/{knowledgeID}", db.handleWisdomMetaRetrieval(mainDB))
+		r.Get("/export/{wisdomID}", db.handleWisdomExport(mainDB))
 	})
 }
 
@@ -600,7 +602,7 @@ func (db *GoDB) handleWisdomDelete(mainDB *GoDB, connector *Connector,
 				}()
 			}
 			txn.Discard()
-			err := db.Delete(WisdomDB, wisdomID, []string{"knowledgeID-type", "refID-state"})
+			err = db.Delete(WisdomDB, wisdomID, []string{"knowledgeID-type", "refID-state"})
 			if err != nil {
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
@@ -1269,9 +1271,17 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 			typeQuery = ""
 		}
 		ixQuery := fmt.Sprintf("%s;%s", knowledgeID, typeQuery)
+		maxResults := -1
+		if request.MaxResults > 0 {
+			maxResults = request.MaxResults
+		}
 		resp, err := db.Select(WisdomDB, map[string]string{
 			"knowledgeID-type": ixQuery,
-		}, nil)
+		}, &SelectOptions{
+			MaxResults: int64(maxResults),
+			Page:       0,
+			Skip:       0,
+		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -2146,6 +2156,88 @@ func (db *GoDB) handleWisdomReminderRequest(mainDB *GoDB,
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
+		}
+	}
+}
+
+func (db *GoDB) handleWisdomExport(mainDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		wisdomID := chi.URLParam(r, "wisdomID")
+		if wisdomID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		response, ok := db.Read(WisdomDB, wisdomID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		wisdom := &Wisdom{}
+		err := json.Unmarshal(response.Data, wisdom)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// If Wisdom is not public, check member and read right
+		canRead, _ := CheckWisdomAccess(
+			user, wisdom, mainDB, db, r)
+		if !canRead {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Is this entry a lesson/question/reply/response/task? If so, we export it as is
+		// If we have encountered a box, then we will export all tasks belonging to this box
+		if wisdom.Type != "box" {
+			// Export wisdom content as Markdown text
+			textContent := strings.Builder{}
+			textContent.WriteString(fmt.Sprintf("%s\n", wisdom.Name))
+			textContent.WriteString(wisdom.Description)
+			// Respond to client
+			_, _ = fmt.Fprintln(w, textContent.String())
+		} else {
+			// Retrieve tasks and export those
+			// Are we selecting with a predefined status?
+			stateFilter := r.URL.Query().Get("state")
+			if stateFilter == "done" {
+				stateFilter = ";true"
+			} else if stateFilter == "todo" {
+				stateFilter = ";false"
+			} else {
+				stateFilter = ""
+			}
+			var task *Wisdom
+			respTask, err := db.Select(WisdomDB, map[string]string{
+				"refID-state": wisdomID + stateFilter,
+			}, nil)
+			if err != nil {
+				fmt.Println(err)
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			responseTask := <-respTask
+			if len(responseTask) < 1 {
+				fmt.Println(err)
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			textContent := strings.Builder{}
+			for _, taskEntry := range responseTask {
+				task = &Wisdom{}
+				err = json.Unmarshal(taskEntry.Data, task)
+				if err != nil {
+					continue
+				}
+				textContent.WriteString(fmt.Sprintf("%s\n", task.Name))
+				textContent.WriteString(fmt.Sprintf("%s\n\n", task.Description))
+			}
+			// Respond to client
+			_, _ = fmt.Fprintln(w, textContent.String())
 		}
 	}
 }

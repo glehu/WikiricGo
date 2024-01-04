@@ -12,7 +12,7 @@ import (
 	"github.com/go-chi/render"
 	"github.com/gofrs/uuid"
 	"net/http"
-	"strings"
+	"regexp"
 )
 
 const UserDB = "m1"
@@ -127,13 +127,15 @@ func (db *GoDB) handleUserCount() http.HandlerFunc {
 }
 
 func (db *GoDB) getUserCount() int64 {
-	count := 0
+	count := 1
+	prefix := []byte(fmt.Sprintf("%s:uid", UserDB))
 	err := db.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
+		opts.Reverse = true
 		it := txn.NewIterator(opts)
 		defer it.Close()
-		for it.Rewind(); it.Valid(); it.Next() {
+		for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
 			count += 1
 		}
 		return nil
@@ -141,8 +143,7 @@ func (db *GoDB) getUserCount() int64 {
 	if err != nil {
 		return -1
 	}
-	countHalved := float64(count) / 2.0
-	return int64(countHalved)
+	return int64(count)
 }
 
 func (db *GoDB) handleUserLogin() http.HandlerFunc {
@@ -181,8 +182,9 @@ func (db *GoDB) handleUserRegistration(rapidDB *GoDB) http.HandlerFunc {
 			http.Error(w, "missing password", http.StatusBadRequest)
 			return
 		}
-		if strings.Contains(request.Username, ";") {
-			http.Error(w, "illegal character in username", http.StatusBadRequest)
+		match, _ := regexp.MatchString("^\\w+$", request.Username)
+		if !match {
+			http.Error(w, "illegal character(s) in username for pattern ^\\w+$", http.StatusBadRequest)
 			return
 		}
 		// Check if this user exists already
@@ -400,6 +402,12 @@ func (db *GoDB) handleUserFriendRequest(rapidDB *GoDB, connector *Connector) htt
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		// Check if requested user exists
+		friend := db.ReadUserFromUsername(request.Username)
+		if friend == nil {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
 		// Check if there's already a friend group
 		chatID, err := db.CheckFriendGroupExist(user.Username, request.Username)
 		if err != nil {
@@ -440,6 +448,7 @@ func (db *GoDB) handleUserFriendRequest(rapidDB *GoDB, connector *Connector) htt
 				},
 			},
 			IsPrivate:            true,
+			IsEncrypted:          true,
 			Password:             password,
 			Subchatrooms:         nil,
 			ParentUUID:           "",
