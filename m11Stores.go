@@ -159,7 +159,7 @@ func (db *GoDB) handleStoreCreate(rapidDB *GoDB, connector *Connector) http.Hand
 		}
 		// Retrieve POST payload
 		request := &Store{}
-		if err := render.Bind(r, request); err != nil {
+		if err = render.Bind(r, request); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -303,7 +303,7 @@ func (db *GoDB) handleStoreVisit(rapidDB *GoDB, user bool) http.HandlerFunc {
 		if store.AnalyticsUUID != "" {
 			anaBytes, txn := rapidDB.Get(AnaDB, store.AnalyticsUUID)
 			if txn != nil {
-				err := json.Unmarshal(anaBytes.Data, analytics)
+				err = json.Unmarshal(anaBytes.Data, analytics)
 				if err != nil {
 					txn.Discard()
 					analytics = &Analytics{}

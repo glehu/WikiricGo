@@ -105,8 +105,13 @@ func (connector *Connector) handleConnectorEndpoint(dbList *Databases) http.Hand
 			)
 			return
 		}
-		// Add session to connector sessions
 		connector.SessionsMu.Lock()
+		// Before adding the connector session, check if session existed before
+		if _, didExist := connector.Sessions.Get(username); !didExist {
+			// Session did not exist before, so notify others
+			go dbList.Map["main"].notifyStatusChange(connector, username, "online")
+		}
+		// Add session to connector sessions
 		session := &CSession{
 			User:   user,
 			Conn:   c,
@@ -116,8 +121,51 @@ func (connector *Connector) handleConnectorEndpoint(dbList *Databases) http.Hand
 		connector.Sessions.Set(username, session)
 		connector.SessionsMu.Unlock()
 		// Handle connection
-		connector.handleChatSession(session)
+		connector.handleChatSession(session, dbList.Map["main"])
 	}
+}
+
+func (db *GoDB) notifyStatusChange(connector *Connector, username string, status string) {
+	if username == "" || status == "" {
+		return
+	}
+	var err error
+	var resp chan []*EntryResponse
+	var response []*EntryResponse
+	// Retrieve friends
+	resp, err = db.Select(MemberDB, map[string]string{
+		"user-friend": FIndex(username),
+	}, nil)
+	if err != nil {
+		return
+	}
+	response = <-resp
+	if len(response) < 1 {
+		return
+	}
+	connector.SessionsMu.RLock()
+	// Notify friends
+	var sesh *CSession
+	var ok bool
+	var chatMember *ChatMember
+	for _, entry := range response {
+		chatMember = &ChatMember{}
+		err = json.Unmarshal(entry.Data, chatMember)
+		if err == nil {
+			// Check if friend is online by checking his connector session
+			sesh, ok = connector.Sessions.Get(chatMember.Username)
+			if ok {
+				_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+					Type:          "[s:ustat]",
+					Action:        "update",
+					ReferenceUUID: "",
+					Username:      username,
+					Message:       status,
+				})
+			}
+		}
+	}
+	connector.SessionsMu.RUnlock()
 }
 
 func (connector *Connector) checkToken(c *websocket.Conn, ctx context.Context) (bool, jwt.Token) {
@@ -160,7 +208,7 @@ func (connector *Connector) checkToken(c *websocket.Conn, ctx context.Context) (
 	return true, token
 }
 
-func (connector *Connector) handleChatSession(s *CSession) {
+func (connector *Connector) handleChatSession(s *CSession, db *GoDB) {
 	messages, closed := ListenToMessages(
 		s.Conn,
 		s.Ctx,
@@ -168,10 +216,10 @@ func (connector *Connector) handleChatSession(s *CSession) {
 	for {
 		select {
 		case <-closed:
-			connector.dropConnection(s)
+			connector.dropConnection(s, db)
 			return
 		case <-s.Ctx.Done():
-			connector.dropConnection(s)
+			connector.dropConnection(s, db)
 			return
 		case resp := <-messages:
 			if resp != nil {
@@ -184,10 +232,12 @@ func (connector *Connector) handleChatSession(s *CSession) {
 	}
 }
 
-func (connector *Connector) dropConnection(s *CSession) {
+func (connector *Connector) dropConnection(s *CSession, db *GoDB) {
 	connector.SessionsMu.Lock()
 	defer connector.SessionsMu.Unlock()
 	connector.Sessions.Delete(s.User.Username)
+	// Notify friends
+	go db.notifyStatusChange(connector, s.User.Username, "offline")
 }
 
 const CForward = "[c:FWD]"

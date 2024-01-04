@@ -514,7 +514,7 @@ func ReadChatGroupAndMember(
 			}
 		}
 		// Are we joining a DM group? If so, then we'll give the owner rule, too
-		// We also need to notify the other member (this is how friend request work)
+		// We also need to notify the other member (this is how friend requests work)
 		var roles []string
 		var indices map[string]string
 		if chatGroup.Type == "dm" {

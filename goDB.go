@@ -312,7 +312,7 @@ func (db *GoDB) doInsert(
 		var ival string
 		for k, v := range indices {
 			ival = fmt.Sprintf("%s:%s:%s;%s", mod, k, v, uUID)
-			err := txn.Set([]byte(ival), uUID)
+			err = txn.Set([]byte(ival), uUID)
 			if err != nil {
 				return err
 			}
@@ -360,7 +360,7 @@ func (db *GoDB) doUpdate(
 		it.Close()
 		// Set new index
 		ival = fmt.Sprintf("%s:%s:%s;%s", mod, k, v, uUID)
-		err := txn.Set([]byte(ival), uUID)
+		err = txn.Set([]byte(ival), uUID)
 		if err != nil {
 			return err
 		}
