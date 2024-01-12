@@ -241,7 +241,7 @@ func (db *GoDB) handleKnowledgeCategoryModification() http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		// Retrieve chat group
+		// Retrieve knowledge
 		response, txn := db.Get(KnowledgeDB, knowledgeID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
@@ -255,7 +255,7 @@ func (db *GoDB) handleKnowledgeCategoryModification() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		// Check if role is present
+		// Check if category is present
 		index := -1
 		for ix, role := range knowledge.Categories {
 			if role.Name == request.Name {

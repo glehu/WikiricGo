@@ -392,6 +392,13 @@ func analyseRequest(r *http.Request, bodyContent []byte) *MockingBirdAnalytics {
 			})
 		}
 	}
+	// Analyse Host Header (which gets put into its own field when being received)
+	if r.Host != "" {
+		analytics.RequestHeaders = append(analytics.RequestHeaders, RequestHeader{
+			Name:  "Host",
+			Value: r.Host,
+		})
+	}
 	// Do we have a post body?
 	if r.Body != nil && len(bodyContent) > 0 {
 		analytics.RequestContent = string(bodyContent)

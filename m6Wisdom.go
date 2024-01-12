@@ -20,35 +20,37 @@ import (
 const WisdomDB = "m6"
 
 type Wisdom struct {
-	Name                 string   `json:"t"`
-	Description          string   `json:"desc"`
-	Keywords             string   `json:"keys"`
-	CopyContent          string   `json:"copy"`
-	Author               string   `json:"usr"`
-	Type                 string   `json:"type"`
-	TimeCreated          string   `json:"ts"`
-	TimeFinished         string   `json:"tsd"`
-	TimeDue              string   `json:"due"`
-	TimeDueEnd           string   `json:"duet"`
-	IsFinished           bool     `json:"done"`
-	KnowledgeUUID        string   `json:"pid"`
-	Categories           []string `json:"cats"`
-	ReferenceUUID        string   `json:"ref"` // References another Wisdom e.g. Comment referencing Answer
-	AnalyticsUUID        string   `json:"ana"` // Views, likes etc. will be stored in a separate database
-	IsPublic             bool     `json:"pub"`
-	Collaborators        []string `json:"coll"`
-	ThumbnailURL         string   `json:"iurl"`
-	ThumbnailAnimatedURL string   `json:"iurla"`
-	BannerURL            string   `json:"burl"`
-	BannerAnimatedURL    string   `json:"burla"`
-	RowIndex             float64  `json:"row"`
+	Name                 string     `json:"t"`
+	Description          string     `json:"desc"`
+	Keywords             string     `json:"keys"`
+	CopyContent          string     `json:"copy"`
+	Author               string     `json:"usr"`
+	Type                 string     `json:"type"`
+	TimeCreated          string     `json:"ts"`
+	TimeFinished         string     `json:"tsd"`
+	TimeDue              string     `json:"due"`
+	TimeDueEnd           string     `json:"duet"`
+	IsFinished           bool       `json:"done"`
+	KnowledgeUUID        string     `json:"pid"`
+	Categories           []Category `json:"cats"`
+	ReferenceUUID        string     `json:"ref"` // References another Wisdom e.g. Comment referencing Answer
+	AnalyticsUUID        string     `json:"ana"` // Views, likes etc. will be stored in a separate database
+	IsPublic             bool       `json:"pub"`
+	Collaborators        []string   `json:"coll"`
+	ThumbnailURL         string     `json:"iurl"`
+	ThumbnailAnimatedURL string     `json:"iurla"`
+	BannerURL            string     `json:"burl"`
+	BannerAnimatedURL    string     `json:"burla"`
+	RowIndex             float64    `json:"row"`
 }
 
 type WisdomContainer struct {
 	UUID string `json:"uid"`
 	*Wisdom
 	*Analytics
-	Accuracy float64 `json:"accuracy"`
+	Accuracy       float64            `json:"accuracy"`
+	Replies        []*WisdomContainer `json:"replies"`
+	HasMoreReplies bool               `json:"moreReplies"`
 }
 
 type BoxesContainer struct {
@@ -73,11 +75,14 @@ type QueryResponse struct {
 }
 
 type WisdomQuery struct {
-	Query      string `json:"query"`
-	Type       string `json:"type"`
-	Fields     string `json:"fields"`
-	State      string `json:"state"`
-	MaxResults int    `json:"results"`
+	Query                string `json:"query"`
+	Type                 string `json:"type"`
+	Fields               string `json:"fields"`
+	State                string `json:"state"`
+	MaxResults           int    `json:"results"`
+	WithReplies          bool   `json:"withReply"`
+	NoSort               bool   `json:"noSort"`
+	MaxDescriptionLength int    `json:"descLen"`
 }
 
 type QueryWord struct {
@@ -325,8 +330,9 @@ func (db *GoDB) handleWisdomCreate(mainDB *GoDB, connector *Connector) http.Hand
 		if request.Type != "lesson" &&
 			request.Type != "question" &&
 			request.Type != "box" &&
-			request.Type != "task" {
-			http.Error(w, "type must be one of lesson or answer or box or task",
+			request.Type != "task" &&
+			request.Type != "post" {
+			http.Error(w, "type must be one of lesson or answer or box or task or post",
 				http.StatusBadRequest)
 			return
 		}
@@ -352,7 +358,7 @@ func (db *GoDB) handleWisdomCreate(mainDB *GoDB, connector *Connector) http.Hand
 			request.Collaborators = make([]string, 0)
 		}
 		if request.Categories == nil {
-			request.Categories = make([]string, 0)
+			request.Categories = make([]Category, 0)
 		}
 		if request.Type == "question" {
 			if request.Keywords != "" {
@@ -458,7 +464,7 @@ func (db *GoDB) handleWisdomEdit(mainDB *GoDB, connector *Connector,
 			request.Collaborators = make([]string, 0)
 		}
 		if request.Categories == nil {
-			request.Categories = make([]string, 0)
+			request.Categories = make([]Category, 0)
 		}
 		// Store
 		jsonEntry, err := json.Marshal(request)
@@ -1084,7 +1090,7 @@ func (db *GoDB) handleWisdomReply(
 			request.Collaborators = make([]string, 0)
 		}
 		if request.Categories == nil {
-			request.Categories = make([]string, 0)
+			request.Categories = make([]Category, 0)
 		}
 		// Store
 		jsonEntry, err := json.Marshal(request)
@@ -1271,17 +1277,17 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 			typeQuery = ""
 		}
 		ixQuery := fmt.Sprintf("%s;%s", knowledgeID, typeQuery)
-		maxResults := -1
+		// Options?
+		options := r.Context().Value("pagination").(*SelectOptions)
 		if request.MaxResults > 0 {
-			maxResults = request.MaxResults
+			options.MaxResults = int64(request.MaxResults)
+		}
+		if options.MaxResults <= 0 {
+			options.MaxResults = -1
 		}
 		resp, err := db.Select(WisdomDB, map[string]string{
 			"knowledgeID-type": ixQuery,
-		}, &SelectOptions{
-			MaxResults: int64(maxResults),
-			Page:       0,
-			Skip:       0,
-		})
+		}, options)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -1303,6 +1309,8 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 		}
 		// Turn query text into a full regex pattern
 		words, p := GetRegexQuery(request.Query)
+		var replies []*WisdomContainer
+		var hasMoreReplies bool
 		var container *WisdomContainer
 		var wisdom *Wisdom
 		var analytics *Analytics
@@ -1335,7 +1343,11 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 			}
 			// Truncate wisdom description
 			if wisdom.Description != "" {
-				wisdom.Description = EllipticalTruncate(wisdom.Description, 200)
+				if request.MaxDescriptionLength > 0 {
+					wisdom.Description = EllipticalTruncate(wisdom.Description, request.MaxDescriptionLength)
+				} else {
+					wisdom.Description = EllipticalTruncate(wisdom.Description, 200)
+				}
 			}
 			// Load analytics if available
 			analytics = &Analytics{}
@@ -1348,11 +1360,20 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 					}
 				}
 			}
+			// Do we need to retrieve replies for this wisdom?
+			if request.WithReplies {
+				replies, hasMoreReplies = db.RetrieveWisdomReplies(wisdom, entry.uUID, 3)
+			} else {
+				replies = make([]*WisdomContainer, 0)
+				hasMoreReplies = false
+			}
 			container = &WisdomContainer{
-				UUID:      entry.uUID,
-				Wisdom:    wisdom,
-				Analytics: analytics,
-				Accuracy:  accuracy,
+				UUID:           entry.uUID,
+				Wisdom:         wisdom,
+				Analytics:      analytics,
+				Accuracy:       accuracy,
+				Replies:        replies,
+				HasMoreReplies: hasMoreReplies,
 			}
 			switch wisdom.Type {
 			case "lesson":
@@ -1371,55 +1392,58 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 				queryResponse.Misc = append(queryResponse.Misc, container)
 			}
 		}
-		// Sort entries by accuracy
-		if len(queryResponse.Lessons) > 1 {
-			sort.SliceStable(
-				queryResponse.Lessons, func(i, j int) bool {
-					return queryResponse.Lessons[i].Accuracy > queryResponse.Lessons[j].Accuracy
-				},
-			)
-		}
-		if len(queryResponse.Replies) > 1 {
-			sort.SliceStable(
-				queryResponse.Replies, func(i, j int) bool {
-					return queryResponse.Replies[i].Accuracy > queryResponse.Replies[j].Accuracy
-				},
-			)
-		}
-		if len(queryResponse.Questions) > 1 {
-			sort.SliceStable(
-				queryResponse.Questions, func(i, j int) bool {
-					return queryResponse.Questions[i].Accuracy > queryResponse.Questions[j].Accuracy
-				},
-			)
-		}
-		if len(queryResponse.Answers) > 1 {
-			sort.SliceStable(
-				queryResponse.Answers, func(i, j int) bool {
-					return queryResponse.Answers[i].Accuracy > queryResponse.Answers[j].Accuracy
-				},
-			)
-		}
-		if len(queryResponse.Boxes) > 1 {
-			sort.SliceStable(
-				queryResponse.Boxes, func(i, j int) bool {
-					return queryResponse.Boxes[i].Accuracy > queryResponse.Boxes[j].Accuracy
-				},
-			)
-		}
-		if len(queryResponse.Tasks) > 1 {
-			sort.SliceStable(
-				queryResponse.Tasks, func(i, j int) bool {
-					return queryResponse.Tasks[i].Accuracy > queryResponse.Tasks[j].Accuracy
-				},
-			)
-		}
-		if len(queryResponse.Misc) > 1 {
-			sort.SliceStable(
-				queryResponse.Misc, func(i, j int) bool {
-					return queryResponse.Misc[i].Accuracy > queryResponse.Misc[j].Accuracy
-				},
-			)
+		// Do we need to sort?
+		if !request.NoSort {
+			// Sort entries by accuracy
+			if len(queryResponse.Lessons) > 1 {
+				sort.SliceStable(
+					queryResponse.Lessons, func(i, j int) bool {
+						return queryResponse.Lessons[i].Accuracy > queryResponse.Lessons[j].Accuracy
+					},
+				)
+			}
+			if len(queryResponse.Replies) > 1 {
+				sort.SliceStable(
+					queryResponse.Replies, func(i, j int) bool {
+						return queryResponse.Replies[i].Accuracy > queryResponse.Replies[j].Accuracy
+					},
+				)
+			}
+			if len(queryResponse.Questions) > 1 {
+				sort.SliceStable(
+					queryResponse.Questions, func(i, j int) bool {
+						return queryResponse.Questions[i].Accuracy > queryResponse.Questions[j].Accuracy
+					},
+				)
+			}
+			if len(queryResponse.Answers) > 1 {
+				sort.SliceStable(
+					queryResponse.Answers, func(i, j int) bool {
+						return queryResponse.Answers[i].Accuracy > queryResponse.Answers[j].Accuracy
+					},
+				)
+			}
+			if len(queryResponse.Boxes) > 1 {
+				sort.SliceStable(
+					queryResponse.Boxes, func(i, j int) bool {
+						return queryResponse.Boxes[i].Accuracy > queryResponse.Boxes[j].Accuracy
+					},
+				)
+			}
+			if len(queryResponse.Tasks) > 1 {
+				sort.SliceStable(
+					queryResponse.Tasks, func(i, j int) bool {
+						return queryResponse.Tasks[i].Accuracy > queryResponse.Tasks[j].Accuracy
+					},
+				)
+			}
+			if len(queryResponse.Misc) > 1 {
+				sort.SliceStable(
+					queryResponse.Misc, func(i, j int) bool {
+						return queryResponse.Misc[i].Accuracy > queryResponse.Misc[j].Accuracy
+					},
+				)
+			}
 		}
 		duration := time.Since(timeStart)
 		queryResponse.TimeSeconds = duration.Seconds()
@@ -1449,7 +1473,7 @@ func GetWisdomQueryPoints(
 	wisdom *Wisdom, query *WisdomQuery, p *regexp.Regexp, words map[string]*QueryWord, b bool,
 ) (float64, int64) {
 	// Get all matches in selected fields
-	var mUser, mName, mDesc, mKeys []string
+	var mUser, mName, mDesc, mKeys, mCats []string
 	if query.Fields == "" || strings.Contains(query.Fields, "usr") {
 		mUser = p.FindAllString(wisdom.Author, -1)
 	}
@@ -1462,7 +1486,14 @@ func GetWisdomQueryPoints(
 	if query.Fields == "" || strings.Contains(query.Fields, "keys") {
 		mKeys = p.FindAllString(wisdom.Keywords, -1)
 	}
-	if len(mUser) < 1 && len(mName) < 1 && len(mDesc) < 1 && len(mKeys) < 1 {
+	if (query.Fields == "" || strings.Contains(query.Fields, "cats")) && len(wisdom.Categories) > 0 {
+		tmp := ""
+		for i := 0; i < len(wisdom.Categories); i++ {
+			tmp += wisdom.Categories[i].Name + " "
+		}
+		mCats = p.FindAllString(tmp, -1)
+	}
+	if len(mUser) < 1 && len(mName) < 1 && len(mDesc) < 1 && len(mKeys) < 1 && len(mCats) < 1 {
 		// Return 0 if there were no matches
 		return 0.0, 0
 	}
@@ -1505,6 +1536,16 @@ func GetWisdomQueryPoints(
 		}
 	}
 	for _, word := range mKeys {
+		if words[strings.ToLower(word)] != nil {
+			words[strings.ToLower(word)].B = b
+		} else {
+			words[strings.ToLower(word)] = &QueryWord{
+				B:      b,
+				Points: 1,
+			}
+		}
+	}
+	for _, word := range mCats {
 		if words[strings.ToLower(word)] != nil {
 			words[strings.ToLower(word)].B = b
 		} else {
@@ -2240,4 +2281,59 @@ func (db *GoDB) handleWisdomExport(mainDB *GoDB) http.HandlerFunc {
 			_, _ = fmt.Fprintln(w, textContent.String())
 		}
 	}
+}
+
+func (db *GoDB) RetrieveWisdomReplies(
+	wisdom *Wisdom, wisdomID string, maxAmount int,
+) ([]*WisdomContainer, bool) {
+	replies := make([]*WisdomContainer, 0)
+	hasMoreReplies := false
+	resp, err := db.Select(WisdomDB, map[string]string{
+		"refID-state": wisdomID,
+	}, nil)
+	if err != nil {
+		return replies, false
+	}
+	var analytics *Analytics
+	responseRef := <-resp
+	if len(responseRef) < 1 {
+		return replies, false
+	}
+	var container *WisdomContainer
+	for _, entry := range responseRef {
+		wisdom = &Wisdom{}
+		err = json.Unmarshal(entry.Data, wisdom)
+		if err != nil {
+			continue
+		}
+		if wisdom.Type != "reply" {
+			continue
+		}
+		// Load analytics if available
+		analytics = &Analytics{}
+		if wisdom.AnalyticsUUID != "" {
+			anaBytes, okAna := db.Read(AnaDB, wisdom.AnalyticsUUID)
+			if okAna {
+				err = json.Unmarshal(anaBytes.Data, analytics)
+				if err != nil {
+					analytics = &Analytics{}
+				}
+			}
+		}
+		container = &WisdomContainer{
+			UUID:      entry.uUID,
+			Wisdom:    wisdom,
+			Analytics: analytics,
+		}
+		replies = append(replies, container)
+		// Stop after reaching limit
+		if len(replies) >= maxAmount {
+			// Would there be more replies?
+			if len(replies) < len(responseRef) {
+				hasMoreReplies = true
+			}
+			return replies, hasMoreReplies
+		}
+	}
+	return replies, hasMoreReplies
 }

@@ -39,6 +39,7 @@ type FileSubmission struct {
 	Filename      string `json:"name"`
 	ChatGroupUUID string `json:"pid"`
 	IsPrivate     bool   `json:"priv"`
+	IsEmote       bool   `json:"emote"`
 }
 
 type FileMeta struct {
@@ -50,6 +51,7 @@ type FileMeta struct {
 	TimeCreated   string  `json:"ts"`
 	ChatGroupUUID string  `json:"pid"`
 	IsPrivate     bool    `json:"priv"`
+	Type          string  `json:"type"`
 }
 
 type FileMetaEntry struct {
@@ -262,6 +264,9 @@ func (db *GoDB) saveBase64AsFile(
 	if err != nil {
 		return "", err
 	}
+	if request.IsEmote && fileType != "image" {
+		return "", errors.New("error: emotes can only be images")
+	}
 	// If an image is being submitted, we need to resize it to avoid having huge files on the server
 	if fileType == "image" {
 		r := bytes.NewReader(dec)
@@ -276,9 +281,17 @@ func (db *GoDB) saveBase64AsFile(
 		if err != nil {
 			return "", err
 		}
+		// Prepare dimensions of the image
+		maxWidth := 1920
+		maxHeight := 1080
+		if request.IsEmote {
+			// If we're saving an emote, then we'll have to make the dimensions tiny
+			maxWidth = 64
+			maxHeight = 64
+		}
 		// We have the image now -> Check if resize is necessary
 		bounds := img.Bounds()
-		scaleX, scaleY, scaled := getScaledDimensions(bounds.Max.X, bounds.Max.Y, 1920, 1080)
+		scaleX, scaleY, scaled := getScaledDimensions(bounds.Max.X, bounds.Max.Y, maxWidth, maxHeight)
 		if scaled || fileExtOverride != "" {
 			// Are we overriding the file extension?
 			if fileExtOverride != "" {
@@ -286,7 +299,7 @@ func (db *GoDB) saveBase64AsFile(
 			}
 			// Scaled -> Resize necessary
 			dst := image.NewRGBA(image.Rect(0, 0, scaleX, scaleY))
-			draw.NearestNeighbor.Scale(dst, dst.Rect, img, img.Bounds(), draw.Over, nil)
+			draw.CatmullRom.Scale(dst, dst.Rect, img, bounds, draw.Over, nil)
 			// Return resized bytes
 			var b bytes.Buffer
 			resizedBytes := bufio.NewWriter(&b)
@@ -297,6 +310,10 @@ func (db *GoDB) saveBase64AsFile(
 			} else if fileExt == ".gif" {
 				err = gif.Encode(resizedBytes, dst, nil)
 			}
+			if err != nil {
+				return "", err
+			}
+			err = resizedBytes.Flush()
 			if err != nil {
 				return "", err
 			}
@@ -344,6 +361,10 @@ func (db *GoDB) saveBase64AsFile(
 		return "", err
 	}
 	sizeMb, _ := decimal.NewFromFloat(fileSizeMB).Round(3).Float64()
+	contentType := ""
+	if request.IsEmote {
+		contentType = "emote"
+	}
 	// Add file meta data to database
 	fileMeta := &FileMeta{
 		Filename:      fmt.Sprintf("%s%s", filename, fileExt),
@@ -354,16 +375,24 @@ func (db *GoDB) saveBase64AsFile(
 		TimeCreated:   TimeNowIsoString(),
 		ChatGroupUUID: request.ChatGroupUUID,
 		IsPrivate:     request.IsPrivate,
+		Type:          contentType,
 	}
 	jsonEntry, err := json.Marshal(fileMeta)
 	if err != nil {
 		return "", err
 	}
-	uUID, err := db.Insert(FileDB, jsonEntry, map[string]string{"chatID": request.ChatGroupUUID})
+	// Prepare indices
+	indices := map[string]string{"chatID": request.ChatGroupUUID}
+	// Do we need an extra index for a custom emote?
+	if request.IsEmote {
+		indices["chatID-type"] = fmt.Sprintf("%s;%s;", request.ChatGroupUUID, "emote")
+	}
+	// Save meta data
+	uUID, err := db.Insert(FileDB, jsonEntry, indices)
 	return uUID, nil
 }
 
-func getScaledDimensions(imgWidth int, imgHeight int, maxWidth int, maxHeight int) (scaleX, scaleY int, scaled bool) {
+func getScaledDimensions(imgWidth, imgHeight, maxWidth, maxHeight int) (scaleX, scaleY int, scaled bool) {
 	// Check if we need to resize
 	if imgWidth < maxWidth && imgHeight < maxHeight {
 		scaleX = imgWidth
@@ -387,7 +416,6 @@ func getScaledDimensions(imgWidth int, imgHeight int, maxWidth int, maxHeight in
 		scaleXTmp := float64(scaleY) * ratio
 		scaleX = int(scaleXTmp)
 	}
-	fmt.Println(ratio)
 	return scaleX, scaleY, true
 }
 
@@ -413,8 +441,11 @@ func (db *GoDB) handleFileCreate(mainDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Is a chat group referenced?
+		var chatGroup *ChatGroupEntry
+		var chatMember *ChatMemberEntry
+		var err error
 		if request.ChatGroupUUID != "" {
-			chatGroup, chatMember, _, err := ReadChatGroupAndMember(
+			chatGroup, chatMember, _, err = ReadChatGroupAndMember(
 				mainDB, db, nil,
 				request.ChatGroupUUID, user.Username, "", r)
 			if err != nil {
@@ -553,9 +584,17 @@ func (db *GoDB) handleFilesGetFromChat(mainDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
 		}
+		// Prepare index query
+		index := map[string]string{"chatID": chatID}
+		// Are we filtering files of a specific type?
+		typeQuery := r.URL.Query().Get("type")
+		if typeQuery == "emote" {
+			index = map[string]string{"chatID-type": fmt.Sprintf("%s;%s;", chatID, "emote")}
+		}
+		// Prepare response
 		files := &FileList{Files: make([]*FileMetaEntry, 0)}
 		// Retrieve all files
-		respFiles, err := db.Select(FileDB, map[string]string{"chatID": chatID}, nil)
+		respFiles, err := db.Select(FileDB, index, nil)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
