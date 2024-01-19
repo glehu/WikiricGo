@@ -1272,11 +1272,9 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Retrieve all Wisdom entries of specified type (if provided)
-		typeQuery := request.Type
-		if typeQuery == ".*" || typeQuery == "." {
-			typeQuery = ""
+		if request.Type == ".*" || request.Type == "." {
+			request.Type = ""
 		}
-		ixQuery := fmt.Sprintf("%s;%s", knowledgeID, typeQuery)
 		// Options?
 		options := r.Context().Value("pagination").(*SelectOptions)
 		if request.MaxResults > 0 {
@@ -1286,7 +1284,7 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 			options.MaxResults = -1
 		}
 		resp, err := db.Select(WisdomDB, map[string]string{
-			"knowledgeID-type": ixQuery,
+			"knowledgeID-type": fmt.Sprintf("%s;%s", knowledgeID, request.Type),
 		}, options)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -1335,9 +1333,15 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 					}
 				}
 			}
-			// Flip boolean on each iteration
-			b = !b
-			accuracy, points = GetWisdomQueryPoints(wisdom, request, p, words, b)
+			// Check if wisdom fits the search criteria
+			if request.Query == "." || request.Query == ".*" {
+				accuracy = 1
+				points = 1
+			} else {
+				// Flip boolean on each iteration
+				b = !b
+				accuracy, points = GetWisdomQueryPoints(wisdom, request, p, words, b)
+			}
 			if points <= 0.0 {
 				continue
 			}

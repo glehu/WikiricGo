@@ -13,6 +13,7 @@ import (
 	"github.com/tidwall/btree"
 	"net/http"
 	"nhooyr.io/websocket"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -288,20 +289,24 @@ func (server *ChatServer) handleIncomingMessage(
 	uUID := ""
 	skipSave := false
 	skipDist := false
-	// [c:SC] is a prefix marking the message as pass through only without saving it
 	if len(text) >= 6 && text[0:6] == "[c:SC]" {
+		// [c:SC] is a prefix marking the message as pass through only without saving it
 		skipSave = true
-	}
-	// Command messages will also not be saved
-	if len(text) >= 13 && text[0:13] == "[c:EDIT<JSON]" {
+	} else if len(text) >= 13 && text[0:13] == "[c:EDIT<JSON]" {
+		// Command messages will also not be saved
 		skipSave = true
 		skipDist = true
 		server.handleEditMessage(s, text[13:], rapidDB)
-	}
-	if len(text) >= 14 && text[0:14] == "[c:REACT<JSON]" {
+	} else if len(text) >= 14 && text[0:14] == "[c:REACT<JSON]" {
+		// Message Reaction
 		skipSave = true
 		skipDist = true
 		server.handleReactMessage(s, text[14:], rapidDB)
+	} else if len(text) >= 7 && text[0:7] == "[c:CMD]" {
+		// Command Message
+		skipSave = true
+		skipDist = true
+		server.handleCommandMessage(s, text[7:], rapidDB, mainDB)
 	}
 	if !skipSave {
 		jsonEntry, err := json.Marshal(msg)
@@ -567,6 +572,61 @@ func (server *ChatServer) handleReactMessage(s *Session, text string, rapidDB *G
 			return
 		}
 	}
+}
+
+func (server *ChatServer) handleCommandMessage(s *Session, text string, rapidDB, mainDB *GoDB) {
+	if text == "/leaderboard" {
+		server.handleCommandLeaderboard(s, text, rapidDB, mainDB)
+	}
+}
+
+func (server *ChatServer) handleCommandLeaderboard(s *Session, text string, rapidDB, mainDB *GoDB) {
+	// Retrieve all messages and count them + check reactions
+	distributions := make([]*MessageDistribution, 0)
+	chatID := s.ChatParentID
+	if chatID == "" {
+		chatID = s.ChatMember.ChatGroupUUID
+	}
+	dist := rapidDB.GetChatMessageDistribution(s.ChatMember, mainDB, chatID)
+	if dist != nil {
+		distributions = append(distributions, dist)
+	}
+	// Acquire distribution for all channels if there are channels
+	if dist.Subchatrooms != nil && len(dist.Subchatrooms) > 0 {
+		for _, sub := range dist.Subchatrooms {
+			dist = rapidDB.GetChatMessageDistribution(s.ChatMember, mainDB, sub.UUID)
+			if dist != nil {
+				distributions = append(distributions, dist)
+			}
+		}
+	}
+	// Let the server send the distribution as a formatted message
+	sb := strings.Builder{}
+	sb.WriteString("# Leaderboard\n\n")
+	sb.WriteString("This list displays the current ranking of this group's members including all channels.\n\n---\n\n")
+	for i, d := range distributions {
+		if i > 0 {
+			sb.WriteString("---\n\n")
+		}
+		sb.WriteString(fmt.Sprintf("## %s\n\n", d.Name))
+		for j, c := range d.Contributors {
+			sb.WriteString(fmt.Sprintf("### %d. %s\n\nMessages: %d\n\n", j+1, c.Username, c.Count))
+		}
+	}
+	// Construct response
+	response := &ChatMessageContainer{
+		ChatMessage: &ChatMessage{
+			ChatGroupUUID: s.ChatMember.ChatGroupUUID,
+			Text:          sb.String(),
+			Username:      "_server",
+			TimeCreated:   TimeNowIsoString(),
+			WasEdited:     false,
+			AnalyticsUUID: "",
+		},
+		Analytics: nil,
+		UUID:      "",
+	}
+	server.DistributeChatMessageJSON(response)
 }
 
 func (server *ChatServer) DistributeFCMMessage(s *Session, msg *ChatMessage, fcmClient *messaging.Client,

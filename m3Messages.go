@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -40,6 +41,17 @@ type ChatMessagesResponse struct {
 type ChatActionMessage struct {
 	*ChatMessageContainer
 	Action string `json:"action"`
+}
+
+type MessageDistribution struct {
+	*ChatGroupEntry `json:"channel"`
+	Count           int64                 `json:"count"`
+	Contributors    []*MessageContributor `json:"contributors"`
+}
+
+type MessageContributor struct {
+	Username string `json:"usr"`
+	Count    int64  `json:"count"`
 }
 
 func (db *GoDB) ProtectedChatMessagesEndpoints(
@@ -522,4 +534,61 @@ func (db *GoDB) handleChatMessageReaction(
 			}
 		}
 	}
+}
+
+func (db *GoDB) GetChatMessageDistribution(chatMember *ChatMember, mainDB *GoDB, chatID string) *MessageDistribution {
+	chatGroup, err := mainDB.ReadChatGroup(chatID)
+	if err != nil {
+		return nil
+	}
+	canRead := CheckWriteRights(chatMember, chatGroup.ChatGroup)
+	if !canRead {
+		return nil
+	}
+	// Retrieve messages from this chat group
+	resp, err := db.Select(MessageDB, map[string]string{
+		"chatID": chatID,
+	}, nil)
+	if err != nil {
+		return nil
+	}
+	response := <-resp
+	if len(response) < 1 {
+		return nil
+	}
+	dist := &MessageDistribution{
+		ChatGroupEntry: chatGroup,
+		Count:          0,
+		Contributors:   make([]*MessageContributor, 0),
+	}
+	contributors := map[string]int64{}
+	for _, result := range response {
+		msg := &ChatMessage{}
+		err = json.Unmarshal(result.Data, msg)
+		if err != nil {
+			continue
+		}
+		// Increment counter
+		dist.Count += 1
+		// Did we see this msg's user yet?
+		if _, ok := contributors[msg.Username]; ok {
+			contributors[msg.Username] += 1
+		} else {
+			contributors[msg.Username] = 1
+		}
+	}
+	// Attach contributors to response
+	for usr, cnt := range contributors {
+		dist.Contributors = append(dist.Contributors, &MessageContributor{
+			Username: usr,
+			Count:    cnt,
+		})
+	}
+	// Sort by count
+	sort.SliceStable(
+		dist.Contributors, func(i, j int) bool {
+			return dist.Contributors[i].Count > dist.Contributors[j].Count
+		},
+	)
+	return dist
 }
