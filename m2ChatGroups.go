@@ -589,6 +589,10 @@ func ReadChatGroupAndMember(
 		ChatGroup: chatGroupOriginal,
 		UUID:      dataOriginal.uUID,
 	}
+	// Prepare main chat group entry
+	// If there is no main entry (this happens when we are requesting a main entry
+	// ... since it will be the original entry instead)
+	// ... we will simply use the original (the main one) chat group
 	var chatGroupMainEntry *ChatGroupEntry
 	if dataMain != nil {
 		chatGroupMainEntry = &ChatGroupEntry{
@@ -748,7 +752,18 @@ func (db *GoDB) handleChatMemberRoleModification() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		// TODO: Check if calling user is member and has at least one role higher than the user about to be modified
+		// Check rights of user before attempting to modify the role
+		_, chatMemberRequest, mainChatroom, err := ReadChatGroupAndMember(
+			db, nil, nil, chatID, user.Username, "", r)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		userRoleRequest := chatMemberRequest.GetRoleInformation(mainChatroom.ChatGroup)
+		if !userRoleRequest.IsAdmin {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
 		// Check if the role should be deleted
 		doDeleteTmp := r.URL.Query().Get("del")
 		doDelete := false
