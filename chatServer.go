@@ -125,7 +125,12 @@ func (server *ChatServer) handleChatEndpoint(
 		password := r.URL.Query().Get("pw")
 		chatGroup, chatMember, _, err := ReadChatGroupAndMember(
 			mainDB, rapidDB, connector, chatID, username, password, r)
-		if chatMember == nil || err != nil {
+		if chatMember == nil || err != nil || chatMember.IsBanned {
+			err = c.Write(
+				ctx,
+				1, // 1=Text
+				[]byte("[s:banned]"),
+			)
 			_ = c.Close(
 				http.StatusForbidden,
 				http.StatusText(http.StatusForbidden),
@@ -591,26 +596,44 @@ func (server *ChatServer) handleCommandLeaderboard(s *Session, text string, rapi
 	if dist != nil {
 		distributions = append(distributions, dist)
 	}
+	totalChannels := 1
 	// Acquire distribution for all channels if there are channels
 	if dist.Subchatrooms != nil && len(dist.Subchatrooms) > 0 {
 		for _, sub := range dist.Subchatrooms {
 			dist = rapidDB.GetChatMessageDistribution(s.ChatMember, mainDB, sub.UUID)
 			if dist != nil {
+				totalChannels += 1
 				distributions = append(distributions, dist)
 			}
 		}
 	}
+	// Process
+	totalMessages := int64(0)
+	totalReactions := int64(0)
+	for _, d := range distributions {
+		totalMessages += d.Count
+		totalReactions += d.Reactions
+	}
 	// Let the server send the distribution as a formatted message
 	sb := strings.Builder{}
 	sb.WriteString("# Leaderboard\n\n")
-	sb.WriteString("This list displays the current ranking of this group's members including all channels.\n\n---\n\n")
+	sb.WriteString(fmt.Sprintf(
+		"Across %d channels, a total of %d messages and %d reactions have been sent!\n\n---\n\n",
+		totalChannels, totalMessages, totalReactions))
+	sb.WriteString(
+		"The following list displays the current ranking of this group's members including all channels:\n\n")
 	for i, d := range distributions {
 		if i > 0 {
 			sb.WriteString("---\n\n")
 		}
 		sb.WriteString(fmt.Sprintf("## %s\n\n", d.Name))
+		sb.WriteString(fmt.Sprintf(
+			"A total of %d messages and %d reactions have been sent between %d people!\n\n",
+			d.Count, d.Reactions, len(d.Contributors)))
 		for j, c := range d.Contributors {
-			sb.WriteString(fmt.Sprintf("### %d. %s\n\nMessages: %d\n\n", j+1, c.Username, c.Count))
+			sb.WriteString(fmt.Sprintf(
+				"### %d. %s\n\nMessages: %d  \nReactions: %d\n\n",
+				j+1, c.Username, c.Count, c.Reactions))
 		}
 	}
 	// Construct response

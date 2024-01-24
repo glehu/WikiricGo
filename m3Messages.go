@@ -46,12 +46,14 @@ type ChatActionMessage struct {
 type MessageDistribution struct {
 	*ChatGroupEntry `json:"channel"`
 	Count           int64                 `json:"count"`
+	Reactions       int64                 `json:"reacts"`
 	Contributors    []*MessageContributor `json:"contributors"`
 }
 
 type MessageContributor struct {
-	Username string `json:"usr"`
-	Count    int64  `json:"count"`
+	Username  string `json:"usr"`
+	Count     int64  `json:"count"`
+	Reactions int64  `json:"reacts"`
 }
 
 func (db *GoDB) ProtectedChatMessagesEndpoints(
@@ -562,14 +564,38 @@ func (db *GoDB) GetChatMessageDistribution(chatMember *ChatMember, mainDB *GoDB,
 		Contributors:   make([]*MessageContributor, 0),
 	}
 	contributors := map[string]int64{}
+	reactors := map[string]int64{}
 	for _, result := range response {
 		msg := &ChatMessage{}
 		err = json.Unmarshal(result.Data, msg)
 		if err != nil {
 			continue
 		}
-		// Increment counter
+		// Retrieve analytics
+		analytics := &Analytics{}
+		if msg.AnalyticsUUID != "" {
+			anaBytes, ok := db.Read(AnaDB, msg.AnalyticsUUID)
+			if ok {
+				err = json.Unmarshal(anaBytes.Data, analytics)
+				if err != nil {
+					analytics = &Analytics{}
+				}
+			}
+		}
+		// Increment counters
 		dist.Count += 1
+		dist.Reactions += int64(len(analytics.Reactions))
+		// Process reactions
+		for _, reaction := range analytics.Reactions {
+			for _, usr := range reaction.Usernames {
+				// Did we see this reaction's user yet?
+				if _, ok := reactors[usr]; ok {
+					reactors[usr] += 1
+				} else {
+					reactors[usr] = 1
+				}
+			}
+		}
 		// Did we see this msg's user yet?
 		if _, ok := contributors[msg.Username]; ok {
 			contributors[msg.Username] += 1
@@ -580,8 +606,9 @@ func (db *GoDB) GetChatMessageDistribution(chatMember *ChatMember, mainDB *GoDB,
 	// Attach contributors to response
 	for usr, cnt := range contributors {
 		dist.Contributors = append(dist.Contributors, &MessageContributor{
-			Username: usr,
-			Count:    cnt,
+			Username:  usr,
+			Count:     cnt,
+			Reactions: reactors[usr],
 		})
 	}
 	// Sort by count

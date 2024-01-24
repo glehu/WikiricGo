@@ -109,6 +109,7 @@ func (db *GoDB) ProtectedChatGroupEndpoints(r chi.Router, tokenAuth *jwtauth.JWT
 			r.Get("/members/{chatID}", db.handleChatGroupGetMembers())
 			r.Get("/friends", db.handleGetFriends(rapidDB))
 			r.Get("/active/{chatID}", db.handleChatGroupGetActiveMembers(chatServer))
+			r.Get("/ban/{chatID}", db.handleChatGroupBanMember())
 		})
 		// Self Actions
 		r.Route("/self", func(r chi.Router) {
@@ -609,6 +610,9 @@ func ReadChatGroupAndMember(
 
 func CheckWriteRights(user *ChatMember, chatGroup *ChatGroup) bool {
 	hasRight := false
+	if user.IsBanned {
+		return false
+	}
 	for _, role := range chatGroup.RulesWrite {
 		for _, usrRole := range user.Roles {
 			if usrRole == role {
@@ -625,6 +629,9 @@ func CheckWriteRights(user *ChatMember, chatGroup *ChatGroup) bool {
 
 func CheckReadRights(user *ChatMember, chatGroup *ChatGroup) bool {
 	hasRight := false
+	if user.IsBanned {
+		return false
+	}
 	for _, role := range chatGroup.RulesRead {
 		for _, usrRole := range user.Roles {
 			if usrRole == role {
@@ -799,6 +806,67 @@ func (db *GoDB) handleChatMemberRoleModification() http.HandlerFunc {
 	}
 }
 
+func (db *GoDB) handleChatGroupBanMember() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		chatID := chi.URLParam(r, "chatID")
+		if chatID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Check what user is being targeted
+		userQuery := r.URL.Query().Get("usr")
+		usernameTarget := ""
+		if userQuery != "" {
+			// Prevent user from banning himself
+			if userQuery != user.Username {
+				usernameTarget = userQuery
+			}
+		}
+		if usernameTarget == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve target chat member
+		_, chatMember, mainChatGroup, err := ReadChatGroupAndMember(
+			db, nil, nil, chatID, usernameTarget, "", r)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Retrieve user chat member
+		_, chatMemberUser, _, err := ReadChatGroupAndMember(
+			db, nil, nil, chatID, user.Username, "", r)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Is user authorized to ban?
+		userRole := chatMemberUser.GetRoleInformation(mainChatGroup.ChatGroup)
+		if !userRole.IsAdmin {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Ban member
+		chatMember.IsBanned = true
+		// Update member entry
+		_, txn := db.Get(MemberDB, chatMember.UUID)
+		defer txn.Discard()
+		jsonEntry, err := json.Marshal(chatMember)
+		err = db.Update(MemberDB, txn, chatMember.UUID, jsonEntry, map[string]string{
+			"chat-usr": fmt.Sprintf("%s;%s;", chatID, chatMember.Username)},
+		)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+	}
+}
+
 func (db *GoDB) handleChatGroupGetMembers() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		chatID := chi.URLParam(r, "chatID")
@@ -841,13 +909,13 @@ func (db *GoDB) handleChatGroupGetMembers() http.HandlerFunc {
 			return
 		}
 		members := ChatMemberList{
-			ChatMembers: make([]*ChatMember, len(responseMember)),
+			ChatMembers: make([]*ChatMember, 0),
 		}
-		for i, entry := range responseMember {
+		for _, entry := range responseMember {
 			chatMember := &ChatMember{}
 			err = json.Unmarshal(entry.Data, chatMember)
-			if err == nil {
-				members.ChatMembers[i] = chatMember
+			if err == nil && !chatMember.IsBanned {
+				members.ChatMembers = append(members.ChatMembers, chatMember)
 			}
 		}
 		if len(members.ChatMembers) < 1 {

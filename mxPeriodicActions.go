@@ -83,15 +83,31 @@ func (db *GoDB) StartPeriodicLoop(
 func (db *GoDB) tickLoop(
 	ticker *time.Ticker, done chan bool, dbList *Databases, connector *Connector, fcmClient *messaging.Client,
 ) {
+	// The hour counter decrements once per minute until it reaches 0
+	hourCounter := 60
 	for {
 		select {
 		case <-done:
 			fmt.Println(":: Periodic Loop Stopped")
 			return
 		case <-ticker.C:
+			hourCounter -= 1
 			go db.triggerActions(dbList, connector, fcmClient)
+			// Trigger hourly actions here
+			if hourCounter == 0 {
+				hourCounter = 60
+				// Garbage collect the database value log every hour
+				go gcDatabases(dbList)
+			}
 		}
 	}
+}
+
+func gcDatabases(dbList *Databases) {
+	fmt.Println(":: GC DB: START " + TimeNowIsoString())
+	_ = dbList.Map["main"].db.RunValueLogGC(0.5)
+	_ = dbList.Map["rapid"].db.RunValueLogGC(0.5)
+	fmt.Println(":: GC DB: DONE  " + TimeNowIsoString())
 }
 
 func (db *GoDB) triggerActions(dbList *Databases, connector *Connector, fcmClient *messaging.Client) {

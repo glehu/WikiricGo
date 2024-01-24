@@ -30,6 +30,7 @@ type ChatMember struct {
 	BannerAnimatedURL    string   `json:"burla"`
 	FCMToken             string   `json:"fcm"`
 	DateCreated          string   `json:"ts"`
+	IsBanned             bool     `json:"banned"`
 }
 
 func (member *ChatMember) GetRoleInformation(group *ChatGroup) *ChatRole {
