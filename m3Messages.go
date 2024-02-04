@@ -127,7 +127,7 @@ func (db *GoDB) handleChatMessageCreate(chatServer *ChatServer, mainDB *GoDB) ht
 		go chatServer.DistributeChatMessageJSON(&ChatMessageContainer{
 			ChatMessage: request,
 			UUID:        uUID,
-		})
+		}, false)
 	}
 }
 

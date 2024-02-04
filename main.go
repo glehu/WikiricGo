@@ -51,10 +51,10 @@ func main() {
 	dbList.Map["main"] = OpenDB("main")
 	// The rapid database will store data being subject to rapid and frequent changes
 	dbList.Map["rapid"] = OpenDB("rapid")
-	// Chat Server
-	chatServer := CreateChatServer(dbList.Map["rapid"])
 	// Connector
 	connector := CreateConnector(dbList.Map["rapid"])
+	// Chat Server
+	chatServer := CreateChatServer(dbList.Map["rapid"], dbList.Map["main"], connector)
 	// #### Firebase Cloud Messaging
 	fmt.Println(":: Checking for fbcm.json")
 	var fcmClient *messaging.Client

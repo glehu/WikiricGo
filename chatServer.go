@@ -30,12 +30,24 @@ type Session struct {
 	ChatParentID string
 }
 
+type CacheEntry struct {
+	LastCheck time.Time
+	Usernames []string
+}
+
 type ChatServer struct {
-	ChatGroupsMu        *sync.RWMutex
-	ChatGroups          *btree.Map[string, map[string]*Session]
-	tokenAuth           *jwtauth.JWTAuth
+	ChatGroupsMu *sync.RWMutex
+	// Map of ChatGroupUUID as key and map of ChatMemberUsername and Session as value
+	ChatGroups *btree.Map[string, map[string]*Session]
+	CacheMu    *sync.RWMutex
+	// Map of MainChatGroupUUID as key and CacheEntry as value
+	Cache     *btree.Map[string, *CacheEntry]
+	tokenAuth *jwtauth.JWTAuth
+	// ChatMessageDB
 	DB                  *GoDB
+	MainDB              *GoDB
 	NotificationCounter *atomic.Int64
+	Connector           *Connector
 }
 
 type MessageResponse struct {
@@ -53,12 +65,16 @@ type ReactionMessage struct {
 	Reaction  string `json:"type"`
 }
 
-func CreateChatServer(db *GoDB) *ChatServer {
+func CreateChatServer(db, mainDB *GoDB, connector *Connector) *ChatServer {
 	server := &ChatServer{
 		ChatGroupsMu:        &sync.RWMutex{},
 		ChatGroups:          btree.NewMap[string, map[string]*Session](3),
+		CacheMu:             &sync.RWMutex{},
+		Cache:               btree.NewMap[string, *CacheEntry](3),
 		DB:                  db,
+		MainDB:              mainDB,
 		NotificationCounter: &atomic.Int64{},
+		Connector:           connector,
 	}
 	return server
 }
@@ -269,6 +285,10 @@ func (server *ChatServer) dropConnection(s *Session) {
 		// Are there any connections left? If not, then delete the chat session
 		if len(sessions) < 1 {
 			server.ChatGroups.Delete(s.ChatMember.ChatGroupUUID)
+			// Also remove chat session from the cache
+			server.CacheMu.Lock()
+			server.Cache.Delete(s.ChatMember.ChatGroupUUID)
+			server.CacheMu.Unlock()
 		} else {
 			server.ChatGroups.Set(s.ChatMember.ChatGroupUUID, sessions)
 		}
@@ -328,19 +348,104 @@ func (server *ChatServer) handleIncomingMessage(
 		go server.DistributeChatMessageJSON(&ChatMessageContainer{
 			ChatMessage: msg,
 			UUID:        uUID,
-		})
+		}, skipSave)
 	}
 }
 
-func (server *ChatServer) DistributeChatMessageJSON(msg *ChatMessageContainer) {
+func (server *ChatServer) DistributeChatMessageJSON(msg *ChatMessageContainer, skipConnector bool) {
+	// Distribute chat message to all members of this channel
 	server.ChatGroupsMu.RLock()
 	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
 	server.ChatGroupsMu.RUnlock()
+	mainChatUUID := ""
 	if ok {
 		for _, value := range sessions {
+			if mainChatUUID == "" {
+				mainChatUUID = value.ChatMember.ChatGroupUUID
+			}
 			_ = WSSendJSON(value.Conn, value.Ctx, msg) // TODO: Drop connection?
 		}
 	}
+	// Send connector messages to all users (e.g. for user tagging)
+	if mainChatUUID == "" || skipConnector {
+		return
+	}
+	server.NotifyChatMembers(mainChatUUID, msg)
+}
+
+func (server *ChatServer) NotifyChatMembers(chatID string, msg *ChatMessageContainer) {
+	// Check if the members of this chat group exist in the cache yet
+	server.CacheMu.RLock()
+	cacheEntry, ok := server.Cache.Get(chatID)
+	server.CacheMu.RUnlock()
+	if !ok {
+		// Add to map
+		server.setCache(chatID)
+		server.CacheMu.RLock()
+		cacheEntry, ok = server.Cache.Get(chatID)
+		server.CacheMu.RUnlock()
+	} else {
+		// Check if we need to update
+		delta := time.Since(cacheEntry.LastCheck)
+		if delta.Minutes() > 1 {
+			// Update map
+			server.setCache(chatID)
+			server.CacheMu.RLock()
+			cacheEntry, ok = server.Cache.Get(chatID)
+			server.CacheMu.RUnlock()
+		}
+	}
+	// Notify all users
+	cMsg := &ConnectorMsg{
+		Type:          "[s:chat]",
+		Action:        "mark",
+		ReferenceUUID: msg.ChatGroupUUID,
+		Username:      msg.Username,
+		Message:       "",
+	}
+	for _, username := range cacheEntry.Usernames {
+		// Do not notify sender
+		if username == msg.Username {
+			continue
+		}
+		server.Connector.SessionsMu.RLock()
+		user, ok := server.Connector.Sessions.Get(username)
+		server.Connector.SessionsMu.RUnlock()
+		if !ok {
+			continue
+		}
+		_ = WSSendJSON(user.Conn, user.Ctx, cMsg) // TODO: Drop connection?
+	}
+}
+
+func (server *ChatServer) setCache(chatUUID string) bool {
+	// Retrieve usernames of all chat members
+	members := server.MainDB.GetChatGroupMembers(chatUUID)
+	if members == nil || len(members.ChatMembers) < 1 {
+		return false
+	}
+	// Pre-allocate username slice
+	usernames := make([]string, len(members.ChatMembers))
+	for i, member := range members.ChatMembers {
+		usernames[i] = member.Username
+	}
+	// Retrieve current cache
+	server.CacheMu.RLock()
+	cacheEntry, ok := server.Cache.Get(chatUUID)
+	server.CacheMu.RUnlock()
+	if !ok {
+		// Set usernames
+		server.CacheMu.Lock()
+		server.Cache.Set(chatUUID, &CacheEntry{
+			LastCheck: time.Time{},
+			Usernames: usernames,
+		})
+		server.CacheMu.Unlock()
+		return true
+	}
+	// Replace usernames
+	cacheEntry.Usernames = usernames
+	return true
 }
 
 func (server *ChatServer) DistributeChatActionMessageJSON(msg *ChatActionMessage) {
@@ -649,7 +754,7 @@ func (server *ChatServer) handleCommandLeaderboard(s *Session, text string, rapi
 		Analytics: nil,
 		UUID:      "",
 	}
-	server.DistributeChatMessageJSON(response)
+	server.DistributeChatMessageJSON(response, true)
 }
 
 func (server *ChatServer) DistributeFCMMessage(s *Session, msg *ChatMessage, fcmClient *messaging.Client,
@@ -679,12 +784,12 @@ func (server *ChatServer) DistributeFCMMessage(s *Session, msg *ChatMessage, fcm
 		return
 	}
 	// Retrieve connected users (we may not notify those under specific circumstances)
-	server.ChatGroupsMu.RLock()
-	sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
-	server.ChatGroupsMu.RUnlock()
-	if !ok {
-		return
-	}
+	// server.ChatGroupsMu.RLock()
+	// sessions, ok := server.ChatGroups.Get(msg.ChatGroupUUID)
+	// server.ChatGroupsMu.RUnlock()
+	// if !ok {
+	//   return
+	// }
 	// Check what members we are going to notify
 	var chatMember *ChatMember
 	tokens := make([]string, 0)
@@ -697,10 +802,10 @@ func (server *ChatServer) DistributeFCMMessage(s *Session, msg *ChatMessage, fcm
 			continue
 		}
 		// Is this member currently connected to this chat group?
-		if sessions[chatMember.Username] != nil {
-			// TODO: Check if this member is inactive (maybe?)
-			continue
-		}
+		// TODO: Check if this member is inactive (maybe?)
+		// if sessions[chatMember.Username] != nil {
+		//   continue
+		// }
 		// Append token as we are going to notify this member
 		tokens = append(tokens, chatMember.FCMToken)
 		i += 1

@@ -85,7 +85,7 @@ func (db *GoDB) ProtectedFileEndpoints(
 		// ###########
 		r.Get("/meta/{fileID}", db.handleFileMetaGet(mainDB))
 		r.Get("/chat/{chatID}", db.handleFilesGetFromChat(mainDB))
-		r.Get("/delete/{fileID}", db.handleFileDelete())
+		r.Get("/delete/{fileID}", db.handleFileDelete(mainDB))
 	})
 }
 
@@ -624,7 +624,7 @@ func (db *GoDB) handleFilesGetFromChat(mainDB *GoDB) http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handleFileDelete() http.HandlerFunc {
+func (db *GoDB) handleFileDelete(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -648,8 +648,23 @@ func (db *GoDB) handleFileDelete() http.HandlerFunc {
 			return
 		}
 		if fileMeta.Username != user.Username {
-			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
-			return
+			// Check if user is an admin before cancelling
+			isAdmin := false
+			if fileMeta.ChatGroupUUID != "" {
+				chatGroup, chatMember, _, err := ReadChatGroupAndMember(
+					mainDB, db, nil,
+					fileMeta.ChatGroupUUID, user.Username, "", r)
+				if err != nil {
+					http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+					return
+				}
+				role := chatMember.GetRoleInformation(chatGroup.ChatGroup)
+				isAdmin = role.IsAdmin
+			}
+			if !isAdmin {
+				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+				return
+			}
 		}
 		err = db.Delete(FileDB, fileID, []string{"chatID"})
 		if err != nil {

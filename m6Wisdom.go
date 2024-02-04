@@ -1201,6 +1201,8 @@ func (db *GoDB) handleWisdomGetTasks(mainDB *GoDB) http.HandlerFunc {
 		}
 		// For each box get all tasks (Wisdom with type task) TODO: Make asynchronous
 		var task *Wisdom
+		var replies []*WisdomContainer
+		var hasMoreReplies bool
 		for bi, boxCon := range boxes.Boxes {
 			respTask, err := db.Select(WisdomDB, map[string]string{
 				"refID-state": boxCon.Box.UUID + stateFilter,
@@ -1229,10 +1231,15 @@ func (db *GoDB) handleWisdomGetTasks(mainDB *GoDB) http.HandlerFunc {
 						}
 					}
 				}
+				// Get recent replies
+				replies, hasMoreReplies = db.RetrieveWisdomReplies(task, taskEntry.uUID, 3)
+				// Append to results
 				boxes.Boxes[bi].Tasks = append(boxes.Boxes[bi].Tasks, &WisdomContainer{
-					UUID:      taskEntry.uUID,
-					Wisdom:    task,
-					Analytics: analytics,
+					UUID:           taskEntry.uUID,
+					Wisdom:         task,
+					Analytics:      analytics,
+					Replies:        replies,
+					HasMoreReplies: hasMoreReplies,
 				})
 			}
 			sort.SliceStable(

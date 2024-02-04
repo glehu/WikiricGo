@@ -889,56 +889,63 @@ func (db *GoDB) handleChatGroupGetMembers() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		// Check if we're targeting a sub chat since only main chat rooms have members technically
-		dataOriginal, ok := db.Read(GroupDB, chatID)
-		if !ok {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		}
-		// Retrieve chat group from database
-		chatGroupOriginal := &ChatGroup{}
-		err := json.Unmarshal(
-			dataOriginal.Data,
-			chatGroupOriginal,
-		)
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		}
-		if chatGroupOriginal.ParentUUID != "" {
-			// Change chatID to parent
-			chatID = chatGroupOriginal.ParentUUID
-		}
-		// Retrieve chat members
-		query := FIndex(chatID)
-		resp, err := db.Select(MemberDB,
-			map[string]string{
-				"chat-usr": query,
-			}, nil,
-		)
-		if err != nil {
+		members := db.GetChatGroupMembers(chatID)
+		if members == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
-		}
-		responseMember := <-resp
-		if len(responseMember) < 1 {
-			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
-			return
-		}
-		members := ChatMemberList{
-			ChatMembers: make([]*ChatMember, 0),
-		}
-		for _, entry := range responseMember {
-			chatMember := &ChatMember{}
-			err = json.Unmarshal(entry.Data, chatMember)
-			if err == nil && !chatMember.IsBanned {
-				members.ChatMembers = append(members.ChatMembers, chatMember)
-			}
 		}
 		if len(members.ChatMembers) < 1 {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
-		render.JSON(w, r, members)
+		render.JSON(w, r, *members)
 	}
+}
+
+func (db *GoDB) GetChatGroupMembers(chatID string) *ChatMemberList {
+	// Check if we're targeting a sub chat since only main chat rooms have members technically
+	dataOriginal, ok := db.Read(GroupDB, chatID)
+	if !ok {
+		return nil
+	}
+	// Retrieve chat group from database
+	chatGroupOriginal := &ChatGroup{}
+	err := json.Unmarshal(
+		dataOriginal.Data,
+		chatGroupOriginal,
+	)
+	if err != nil {
+		return nil
+	}
+	if chatGroupOriginal.ParentUUID != "" {
+		// Change chatID to parent
+		chatID = chatGroupOriginal.ParentUUID
+	}
+	// Retrieve chat members
+	query := FIndex(chatID)
+	resp, err := db.Select(MemberDB,
+		map[string]string{
+			"chat-usr": query,
+		}, nil,
+	)
+	if err != nil {
+		return nil
+	}
+	responseMember := <-resp
+	if len(responseMember) < 1 {
+		return nil
+	}
+	members := ChatMemberList{
+		ChatMembers: make([]*ChatMember, 0),
+	}
+	for _, entry := range responseMember {
+		chatMember := &ChatMember{}
+		err = json.Unmarshal(entry.Data, chatMember)
+		if err == nil && !chatMember.IsBanned {
+			members.ChatMembers = append(members.ChatMembers, chatMember)
+		}
+	}
+	return &members
 }
 
 func notifyFriendRequestAccept(refUsername string, user *User,

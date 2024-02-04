@@ -6,6 +6,10 @@ func TimeNowIsoString() string {
 	return TimeToIsoString(time.Now().UTC())
 }
 
+func TimeNowUnix() int64 {
+	return time.Now().UnixMilli()
+}
+
 // TimeToIsoString returns the ISO date time string for the provided time.Time
 //
 // Example date time:

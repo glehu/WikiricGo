@@ -148,6 +148,13 @@ func (db *GoDB) notifyStatusChange(connector *Connector, username string, status
 	var sesh *CSession
 	var ok bool
 	var chatMember *ChatMember
+	cMsg := &ConnectorMsg{
+		Type:          "[s:ustat]",
+		Action:        "update",
+		ReferenceUUID: "",
+		Username:      username,
+		Message:       status,
+	}
 	for _, entry := range response {
 		chatMember = &ChatMember{}
 		err = json.Unmarshal(entry.Data, chatMember)
@@ -155,13 +162,7 @@ func (db *GoDB) notifyStatusChange(connector *Connector, username string, status
 			// Check if friend is online by checking his connector session
 			sesh, ok = connector.Sessions.Get(chatMember.Username)
 			if ok {
-				_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
-					Type:          "[s:ustat]",
-					Action:        "update",
-					ReferenceUUID: "",
-					Username:      username,
-					Message:       status,
-				})
+				_ = WSSendJSON(sesh.Conn, sesh.Ctx, cMsg)
 			}
 		}
 	}
