@@ -21,20 +21,20 @@ type Sandbox struct {
 }
 
 type SandboxElement struct {
-	UUID          string `json:"uuid"`
-	Name          string `json:"t"`
-	Type          string `json:"type"`
-	Username      string `json:"usr"`
-	Description   string `json:"desc"`
-	TimeCreated   string `json:"ts"`
-	ReferenceUUID string `json:"ref"`
-	ParentUUID    string `json:"pid"`
-	AnalyticsUUID string `json:"ana"` // Views, likes etc. will be stored in a separate database
-	PosX          int64  `json:"x"`
-	PosY          int64  `json:"y"`
-	Width         int64  `json:"w"`
-	Height        int64  `json:"h"`
-	Hide          bool   `json:"hide"`
+	UUID          string  `json:"uuid"`
+	Name          string  `json:"t"`
+	Type          string  `json:"type"`
+	Username      string  `json:"usr"`
+	Description   string  `json:"desc"`
+	TimeCreated   string  `json:"ts"`
+	ReferenceUUID string  `json:"ref"`
+	ParentUUID    string  `json:"pid"`
+	AnalyticsUUID string  `json:"ana"` // Views, likes etc. will be stored in a separate database
+	PosX          float64 `json:"x"`
+	PosY          float64 `json:"y"`
+	Width         float64 `json:"w"`
+	Height        float64 `json:"h"`
+	Hide          bool    `json:"hide"`
 }
 
 type SandboxEntry struct {
