@@ -88,11 +88,12 @@ func main() {
 	}
 	// #### Start Server (with wait group delta)
 	wg.Add(1)
-	go StartServer(doneServer, &wg, config, dbList, chatServer, connector, fcmClient, emailClient)
+	go StartServer(doneServer, donePeriodic, &wg, config, dbList, chatServer, connector, fcmClient, emailClient)
 	// #### Start periodic actions loop
 	dbList.Map["rapid"].StartPeriodicLoop(donePeriodic, dbList, connector, fcmClient)
 	// #### Wait for all processes to end
 	wg.Wait()
+	fmt.Println(":: wikiric process has terminated. Goodbye!")
 }
 
 func getConfig() (Config, error) {

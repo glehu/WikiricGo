@@ -29,14 +29,16 @@ const REALM = "Access to the '/' path"
 var tokenAuth *jwtauth.JWTAuth
 
 var cs chan bool
+var donePeriodic chan bool
 
-func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
+func StartServer(_cs, _donePeriodic chan bool, wg *sync.WaitGroup, config Config,
 	dbList *Databases, chatServer *ChatServer, connector *Connector,
 	fcmClient *messaging.Client, emailClient *EmailClient,
 ) {
 	startTime := time.Now()
 	fmt.Println(":: INIT SERVER")
 	cs = _cs
+	donePeriodic = _donePeriodic
 	// Initialize JWT Authenticator
 	setupJWTAuth(config)
 	// Are we using HTTPS or not?
@@ -69,7 +71,9 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
 	setBasicProtectedRoutes(r, dbList.Map["main"])
 	// Routes -> JWT Bearer Auth
 	setJWTProtectedRoutes(r, dbList, chatServer, connector)
-	// PWA (Progressive Web App)
+	// V2 PWA (Quasar Progressive Web App)
+	quasarVueJSWikiricEndpoint(r)
+	// V1 PWA (Progressive Web App)
 	vueJSWikiricEndpoint(r)
 	// Shutdown URL with random access token
 	shutdownURL, err := uuid.NewV4()
@@ -101,8 +105,13 @@ func StartServer(_cs chan bool, wg *sync.WaitGroup, config Config,
 	}()
 	// Wait for underlying process to end
 	if <-cs {
-		fmt.Println(":: STOP SERVE")
-		wg.Done()
+		fmt.Println(":: Shutting down the server in 10 seconds...")
+		timer1 := time.NewTimer(10 * time.Second)
+		go func() {
+			<-timer1.C
+			fmt.Println(":: STOP SERVE")
+			wg.Done()
+		}()
 	}
 }
 
@@ -160,7 +169,9 @@ func FileExists(filename string) bool {
 }
 
 func setShutdownURL(r chi.Router, url string) {
-	r.Get(fmt.Sprintf("/shutdown/%s", url), handleShutdown)
+	urlString := fmt.Sprintf("/shutdown/%s", url)
+	fmt.Println(fmt.Sprintf("!! Shutdown URL: %s", urlString))
+	r.Get(urlString, handleShutdown)
 }
 
 func setPublicRoutes(r chi.Router, dbList *Databases,
@@ -256,8 +267,14 @@ func setJWTProtectedRoutes(
 }
 
 func handleShutdown(w http.ResponseWriter, req *http.Request) {
-	fmt.Println(":: WARNING: SERVER SHUTDOWN URL REQUESTED")
-	_, _ = w.Write([]byte("Server Shutdown"))
+	fmt.Println("\n!! WARNING: SERVER SHUTDOWN URL REQUESTED")
+	_, err := w.Write([]byte("Server Shutdown"))
+	if err == nil {
+		go func() {
+			panic("lol")
+		}()
+	}
+	donePeriodic <- true
 	cs <- true
 }
 
@@ -270,9 +287,23 @@ func sampleMessage(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// quasarVueJSWikiricEndpoint serves the V2 wikiric Vue.js PWA website
+func quasarVueJSWikiricEndpoint(r chi.Router) {
+	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+		workDir, _ := os.Getwd()
+		filesDir := filepath.Join(workDir, "vue", "pwa")
+		url := filesDir + r.URL.Path
+		if _, err := os.Stat(url); errors.Is(err, os.ErrNotExist) {
+			http.ServeFile(w, r, filepath.Join(filesDir, "index.html"))
+		} else {
+			http.ServeFile(w, r, url)
+		}
+	})
+}
+
 // vueJSWikiricEndpoint serves the wikiric Vue.js PWA website
 func vueJSWikiricEndpoint(r chi.Router) {
-	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+	r.Get("/v1/*", func(w http.ResponseWriter, r *http.Request) {
 		workDir, _ := os.Getwd()
 		filesDir := filepath.Join(workDir, "vue", "dist")
 		if _, err := os.Stat(filesDir + r.URL.Path); errors.Is(err, os.ErrNotExist) {

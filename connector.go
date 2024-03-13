@@ -105,11 +105,28 @@ func (connector *Connector) handleConnectorEndpoint(dbList *Databases) http.Hand
 			)
 			return
 		}
+		// Say hi!
+		str := fmt.Sprintf("[s:wlcm]")
+		err = c.Write(
+			ctx,
+			1, // 1=Text
+			[]byte(str),
+		)
+		if err != nil {
+			return
+		}
 		connector.SessionsMu.Lock()
 		// Before adding the connector session, check if session existed before
 		if _, didExist := connector.Sessions.Get(username); !didExist {
 			// Session did not exist before, so notify others
-			go dbList.Map["main"].notifyStatusChange(connector, username, "online")
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						fmt.Println("!! ERROR Recovered on notifyStatusChange", r)
+					}
+				}()
+				dbList.Map["main"].notifyStatusChange(connector, username, "online")
+			}()
 		}
 		// Add session to connector sessions
 		session := &CSession{

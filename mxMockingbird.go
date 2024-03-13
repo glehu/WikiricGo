@@ -404,20 +404,32 @@ func analyseRequest(r *http.Request, bodyContent []byte) *MockingBirdAnalytics {
 		analytics.RequestContent = string(bodyContent)
 		analytics.RequestContentType = r.Header.Get("Content-Type")
 	}
-	// Is this an authorized request? Check Basic first
+	// Is this an authorized request?
 	authHeader := r.Header.Get("Authorization")
 	if authHeader != "" {
+		// Basic Auth?
 		tmpUser, tmpPass, ok := r.BasicAuth()
 		if ok {
 			analytics.AuthorizationType = "Basic"
 			analytics.AuthUser = tmpUser
 			analytics.AuthPassword = tmpPass
 		} else {
-			// Bearer Token?
+			// Bearer Token Auth?
 			const prefix = "Bearer "
 			if len(authHeader) >= len(prefix) && ascii.EqualFold([]byte(authHeader[:len(prefix)]), []byte(prefix)) {
-				analytics.AuthorizationType = "Bearer"
+				analytics.AuthorizationType = prefix
 				analytics.AuthPassword = authHeader[len(prefix):]
+			} else {
+				// Digest Auth?
+				const prefix = "Digest "
+				if len(authHeader) >= len(prefix) && ascii.EqualFold([]byte(authHeader[:len(prefix)]), []byte(prefix)) {
+					analytics.AuthorizationType = prefix
+					analytics.AuthPassword = authHeader[len(prefix):]
+				} else {
+					// Fallback
+					analytics.AuthorizationType = "(Unknown Authorization)"
+					analytics.AuthPassword = authHeader
+				}
 			}
 		}
 	}

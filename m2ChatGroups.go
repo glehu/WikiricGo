@@ -102,7 +102,7 @@ func (db *GoDB) ProtectedChatGroupEndpoints(r chi.Router, tokenAuth *jwtauth.JWT
 		// Roles
 		r.Post("/roles/mod/{chatID}", db.handleChatGroupRoleModification())
 		// PubKey
-		r.Post("/pubkey/{chatID}", db.handlePublicKeySet())
+		r.Post("/pubkey/{chatID}", db.handlePublicKeySet(rapidDB, chatServer.Connector))
 		// Users
 		r.Route("/users", func(r chi.Router) {
 			r.Post("/roles/mod/{chatID}", db.handleChatMemberRoleModification())
@@ -163,6 +163,8 @@ func (db *GoDB) handleChatGroupCreate() http.HandlerFunc {
 		}
 		if request.Password == "" {
 			request.IsPrivate = false
+		} else {
+			request.IsPrivate = true
 		}
 		length := len(request.Name)
 		if length > 50 {
@@ -529,6 +531,11 @@ func ReadChatGroupAndMember(
 					"user-friend": fmt.Sprintf("%s;%s;", refUsername, username), // Sides switched to enable friend query
 				}
 				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							fmt.Println("!! ERROR Recovered on notifyFriendRequestAccept", r)
+						}
+					}()
 					err = notifyFriendRequestAccept(refUsername, user, rapidDB, connector, chatID, password)
 					if err != nil {
 						fmt.Println(err)
@@ -545,11 +552,16 @@ func ReadChatGroupAndMember(
 				"chat-usr": fmt.Sprintf("%s;%s;", chatID, username),
 			}
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						fmt.Println("!! ERROR Recovered on notifyJoin", r)
+					}
+				}()
 				container := &ChatGroupEntry{
 					ChatGroup: &chatGroup,
 					UUID:      dataOriginal.uUID,
 				}
-				err = notifyJoin(user.DisplayName, mainDB, rapidDB, connector, container)
+				err = notifyJoin(user.DisplayName, mainDB, rapidDB, connector, container, false)
 				if err != nil {
 					fmt.Println(err)
 					return
@@ -992,7 +1004,7 @@ func notifyFriendRequestAccept(refUsername string, user *User,
 	return nil
 }
 
-func notifyJoin(selfName string, mainDB, rapidDB *GoDB, connector *Connector, chatGroup *ChatGroupEntry,
+func notifyJoin(selfName string, mainDB, rapidDB *GoDB, connector *Connector, chatGroup *ChatGroupEntry, silent bool,
 ) error {
 	if rapidDB == nil {
 		return nil
@@ -1011,9 +1023,29 @@ func notifyJoin(selfName string, mainDB, rapidDB *GoDB, connector *Connector, ch
 	for _, entry := range responseMember {
 		chatMember := &ChatMember{}
 		err = json.Unmarshal(entry.Data, chatMember)
-		if err == nil {
+		if err != nil {
 			continue
 		}
+		// Send connector message to ensure all members retrieve the new members details
+		connector.SessionsMu.RLock()
+		session, ok := connector.Sessions.Get(chatMember.Username)
+		if !ok {
+			connector.SessionsMu.RUnlock()
+			continue
+		}
+		cMSG := &ConnectorMsg{
+			Type:          "[s:memberjoin]",
+			Action:        "update",
+			ReferenceUUID: chatGroup.UUID,
+			Username:      selfName,
+		}
+		_ = WSSendJSON(session.Conn, session.Ctx, cMSG)
+		connector.SessionsMu.RUnlock()
+		// Skip creating notifications if we're silent
+		if silent {
+			continue
+		}
+		// Proceed with admins only (they will receive a notification as well as the previous connector message)
 		userRole := chatMember.GetRoleInformation(chatGroup.ChatGroup)
 		if !userRole.IsAdmin {
 			continue
@@ -1040,12 +1072,12 @@ func notifyJoin(selfName string, mainDB, rapidDB *GoDB, connector *Connector, ch
 		}
 		// Now send a message via the connector
 		connector.SessionsMu.RLock()
-		session, ok := connector.Sessions.Get(chatMember.Username)
+		session, ok = connector.Sessions.Get(chatMember.Username)
 		if !ok {
 			connector.SessionsMu.RUnlock()
 			continue
 		}
-		cMSG := &ConnectorMsg{
+		cMSG = &ConnectorMsg{
 			Type:          "[s:NOTIFICATION]",
 			Action:        "info",
 			ReferenceUUID: notificationUUID,
@@ -1132,7 +1164,7 @@ func (db *GoDB) handleGetFriends(rapidDB *GoDB) http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handlePublicKeySet() http.HandlerFunc {
+func (db *GoDB) handlePublicKeySet(rapidDB *GoDB, connector *Connector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -1195,6 +1227,11 @@ func (db *GoDB) handlePublicKeySet() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
+		// Notify all members to ensure they retrieve the new details
+		err = notifyJoin(user.DisplayName, db, rapidDB, connector, &ChatGroupEntry{
+			ChatGroup: chatGroup,
+			UUID:      chatID,
+		}, true)
 	}
 }
 
