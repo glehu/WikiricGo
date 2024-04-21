@@ -389,6 +389,9 @@ func (db *GoDB) handleWisdomCreate(mainDB *GoDB, connector *Connector) http.Hand
 		// Respond to client
 		_, _ = fmt.Fprintln(w, uUID)
 		go db.NotifyTaskChange(user, request, uUID, mainDB, connector)
+		if request.Type == "post" {
+			go db.NotifyMembersCustomMessage("New Post", "Go see what xy posted!", user, request, uUID, mainDB, connector)
+		}
 	}
 }
 
@@ -438,8 +441,9 @@ func (db *GoDB) handleWisdomEdit(mainDB *GoDB, connector *Connector,
 			request.Type != "question" &&
 			request.Type != "answer" &&
 			request.Type != "box" &&
-			request.Type != "task" {
-			http.Error(w, "type must be one of lesson or reply or question or answer or box or task",
+			request.Type != "task" &&
+			request.Type != "post" {
+			http.Error(w, "type must be one of lesson or reply or question or answer or box or task or post",
 				http.StatusBadRequest)
 			return
 		}
@@ -963,6 +967,85 @@ func (db *GoDB) NotifyTaskChange(
 		session, ok := connector.Sessions.Get(collab)
 		if !ok {
 			continue
+		}
+		_ = WSSendJSON(session.Conn, session.Ctx, cMSG)
+	}
+}
+
+func (db *GoDB) NotifyMembersCustomMessage(
+	title, message string, user *User, wisdom *Wisdom, wisdomID string,
+	mainDB *GoDB,
+	connector *Connector,
+) {
+	// Retrieve users
+	knowledgeBytes, ok := mainDB.Read(KnowledgeDB, wisdom.KnowledgeUUID)
+	if !ok {
+		return
+	}
+	knowledge := &Knowledge{}
+	err := json.Unmarshal(knowledgeBytes.Data, knowledge)
+	if err != nil {
+		return
+	}
+	query := FIndex(knowledge.ChatGroupUUID)
+	resp, err := mainDB.Select(MemberDB,
+		map[string]string{
+			"chat-usr": query,
+		}, nil,
+	)
+	if err != nil {
+		return
+	}
+	responseMember := <-resp
+	if len(responseMember) < 1 {
+		return
+	}
+	usersToNotify := make([]string, len(responseMember))
+	for i, entry := range responseMember {
+		chatMember := &ChatMember{}
+		err = json.Unmarshal(entry.Data, chatMember)
+		if err == nil {
+			if chatMember.Username == user.Username {
+				continue
+			}
+			usersToNotify[i] = chatMember.Username
+		}
+	}
+	// Notify users
+	connector.SessionsMu.RLock()
+	defer connector.SessionsMu.RUnlock()
+	for _, collab := range usersToNotify {
+		notification := &Notification{
+			Title:             title,
+			Description:       message,
+			Type:              "info",
+			TimeCreated:       TimeNowIsoString(),
+			RecipientUsername: collab,
+			ClickAction:       "open",
+			ClickModule:       "wisdom",
+			ClickUUID:         fmt.Sprintf("%s", wisdomID),
+		}
+		jsonNotification, err := json.Marshal(notification)
+		if err != nil {
+			continue
+		}
+		notificationUUID, err := db.Insert(NotifyDB, jsonNotification, map[string]string{
+			"usr": FIndex(collab),
+		})
+		if err != nil {
+			continue
+		}
+		// Now send a message via the connector
+		session, ok := connector.Sessions.Get(collab)
+		if !ok {
+			continue
+		}
+		cMSG := &ConnectorMsg{
+			Type:          "[s:NOTIFICATION]",
+			Action:        "info",
+			ReferenceUUID: notificationUUID,
+			Username:      user.DisplayName,
+			Message:       message,
 		}
 		_ = WSSendJSON(session.Conn, session.Ctx, cMSG)
 	}

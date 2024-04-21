@@ -158,6 +158,9 @@ func GetBase64FileType(mimeType string) (fileExt, fileType string) {
 		case "mpeg":
 			fileExt = ".mp3"
 			break
+		case "wav":
+			fileExt = ".wav"
+			break
 		}
 		break
 	case "application":
