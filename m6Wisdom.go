@@ -20,28 +20,29 @@ import (
 const WisdomDB = "m6"
 
 type Wisdom struct {
-	Name                 string     `json:"t"`
-	Description          string     `json:"desc"`
-	Keywords             string     `json:"keys"`
-	CopyContent          string     `json:"copy"`
-	Author               string     `json:"usr"`
-	Type                 string     `json:"type"`
-	TimeCreated          string     `json:"ts"`
-	TimeFinished         string     `json:"tsd"`
-	TimeDue              string     `json:"due"`
-	TimeDueEnd           string     `json:"duet"`
-	IsFinished           bool       `json:"done"`
-	KnowledgeUUID        string     `json:"pid"`
-	Categories           []Category `json:"cats"`
-	ReferenceUUID        string     `json:"ref"` // References another Wisdom e.g. Comment referencing Answer
-	AnalyticsUUID        string     `json:"ana"` // Views, likes etc. will be stored in a separate database
-	IsPublic             bool       `json:"pub"`
-	Collaborators        []string   `json:"coll"`
-	ThumbnailURL         string     `json:"iurl"`
-	ThumbnailAnimatedURL string     `json:"iurla"`
-	BannerURL            string     `json:"burl"`
-	BannerAnimatedURL    string     `json:"burla"`
-	RowIndex             float64    `json:"row"`
+	Name                 string          `json:"t"`
+	Description          string          `json:"desc"`
+	Keywords             string          `json:"keys"`
+	CopyContent          string          `json:"copy"`
+	Author               string          `json:"usr"`
+	Type                 string          `json:"type"`
+	TimeCreated          string          `json:"ts"`
+	TimeFinished         string          `json:"tsd"`
+	TimeDue              string          `json:"due"`
+	TimeDueEnd           string          `json:"duet"`
+	IsFinished           bool            `json:"done"`
+	KnowledgeUUID        string          `json:"pid"`
+	Categories           []Category      `json:"cats"`
+	ReferenceUUID        string          `json:"ref"` // References another Wisdom e.g. Comment referencing Answer
+	AnalyticsUUID        string          `json:"ana"` // Views, likes etc. will be stored in a separate database
+	IsPublic             bool            `json:"pub"`
+	Collaborators        []string        `json:"coll"`
+	ThumbnailURL         string          `json:"iurl"`
+	ThumbnailAnimatedURL string          `json:"iurla"`
+	BannerURL            string          `json:"burl"`
+	BannerAnimatedURL    string          `json:"burla"`
+	RowIndex             float64         `json:"row"`
+	Chapters             []WisdomChapter `json:"chapters"`
 }
 
 type WisdomContainer struct {
@@ -51,6 +52,16 @@ type WisdomContainer struct {
 	Accuracy       float64            `json:"accuracy"`
 	Replies        []*WisdomContainer `json:"replies"`
 	HasMoreReplies bool               `json:"moreReplies"`
+}
+
+type WisdomChapter struct {
+	UUID        string     `json:"uid"`
+	Name        string     `json:"t"`
+	Author      string     `json:"usr"`
+	Keywords    string     `json:"keys"`
+	Categories  []Category `json:"cats"`
+	TimeCreated string     `json:"ts"`
+	Index       int        `json:"index"`
 }
 
 type BoxesContainer struct {
@@ -70,6 +81,8 @@ type QueryResponse struct {
 	Answers         []*WisdomContainer `json:"answers"`
 	Boxes           []*WisdomContainer `json:"boxes"`
 	Tasks           []*WisdomContainer `json:"tasks"`
+	Courses         []*WisdomContainer `json:"courses"`
+	Posts           []*WisdomContainer `json:"posts"`
 	Misc            []*WisdomContainer `json:"misc"`
 	ReferenceWisdom *WisdomContainer   `json:"ref"`
 }
@@ -331,8 +344,9 @@ func (db *GoDB) handleWisdomCreate(mainDB *GoDB, connector *Connector) http.Hand
 			request.Type != "question" &&
 			request.Type != "box" &&
 			request.Type != "task" &&
-			request.Type != "post" {
-			http.Error(w, "type must be one of lesson or answer or box or task or post",
+			request.Type != "post" &&
+			request.Type != "course" {
+			http.Error(w, "type must be one of lesson or answer or box or task or post or course",
 				http.StatusBadRequest)
 			return
 		}
@@ -390,7 +404,15 @@ func (db *GoDB) handleWisdomCreate(mainDB *GoDB, connector *Connector) http.Hand
 		_, _ = fmt.Fprintln(w, uUID)
 		go db.NotifyTaskChange(user, request, uUID, mainDB, connector)
 		if request.Type == "post" {
-			go db.NotifyMembersCustomMessage("New Post", "Go see what xy posted!", user, request, uUID, mainDB, connector)
+			go db.NotifyMembersCustomMessage(
+				"New Post",
+				fmt.Sprintf("Go see %s's new post: %s!", request.Author, request.Name),
+				user,
+				request,
+				uUID,
+				mainDB,
+				connector,
+			)
 		}
 	}
 }
@@ -442,8 +464,9 @@ func (db *GoDB) handleWisdomEdit(mainDB *GoDB, connector *Connector,
 			request.Type != "answer" &&
 			request.Type != "box" &&
 			request.Type != "task" &&
-			request.Type != "post" {
-			http.Error(w, "type must be one of lesson or reply or question or answer or box or task or post",
+			request.Type != "post" &&
+			request.Type != "course" {
+			http.Error(w, "type must be one of lesson or reply or question or answer or box or task or post or course",
 				http.StatusBadRequest)
 			return
 		}
@@ -1388,6 +1411,8 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 			Answers:     make([]*WisdomContainer, 0),
 			Boxes:       make([]*WisdomContainer, 0),
 			Tasks:       make([]*WisdomContainer, 0),
+			Posts:       make([]*WisdomContainer, 0),
+			Courses:     make([]*WisdomContainer, 0),
 			Misc:        make([]*WisdomContainer, 0),
 		}
 		response := <-resp
@@ -1482,6 +1507,10 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 				queryResponse.Boxes = append(queryResponse.Boxes, container)
 			case "task":
 				queryResponse.Tasks = append(queryResponse.Tasks, container)
+			case "post":
+				queryResponse.Posts = append(queryResponse.Posts, container)
+			case "course":
+				queryResponse.Courses = append(queryResponse.Courses, container)
 			default:
 				queryResponse.Misc = append(queryResponse.Misc, container)
 			}
@@ -1852,6 +1881,8 @@ func (db *GoDB) handleWisdomInvestigate(mainDB *GoDB,
 			Answers:     make([]*WisdomContainer, 0),
 			Boxes:       make([]*WisdomContainer, 0),
 			Tasks:       make([]*WisdomContainer, 0),
+			Posts:       make([]*WisdomContainer, 0),
+			Courses:     make([]*WisdomContainer, 0),
 			Misc:        make([]*WisdomContainer, 0),
 		}
 		var analytics *Analytics
@@ -1922,6 +1953,10 @@ func (db *GoDB) handleWisdomInvestigate(mainDB *GoDB,
 				queryResponse.Boxes = append(queryResponse.Boxes, container)
 			case "task":
 				queryResponse.Tasks = append(queryResponse.Tasks, container)
+			case "post":
+				queryResponse.Posts = append(queryResponse.Posts, container)
+			case "course":
+				queryResponse.Courses = append(queryResponse.Courses, container)
 			default:
 				queryResponse.Misc = append(queryResponse.Misc, container)
 			}
@@ -1978,6 +2013,8 @@ func (db *GoDB) handleWisdomModification(mainDB *GoDB, connector *Connector,
 				wisdom.Name = request.NewValue
 			} else if request.Field == "desc" {
 				wisdom.Description = request.NewValue
+			} else if request.Field == "chapters" {
+				wisdom = db.handleWisdomChaptersEdit(wisdom, request)
 			}
 			// Store
 			jsonEntry, err := json.Marshal(wisdom)
@@ -1996,6 +2033,61 @@ func (db *GoDB) handleWisdomModification(mainDB *GoDB, connector *Connector,
 			go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
 		}
 	}
+}
+
+func (db *GoDB) handleWisdomChaptersEdit(wisdom *Wisdom, request *WisdomModification) *Wisdom {
+	highestIndex := -1
+	// Check if chapter uuid is present if there are chapters
+	ix := -1
+	if len(wisdom.Chapters) > 0 {
+		uidCheck := request.NewValue
+		for i, chapter := range wisdom.Chapters {
+			if chapter.Index > highestIndex {
+				highestIndex = chapter.Index
+			}
+			if chapter.UUID == uidCheck {
+				ix = i
+			}
+		}
+	}
+	if ix != -1 {
+		// Remove chapter
+		wisdom.Chapters = append(wisdom.Chapters[:ix], wisdom.Chapters[ix+1:]...)
+		// Reassign chapter indices to ensure order
+		if len(wisdom.Chapters) > 0 {
+			ix = 0
+			for _, chapter := range wisdom.Chapters {
+				chapter.Index = ix
+				ix += 1
+			}
+		}
+	} else {
+		// Add chapter
+		chapterIndex := highestIndex + 1
+		// Retrieve targeted wisdom entry (the chapter to be added)
+		resp, txn := db.Get(WisdomDB, request.NewValue)
+		if txn == nil {
+			return wisdom
+		}
+		defer txn.Discard()
+		chapterWisdom := &Wisdom{}
+		err := json.Unmarshal(resp.Data, chapterWisdom)
+		if err != nil {
+			return wisdom
+		}
+		// Store new chapter
+		newChapter := WisdomChapter{
+			UUID:        request.NewValue,
+			Name:        chapterWisdom.Name,
+			Author:      chapterWisdom.Author,
+			Keywords:    chapterWisdom.Keywords,
+			Categories:  chapterWisdom.Categories,
+			TimeCreated: chapterWisdom.TimeCreated,
+			Index:       chapterIndex,
+		}
+		wisdom.Chapters = append(wisdom.Chapters, newChapter)
+	}
+	return wisdom
 }
 
 func (db *GoDB) handleWisdomAcceptAnswer(mainDB *GoDB, connector *Connector,
@@ -2331,7 +2423,7 @@ func (db *GoDB) handleWisdomExport(mainDB *GoDB) http.HandlerFunc {
 		if wisdom.Type != "box" {
 			// Export wisdom content as Markdown text
 			textContent := strings.Builder{}
-			textContent.WriteString(fmt.Sprintf("%s\n", wisdom.Name))
+			textContent.WriteString(fmt.Sprintf("%s\n\n", wisdom.Name))
 			textContent.WriteString(wisdom.Description)
 			// Respond to client
 			_, _ = fmt.Fprintln(w, textContent.String())
