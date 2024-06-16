@@ -35,6 +35,7 @@ type MockingbirdConfig struct {
 	RequestContentType  string `json:"reqContentType"`
 	RequestMethod       string `json:"reqMethod"`
 	RequestContent      string `json:"request"`
+	Group               string `json:"group"`
 }
 
 type MockingBirdConfigEntry struct {
@@ -79,11 +80,14 @@ func (db *GoDB) PublicMockingbirdEndpoints(r chi.Router, tokenAuth *jwtauth.JWTA
 		// ############
 		// ### POST ###
 		// ############
-		r.Post("/{usr}-{endpoint}", db.handleMockingbirdPost(connector))
+		r.Post("/{usr}-{endpoint}", db.handleMockingbirdPost(connector, "post"))
+		r.Put("/{usr}-{endpoint}", db.handleMockingbirdPost(connector, "put"))
+		r.Patch("/{usr}-{endpoint}", db.handleMockingbirdPost(connector, "patch"))
 		// ###########
 		// ### GET ###
 		// ###########
-		r.Get("/{usr}-{endpoint}", db.handleMockingbirdGet(connector))
+		r.Get("/{usr}-{endpoint}", db.handleMockingbirdGet(connector, "get"))
+		r.Delete("/{usr}-{endpoint}", db.handleMockingbirdGet(connector, "delete"))
 	})
 }
 
@@ -153,7 +157,11 @@ func (db *GoDB) handleMockingbirdConfigSubmit() http.HandlerFunc {
 			return
 		}
 		uUID, err := db.Insert(MockDB, jsonEntry, map[string]string{
-			"usr-endpoint": fmt.Sprintf("%s%s;", FIndex(request.Username), request.Endpoint),
+			"usr-endpoint": fmt.Sprintf(
+				"%s%s%s",
+				FIndex(request.Username),
+				FIndex(request.Endpoint),
+				FIndex(strings.ToLower(request.RequestMethod))),
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -228,7 +236,11 @@ func (db *GoDB) handleMockingbirdConfigEdit() http.HandlerFunc {
 			return
 		}
 		err = db.Update(MockDB, txn, response.uUID, jsonEntry, map[string]string{
-			"usr-endpoint": fmt.Sprintf("%s%s;", FIndex(requestConfig.Username), requestConfig.Endpoint),
+			"usr-endpoint": fmt.Sprintf(
+				"%s%s%s",
+				FIndex(requestConfig.Username),
+				FIndex(requestConfig.Endpoint),
+				FIndex(strings.ToLower(requestConfig.RequestMethod))),
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -274,12 +286,16 @@ func (db *GoDB) handleMockingbirdGetConfigs() http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) GetMockingbirdConfigFromUserEndpoint(user, endpoint string) *MockingBirdConfigEntry {
+func (db *GoDB) GetMockingbirdConfigFromUserEndpoint(user, endpoint, method string) *MockingBirdConfigEntry {
 	if user == "" || endpoint == "" {
 		return nil
 	}
 	resp, err := db.Select(MockDB, map[string]string{
-		"usr-endpoint": fmt.Sprintf("%s%s;", FIndex(user), endpoint),
+		"usr-endpoint": fmt.Sprintf(
+			"%s%s%s",
+			FIndex(user),
+			FIndex(endpoint),
+			FIndex(strings.ToLower(method))),
 	}, &SelectOptions{
 		MaxResults: 1,
 		Page:       0,
@@ -303,7 +319,7 @@ func (db *GoDB) GetMockingbirdConfigFromUserEndpoint(user, endpoint string) *Moc
 	}
 }
 
-func (db *GoDB) handleMockingbirdPost(connector *Connector) http.HandlerFunc {
+func (db *GoDB) handleMockingbirdPost(connector *Connector, method string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// timeStart := time.Now()
 		usrParam := chi.URLParam(r, "usr")
@@ -317,7 +333,7 @@ func (db *GoDB) handleMockingbirdPost(connector *Connector) http.HandlerFunc {
 			return
 		}
 		// Retrieve config for this endpoint
-		config := db.GetMockingbirdConfigFromUserEndpoint(usrParam, endpointParam)
+		config := db.GetMockingbirdConfigFromUserEndpoint(usrParam, endpointParam, method)
 		if config == nil {
 			http.Error(w, "wikiric mockingbird: unknown user or endpoint", http.StatusBadRequest)
 			return
@@ -346,7 +362,7 @@ func (db *GoDB) handleMockingbirdPost(connector *Connector) http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handleMockingbirdGet(connector *Connector) http.HandlerFunc {
+func (db *GoDB) handleMockingbirdGet(connector *Connector, method string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// timeStart := time.Now()
 		usrParam := chi.URLParam(r, "usr")
@@ -360,7 +376,7 @@ func (db *GoDB) handleMockingbirdGet(connector *Connector) http.HandlerFunc {
 			return
 		}
 		// Retrieve config for this endpoint
-		config := db.GetMockingbirdConfigFromUserEndpoint(usrParam, endpointParam)
+		config := db.GetMockingbirdConfigFromUserEndpoint(usrParam, endpointParam, method)
 		if config == nil {
 			http.Error(w, "wikiric mockingbird: unknown user or endpoint", http.StatusBadRequest)
 			return

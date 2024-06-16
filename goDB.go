@@ -58,11 +58,6 @@ func OpenDB(module string) *GoDB {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// TODO: Find a suitable spot for value log garbage collection
-	// err = badgerDB.RunValueLogGC(0.5)
-	// if err != nil {
-	// 	return nil
-	// }
 	// Create db struct pointer and return
 	goDB := &GoDB{
 		db:      badgerDB,
