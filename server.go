@@ -262,6 +262,8 @@ func setJWTProtectedRoutes(
 			dbList.Map["rapid"].ProtectedOrdersEndpoints(r, tokenAuth, dbList.Map["main"], connector)
 			// #### Sandbox
 			dbList.Map["rapid"].ProtectedSandboxEndpoints(r, tokenAuth, dbList.Map["main"], connector)
+			// #### Finance
+			dbList.Map["rapid"].ProtectedFinanceEndpoints(r, tokenAuth, dbList.Map["main"], connector)
 		},
 	)
 }
