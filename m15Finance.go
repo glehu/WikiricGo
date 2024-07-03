@@ -426,14 +426,6 @@ func (db *GoDB) handleFinanceTransactionCreate(mainDB *GoDB) http.HandlerFunc {
 		if request.Unit == "" {
 			request.Unit = "EUR"
 		}
-		if len(request.Distribution) < 1 {
-			request.Distribution = []FinanceUserSummary{}
-			request.Distribution = append(request.Distribution, FinanceUserSummary{
-				UsernameFrom: request.UsernameFrom,
-				UsernameTo:   request.UsernameTo,
-				Value:        request.Value,
-			})
-		}
 		for _, dist := range request.Distribution {
 			if dist.Unit == "" {
 				dist.Unit = request.Unit
