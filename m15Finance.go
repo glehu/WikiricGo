@@ -22,7 +22,7 @@ func (db *GoDB) ProtectedFinanceEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAu
 	r.Route("/finance/private", func(r chi.Router) {
 		r.Route("/collection", func(r chi.Router) {
 			r.Post("/create", db.handleFinanceCollectionCreate())
-			r.Get("/join/{collectionID}", db.handleFinanceCollectionJoin())
+			r.Get("/join/{collectionID}", db.handleFinanceCollectionJoin(connector))
 			r.Get("/view/{collectionID}", db.handleFinanceCollectionViewTransactions())
 			r.Get("/delete/{collectionID}", db.handleFinanceCollectionDelete())
 		})
@@ -216,7 +216,9 @@ func (db *GoDB) handleFinanceCollectionViewTransactions() http.HandlerFunc {
 			}
 			overview.Transactions = append(overview.Transactions, *rspT)
 			// Count total income and payment
+			usrCount := 0
 			if rspT.UsernameFrom != "" {
+				usrCount += 1
 				tmpSummary, ok = summary[rspT.UsernameFrom]
 				if ok {
 					tmpSummary.TotalPayment += rspT.Value
@@ -224,10 +226,36 @@ func (db *GoDB) handleFinanceCollectionViewTransactions() http.HandlerFunc {
 				}
 			}
 			if rspT.UsernameTo != "" {
+				usrCount += 1
 				tmpSummary, ok = summary[rspT.UsernameTo]
 				if ok {
 					tmpSummary.TotalIncome += rspT.Value
 					summary[rspT.UsernameTo] = tmpSummary
+				}
+			}
+			// If this is a directional payment between to users, add a negative compensation to
+			// ... balance out any open compensations
+			if usrCount == 2 {
+				// Do we know this directional payment already?
+				found = false
+				for k, userSummary := range overview.Compensation {
+					if userSummary.UsernameFrom == rspT.UsernameFrom &&
+						userSummary.UsernameTo == rspT.UsernameTo {
+						found = true
+						userSummary.Value -= rspT.Value
+						overview.Compensation[k] = userSummary
+						break
+					}
+				}
+				if !found {
+					// Add new directional payment
+					overview.Compensation = append(overview.Compensation, FinanceUserSummary{
+						UsernameFrom: rspT.UsernameFrom,
+						UsernameTo:   rspT.UsernameTo,
+						Unit:         rspT.Unit,
+						Value:        rspT.Value * -1,
+						Ratio:        -1,
+					})
 				}
 			}
 			// Iterate over the distribution of the current transaction
@@ -269,7 +297,7 @@ func (db *GoDB) handleFinanceCollectionViewTransactions() http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) handleFinanceCollectionJoin() http.HandlerFunc {
+func (db *GoDB) handleFinanceCollectionJoin(connector *Connector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -300,6 +328,9 @@ func (db *GoDB) handleFinanceCollectionJoin() http.HandlerFunc {
 				return
 			}
 		}
+		// Notify users and request a reload of the data
+		usersToNotify := slices.Clone(collection.Collaborators)
+		usersToNotify = append(usersToNotify, collection.Username)
 		// Add user
 		collection.Collaborators = append(collection.Collaborators, user.Username)
 		jsonEntry, err := json.Marshal(collection)
@@ -311,6 +342,14 @@ func (db *GoDB) handleFinanceCollectionJoin() http.HandlerFunc {
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
+		}
+		for _, username := range usersToNotify {
+			go db.notifyCollectionCollaborator(
+				connector,
+				"User joined your Finance account",
+				fmt.Sprintf("%s has joined the account %s", user.DisplayName, collection.Name),
+				username,
+				true)
 		}
 		return
 	}
@@ -653,4 +692,46 @@ func (trx *FinanceTransaction) SignTransaction(mainDB *GoDB, user, pass string) 
 	// Signature gets inserted with name as prefix for usability (who signed it)
 	trx.Signature = fmt.Sprintf("%s;%x", user, sig.Sum(nil))
 	return true
+}
+
+func (db *GoDB) notifyCollectionCollaborator(connector *Connector, title, message, username string, requestReload bool) {
+	notification := &Notification{
+		Title:             title,
+		Description:       message,
+		Type:              "info",
+		TimeCreated:       TimeNowIsoString(),
+		RecipientUsername: username,
+	}
+	jsonNotification, err := json.Marshal(notification)
+	if err != nil {
+		return
+	}
+	notificationUUID, err := db.Insert(NotifyDB, jsonNotification, map[string]string{
+		"usr": FIndex(username),
+	})
+	if err != nil {
+		return
+	}
+	// Now send a message via the connector
+	session, ok := connector.Sessions.Get(username)
+	if !ok {
+		return
+	}
+	cMSG := &ConnectorMsg{
+		Type:          "[s:NOTIFICATION]",
+		Action:        "info",
+		ReferenceUUID: notificationUUID,
+		Username:      username,
+		Message:       message,
+	}
+	_ = WSSendJSON(session.Conn, session.Ctx, cMSG)
+	if requestReload {
+		cMSG = &ConnectorMsg{
+			Type:          "[s:CHANGE>FINANCE]",
+			Action:        "reload",
+			ReferenceUUID: notificationUUID,
+			Username:      username,
+		}
+		_ = WSSendJSON(session.Conn, session.Ctx, cMSG)
+	}
 }
