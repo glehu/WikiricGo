@@ -330,7 +330,6 @@ func (db *GoDB) handleFinanceCollectionJoin(connector *Connector) http.HandlerFu
 		}
 		// Notify users and request a reload of the data
 		usersToNotify := slices.Clone(collection.Collaborators)
-		usersToNotify = append(usersToNotify, collection.Username)
 		// Add user
 		collection.Collaborators = append(collection.Collaborators, user.Username)
 		jsonEntry, err := json.Marshal(collection)
