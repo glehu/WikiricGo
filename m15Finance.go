@@ -346,6 +346,7 @@ func (db *GoDB) handleFinanceCollectionJoin(connector *Connector) http.HandlerFu
 		for _, username := range usersToNotify {
 			go db.notifyCollectionCollaborator(
 				connector,
+				collectionID,
 				"User joined your Finance account",
 				fmt.Sprintf("%s has joined the account %s", user.DisplayName, collection.Name),
 				username,
@@ -694,7 +695,8 @@ func (trx *FinanceTransaction) SignTransaction(mainDB *GoDB, user, pass string) 
 	return true
 }
 
-func (db *GoDB) notifyCollectionCollaborator(connector *Connector, title, message, username string, requestReload bool) {
+func (db *GoDB) notifyCollectionCollaborator(
+	connector *Connector, collectionID, title, message, username string, requestReload bool) {
 	notification := &Notification{
 		Title:             title,
 		Description:       message,
@@ -729,7 +731,7 @@ func (db *GoDB) notifyCollectionCollaborator(connector *Connector, title, messag
 		cMSG = &ConnectorMsg{
 			Type:          "[s:CHANGE>FINANCE]",
 			Action:        "reload",
-			ReferenceUUID: notificationUUID,
+			ReferenceUUID: collectionID,
 			Username:      username,
 		}
 		_ = WSSendJSON(session.Conn, session.Ctx, cMSG)
