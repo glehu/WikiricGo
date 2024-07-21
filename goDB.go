@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -229,7 +230,7 @@ func (db *GoDB) Select(
 	// Launch index search goroutines
 	for key, value := range indicesClean {
 		wg.Add(1)
-		go db.singleIndexQuery(mod, key, value, responsesInternal, &wg, ctx)
+		go db.singleIndexQuery(mod, processArrayIndexKey(key), value, responsesInternal, &wg, ctx)
 	}
 	// Start goroutine awaiting a cancellation
 	go func() {
@@ -244,9 +245,11 @@ func (db *GoDB) Select(
 		current := int64(0)
 		skipDone := skip == int64(0) // If skip = 0, skipDone is automatically true
 		gatherDone := false
+		cache := map[string]bool{} // Unique results only
 		for {
 			select {
 			case <-done:
+				// *** We are done collecting ***
 				close(responsesInternal)
 				// Sort by uuid V7 to ensure order of returned values
 				sort.SliceStable(
@@ -259,11 +262,19 @@ func (db *GoDB) Select(
 				close(responsesExternal)
 				return
 			case entry := <-responsesInternal:
+				// *** New result collected ***
 				if entry.uUID == "" {
 					continue
 				}
 				if gatherDone {
 					break
+				}
+				// Only collect unique results, so check cache first
+				if cache[entry.uUID] {
+					continue
+				} else {
+					// Not found yet, so remember it now
+					cache[entry.uUID] = true
 				}
 				// Collect all found values after having skipped all results that had to be skipped
 				if skipDone || attempts.Load() >= skip {
@@ -306,7 +317,7 @@ func (db *GoDB) doInsert(
 		// 		Sub:		|	m1:usr:User1;12345	|	12345							 |
 		var ival string
 		for k, v := range indices {
-			ival = fmt.Sprintf("%s:%s:%s;%s", mod, k, v, uUID)
+			ival = fmt.Sprintf("%s:%s:%s;%s", mod, processArrayIndexKey(k), v, uUID)
 			err = txn.Set([]byte(ival), uUID)
 			if err != nil {
 				return err
@@ -340,6 +351,8 @@ func (db *GoDB) doUpdate(
 		opts.PrefetchValues = false
 		opts.Reverse = true
 		it := txn.NewIterator(opts)
+		// Remove array index values
+		k = processArrayIndexKey(k)
 		ival = fmt.Sprintf("%s:%s:", mod, k)
 		prefix := []byte(ival)
 		for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
@@ -354,6 +367,10 @@ func (db *GoDB) doUpdate(
 		}
 		it.Close()
 		// Set new index
+		if v == "" {
+			// Skip empty values as their keys are only needed to clear old entries
+			continue
+		}
 		ival = fmt.Sprintf("%s:%s:%s;%s", mod, k, v, uUID)
 		err = txn.Set([]byte(ival), uUID)
 		if err != nil {
@@ -444,6 +461,12 @@ func (db *GoDB) validateIndices(indices map[string]string, isSelect bool) (map[s
 		return nil, errors.New("no valid index queries provided")
 	}
 	return indicesClean, nil
+}
+
+func processArrayIndexKey(key string) string {
+	// We will remove array index values from keys
+	// E.g. turning "cat[1" (the character "]" is omitted) to "cat"
+	return strings.Split(key, "[")[0]
 }
 
 func incrementPrefix(prefix []byte) []byte {

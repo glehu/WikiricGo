@@ -484,7 +484,7 @@ func (db *GoDB) handleWisdomEdit(mainDB *GoDB, connector *Connector,
 			return
 		}
 		// Sanitize
-		request.Author = user.Username
+		// request.Author = user.Username !!! oops! this was a mistake!
 		request.Keywords = strings.ToLower(request.Keywords)
 		if request.Collaborators == nil {
 			request.Collaborators = make([]string, 0)

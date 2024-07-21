@@ -35,6 +35,30 @@ type Item struct {
 	BannerURLs            []ItemImage     `json:"burls"`
 	BannerAnimatedURLs    []ItemImage     `json:"burlas"`
 	AnalyticsUUID         string          `json:"ana"` // Views, likes etc. will be stored in a separate database
+	Brand                 string          `json:"brand"`
+	Manufacturer          string          `json:"manu"`
+	DateOfAppearance      string          `json:"doa"`
+}
+
+type BulkItem struct {
+	Items []Item `json:"items"`
+}
+
+type BulkItemEdit struct {
+	Items []ItemEdit `json:"items"`
+}
+
+type ItemEdit struct {
+	UUID    string `json:"uid"`
+	Payload Item   `json:"payload"`
+}
+
+type BulkItemResults struct {
+	Results []string `json:"results"`
+}
+
+type BulkItemEditResults struct {
+	Results []bool `json:"results"`
 }
 
 type ItemEntry struct {
@@ -87,6 +111,9 @@ type ItemQuery struct {
 	MinCost    float64          `json:"minCost"`
 	MaxCost    float64          `json:"maxCost"`
 	Variations []VariationQuery `json:"vars"`
+	Categories []string         `json:"cats"`
+	Colors     []string         `json:"clrs"`
+	Brand      string           `json:"brand"`
 }
 
 type VariationQuery struct {
@@ -108,8 +135,13 @@ type ItemModification struct {
 	MetaValue string `json:"meta"`
 }
 
+type BulkItemModification struct {
+	Modifications []ItemModification `json:"mods"`
+}
+
 type ItemFilters struct {
 	Variations []ItemVariation `json:"vars"`
+	Colors     []Category      `json:"clrs"`
 	MinCost    float64         `json:"min"`
 	MaxCost    float64         `json:"max"`
 	AvgCost    float64         `json:"avg"`
@@ -138,6 +170,11 @@ func (db *GoDB) ProtectedItemEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 		r.Post("/create/{storeID}", db.handleItemCreate(mainDB))
 		r.Post("/edit/{itemID}", db.handleItemEdit(mainDB))
 		r.Post("/mod/{itemID}", db.handleItemModification(mainDB))
+		// Bulk operations
+		r.Route("/bulk", func(r chi.Router) {
+			r.Post("/create/{storeID}", db.handleBulkItemCreate(mainDB))
+			r.Post("/edit/{storeID}", db.handleItemEdit(mainDB))
+		})
 		// ###########
 		// ### GET ###
 		// ###########
@@ -147,10 +184,24 @@ func (db *GoDB) ProtectedItemEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 
 func (a *Item) Bind(_ *http.Request) error {
 	if a.Name == "" {
-		return errors.New("missing name")
+		return errors.New("missing t")
 	}
 	if a.Description == "" {
 		return errors.New("missing desc")
+	}
+	return nil
+}
+
+func (a *BulkItem) Bind(_ *http.Request) error {
+	if len(a.Items) < 1 {
+		return errors.New("missing items")
+	}
+	return nil
+}
+
+func (a *BulkItemEdit) Bind(_ *http.Request) error {
+	if len(a.Items) < 1 {
+		return errors.New("missing items")
 	}
 	return nil
 }
@@ -168,6 +219,13 @@ func (a *ItemModification) Bind(_ *http.Request) error {
 	}
 	if a.Field == "" {
 		return errors.New("missing field")
+	}
+	return nil
+}
+
+func (a *BulkItemModification) Bind(_ *http.Request) error {
+	if len(a.Modifications) < 1 {
+		return errors.New("missing mods")
 	}
 	return nil
 }
@@ -202,122 +260,179 @@ func (db *GoDB) handleItemCreate(mainDB *GoDB) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		// Sanitize
-		request.StoreUUID = storeID
-		request.TimeCreated = TimeNowIsoString()
-		if request.VATPercent >= 1 {
-			// VAT provided as full % number instead of fraction as >=1 would mean >=100%
-			// e.g.: 19 provided => 19 / 100 = 0.19
-			request.VATPercent = request.VATPercent / 100
-		}
-		if request.Categories == nil {
-			request.Categories = make([]string, 0)
-		}
-		if request.Colors == nil {
-			request.Colors = make([]Category, 0)
-		}
-		if request.ThumbnailURLs == nil {
-			request.ThumbnailURLs = make([]ItemImage, 0)
-		} else {
-			newArray := make([]ItemImage, 0)
-			var uUID string
-			// Convert Base64 to URL
-			for _, img := range request.ThumbnailURLs {
-				if img.URL == "" {
-					continue
-				}
-				uUID, err = saveThumbnailImage(db, user, img.URL)
-				if err != nil {
-					continue
-				}
-				newArray = append(newArray, ItemImage{
-					URL:     fmt.Sprintf("files/public/get/%s", uUID),
-					Caption: img.Caption,
-				})
-			}
-			if len(newArray) > 0 {
-				request.ThumbnailURLs = newArray
-			}
-		}
-		if request.ThumbnailAnimatedURLs == nil {
-			request.ThumbnailAnimatedURLs = make([]ItemImage, 0)
-		}
-		if request.BannerURLs == nil {
-			request.BannerURLs = make([]ItemImage, 0)
-		}
-		if request.BannerAnimatedURLs == nil {
-			request.BannerAnimatedURLs = make([]ItemImage, 0)
-		}
-		if request.Variations == nil {
-			request.Variations = make([]ItemVariation, 0)
-		} else {
-			// Check if there are duplicate variations
-			vars := map[string]string{}
-			var varVars map[string]string
-			for _, variation := range request.Variations {
-				if vars[variation.Name] != "" {
-					http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-					return
-				}
-				vars[variation.Name] = "x"
-				// Check if there are duplicate variation variations
-				varVars = map[string]string{}
-				for _, varVar := range variation.Variations {
-					if varVars[varVar.StringValue] != "" {
-						http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-						return
-					}
-					varVars[varVar.StringValue] = "x"
-				}
-			}
-			var done bool
-			for {
-				done = true
-				for ix, variation := range request.Variations {
-					if variation.Name == "" {
-						request.Variations = append(request.Variations[:ix], request.Variations[ix+1:]...)
-						done = false
-						break
-					}
-				}
-				if done {
-					break
-				}
-			}
-		}
-		if request.Attributes == nil {
-			request.Attributes = make([]ItemAttribute, 0)
-		} else {
-			var done bool
-			for {
-				done = true
-				for ix, att := range request.Attributes {
-					if att.Name == "" {
-						request.Attributes = append(request.Attributes[:ix], request.Attributes[ix+1:]...)
-						done = false
-						break
-					}
-				}
-				if done {
-					break
-				}
-			}
-		}
-		// Store
-		jsonEntry, err := json.Marshal(request)
-		if err != nil {
+		uUID := db.doCreateItem(w, user, request, storeID, false)
+		if uUID == "" {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-		uUID, err := db.Insert(ItemDB, jsonEntry, map[string]string{
-			"pid": request.StoreUUID,
-		})
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
 		}
 		_, _ = fmt.Fprintln(w, uUID)
 	}
+}
+
+func (db *GoDB) handleBulkItemCreate(mainDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		storeID := chi.URLParam(r, "storeID")
+		if storeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		response, ok := mainDB.Read(StoreDB, storeID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		store := &Store{}
+		err := json.Unmarshal(response.Data, store)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Retrieve POST payload
+		request := &BulkItem{}
+		if err := render.Bind(r, request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		bulkResults := BulkItemResults{Results: make([]string, len(request.Items))}
+		for i, item := range request.Items {
+			bulkResults.Results[i] = db.doCreateItem(w, user, &item, storeID, true)
+		}
+		render.JSON(w, r, bulkResults)
+	}
+}
+
+func (db *GoDB) doCreateItem(w http.ResponseWriter, user *User, request *Item, storeID string, noErrors bool) string {
+	var err error
+	// Sanitize
+	request.StoreUUID = storeID
+	request.TimeCreated = TimeNowIsoString()
+	if request.VATPercent >= 1 {
+		// VAT provided as full % number instead of fraction as >=1 would mean >=100%
+		// e.g.: 19 provided => 19 / 100 = 0.19
+		request.VATPercent = request.VATPercent / 100
+	}
+	if request.Categories == nil {
+		request.Categories = make([]string, 0)
+	}
+	if request.Colors == nil {
+		request.Colors = make([]Category, 0)
+	}
+	if request.ThumbnailURLs == nil {
+		request.ThumbnailURLs = make([]ItemImage, 0)
+	} else {
+		newArray := make([]ItemImage, 0)
+		var uUID string
+		// Convert Base64 to URL
+		for _, img := range request.ThumbnailURLs {
+			if img.URL == "" {
+				continue
+			}
+			uUID, err = saveThumbnailImage(db, user, img.URL)
+			if err != nil {
+				continue
+			}
+			newArray = append(newArray, ItemImage{
+				URL:     fmt.Sprintf("files/public/get/%s", uUID),
+				Caption: img.Caption,
+			})
+		}
+		if len(newArray) > 0 {
+			request.ThumbnailURLs = newArray
+		}
+	}
+	if request.ThumbnailAnimatedURLs == nil {
+		request.ThumbnailAnimatedURLs = make([]ItemImage, 0)
+	}
+	if request.BannerURLs == nil {
+		request.BannerURLs = make([]ItemImage, 0)
+	}
+	if request.BannerAnimatedURLs == nil {
+		request.BannerAnimatedURLs = make([]ItemImage, 0)
+	}
+	if request.Variations == nil {
+		request.Variations = make([]ItemVariation, 0)
+	} else {
+		// Check if there are duplicate variations
+		vars := map[string]string{}
+		var varVars map[string]string
+		for _, variation := range request.Variations {
+			if vars[variation.Name] != "" {
+				if !noErrors {
+					http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+				}
+				return ""
+			}
+			vars[variation.Name] = "x"
+			// Check if there are duplicate variation variations
+			varVars = map[string]string{}
+			for _, varVar := range variation.Variations {
+				if varVars[varVar.StringValue] != "" {
+					if !noErrors {
+						http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+					}
+					return ""
+				}
+				varVars[varVar.StringValue] = "x"
+			}
+		}
+		var done bool
+		for {
+			done = true
+			for ix, variation := range request.Variations {
+				if variation.Name == "" {
+					request.Variations = append(request.Variations[:ix], request.Variations[ix+1:]...)
+					done = false
+					break
+				}
+			}
+			if done {
+				break
+			}
+		}
+	}
+	if request.Attributes == nil {
+		request.Attributes = make([]ItemAttribute, 0)
+	} else {
+		var done bool
+		for {
+			done = true
+			for ix, att := range request.Attributes {
+				if att.Name == "" {
+					request.Attributes = append(request.Attributes[:ix], request.Attributes[ix+1:]...)
+					done = false
+					break
+				}
+			}
+			if done {
+				break
+			}
+		}
+	}
+	// Store
+	jsonEntry, err := json.Marshal(request)
+	if err != nil {
+		if !noErrors {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		}
+		return ""
+	}
+	index := map[string]string{
+		"pid": FIndex(request.StoreUUID),
+	}
+	index = createItemIndex(request, index, false)
+	uUID, err := db.Insert(ItemDB, jsonEntry, index)
+	if err != nil {
+		if !noErrors {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		}
+		return ""
+	}
+	return uUID
 }
 
 func (db *GoDB) handleItemGet() http.HandlerFunc {
@@ -413,10 +528,36 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		// Retrieve all Item entries
-		resp, err := db.Select(ItemDB, map[string]string{
-			"pid": storeID,
-		}, nil)
+		// Options?
+		options := r.Context().Value("pagination").(*SelectOptions)
+		if options.MaxResults <= 0 {
+			options.MaxResults = 25
+		}
+		maxResults := int(options.MaxResults)
+		// Retrieve all Item entries respecting the query index filters
+		var customIndices = false
+		index := map[string]string{}
+		if request.Brand != "" {
+			index["pid-brand"] = fmt.Sprintf("%s;%s", storeID, request.Brand)
+			customIndices = true
+		}
+		if len(request.Categories) > 0 {
+			for i, category := range request.Categories {
+				index[fmt.Sprintf("pid-cat[%d", i)] = fmt.Sprintf("%s;%s", storeID, category)
+			}
+			customIndices = true
+		}
+		if len(request.Colors) > 0 {
+			for i, color := range request.Colors {
+				index[fmt.Sprintf("pid-clrs[%d", i)] = fmt.Sprintf("%s;%s", storeID, color)
+			}
+			customIndices = true
+		}
+		// Search for all items if no index filters were supplied
+		if !customIndices {
+			index["pid"] = storeID
+		}
+		resp, err := db.Select(ItemDB, index, nil)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -492,6 +633,7 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 					}
 				}
 			}
+			// Add result
 			container = &ItemContainer{
 				UUID:      entry.uUID,
 				Item:      item,
@@ -499,6 +641,10 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 				Accuracy:  accuracy,
 			}
 			queryResponse.Items = append(queryResponse.Items, container)
+			// Stop if we have reached the maximum amount of results
+			if len(queryResponse.Items) >= maxResults {
+				break
+			}
 		}
 		// Sort entries by accuracy
 		if len(queryResponse.Items) > 1 {
@@ -518,16 +664,20 @@ func GetItemQueryPoints(
 	item *Item, query *ItemQuery, p *regexp.Regexp, words map[string]*QueryWord, b bool,
 ) (float64, int64) {
 	// Get all matches in selected fields
-	var mAtts, mCats, mName, mDesc, mKeys []string
+	var mAtts, mCats, mName, mDesc, mKeys, mClrs []string
+	// *** Title ***
 	if query.Fields == "" || strings.Contains(query.Fields, "title") {
 		mName = p.FindAllString(item.Name, -1)
 	}
+	// *** Description ***
 	if query.Fields == "" || strings.Contains(query.Fields, "desc") {
 		mDesc = p.FindAllString(item.Description, -1)
 	}
+	// *** Keywords ***
 	if query.Fields == "" || strings.Contains(query.Fields, "keys") {
 		mKeys = p.FindAllString(item.Keywords, -1)
 	}
+	// *** Categories ***
 	if query.Fields == "" || strings.Contains(query.Fields, "cats") {
 		if len(item.Categories) > 0 {
 			var cats string
@@ -537,6 +687,7 @@ func GetItemQueryPoints(
 			mCats = p.FindAllString(cats, -1)
 		}
 	}
+	// *** Attributes ***
 	if query.Fields == "" || strings.Contains(query.Fields, "attr") {
 		if len(item.Attributes) > 0 {
 			var attr string
@@ -546,7 +697,17 @@ func GetItemQueryPoints(
 			mAtts = p.FindAllString(attr, -1)
 		}
 	}
-	if len(mAtts) < 1 && len(mCats) < 1 && len(mName) < 1 && len(mDesc) < 1 && len(mKeys) < 1 {
+	// *** Colors ***
+	if query.Fields == "" || strings.Contains(query.Fields, "clrs") {
+		if len(item.Colors) > 0 {
+			var clrs string
+			for _, color := range item.Colors {
+				clrs += fmt.Sprintf("%s %s", color.Name, color.ColorHex)
+			}
+			mClrs = p.FindAllString(clrs, -1)
+		}
+	}
+	if len(mName) < 1 && len(mDesc) < 1 && len(mKeys) < 1 && len(mAtts) < 1 && len(mCats) < 1 && len(mClrs) < 1 {
 		// Return 0 if there were no matches
 		return 0.0, 0
 	}
@@ -599,6 +760,16 @@ func GetItemQueryPoints(
 		}
 	}
 	for _, word := range mKeys {
+		if words[strings.ToLower(word)] != nil {
+			words[strings.ToLower(word)].B = b
+		} else {
+			words[strings.ToLower(word)] = &QueryWord{
+				B:      b,
+				Points: 1,
+			}
+		}
+	}
+	for _, word := range mClrs {
 		if words[strings.ToLower(word)] != nil {
 			words[strings.ToLower(word)].B = b
 		} else {
@@ -949,119 +1120,186 @@ func (db *GoDB) handleItemEdit(mainDB *GoDB) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if request.VATPercent >= 1 {
-			// VAT provided as full % number instead of fraction as >=1 would mean >=100%
-			// e.g.: 19 provided => 19 / 100 = 0.19
-			request.VATPercent = request.VATPercent / 100
+		db.doEditItem(w, user, request, itemID, true)
+	}
+}
+
+func (db *GoDB) handleBulkItemEdit(mainDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
 		}
-		if request.Categories == nil {
-			request.Categories = make([]string, 0)
+		storeID := chi.URLParam(r, "storeID")
+		if storeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
 		}
-		if request.Colors == nil {
-			request.Colors = make([]Category, 0)
+		responseStore, ok := mainDB.Read(StoreDB, storeID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
 		}
-		if request.ThumbnailURLs == nil {
-			request.ThumbnailURLs = make([]ItemImage, 0)
-		} else {
-			newArray := make([]ItemImage, 0)
-			var uUID string
-			// Convert Base64 to URL
-			for _, img := range request.ThumbnailURLs {
-				if img.URL == "" {
-					continue
-				}
-				if len(img.URL) >= 5 && img.URL[0:5] == "files" {
-					newArray = append(newArray, img)
-					continue
-				}
-				uUID, err = saveThumbnailImage(db, user, img.URL)
-				if err != nil {
-					continue
-				}
-				newArray = append(newArray, ItemImage{
-					URL:     fmt.Sprintf("files/public/get/%s", uUID),
-					Caption: img.Caption,
-				})
-			}
-			if len(newArray) > 0 {
-				request.ThumbnailURLs = newArray
-			}
-		}
-		if request.ThumbnailAnimatedURLs == nil {
-			request.ThumbnailAnimatedURLs = make([]ItemImage, 0)
-		}
-		if request.BannerURLs == nil {
-			request.BannerURLs = make([]ItemImage, 0)
-		}
-		if request.BannerAnimatedURLs == nil {
-			request.BannerAnimatedURLs = make([]ItemImage, 0)
-		}
-		if request.Variations == nil {
-			request.Variations = make([]ItemVariation, 0)
-		} else {
-			// Check if there are duplicate variations
-			vars := map[string]string{}
-			var varVars map[string]string
-			for _, variation := range request.Variations {
-				if vars[variation.Name] != "" {
-					http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-					return
-				}
-				vars[variation.Name] = "x"
-				// Check if there are duplicate variation variations
-				varVars = map[string]string{}
-				for _, varVar := range variation.Variations {
-					if varVars[varVar.StringValue] != "" {
-						http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-						return
-					}
-					varVars[varVar.StringValue] = "x"
-				}
-			}
-			var done bool
-			for {
-				done = true
-				for ix, variation := range request.Variations {
-					if variation.Name == "" {
-						request.Variations = append(request.Variations[:ix], request.Variations[ix+1:]...)
-						done = false
-						break
-					}
-				}
-				if done {
-					break
-				}
-			}
-		}
-		if request.Attributes == nil {
-			request.Attributes = make([]ItemAttribute, 0)
-		} else {
-			var done bool
-			for {
-				done = true
-				for ix, att := range request.Attributes {
-					if att.Name == "" {
-						request.Attributes = append(request.Attributes[:ix], request.Attributes[ix+1:]...)
-						done = false
-						break
-					}
-				}
-				if done {
-					break
-				}
-			}
-		}
-		// Update
-		_, txn := db.Get(ItemDB, itemID)
-		jsonEntry, err := json.Marshal(request)
+		store := &Store{}
+		err := json.Unmarshal(responseStore.Data, store)
 		if err != nil {
+			fmt.Println(err)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		err = db.Update(ItemDB, txn, itemID, jsonEntry, map[string]string{
-			"pid": FIndex(request.StoreUUID),
-		})
+		// Retrieve POST payload
+		request := &BulkItemEdit{}
+		if err := render.Bind(r, request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		bulkEditResults := BulkItemEditResults{Results: make([]bool, len(request.Items))}
+		for i, entry := range request.Items {
+			// Retrieve item
+			response, ok := db.Read(ItemDB, entry.UUID)
+			if !ok {
+				bulkEditResults.Results[i] = false
+				continue
+			}
+			item := &Item{}
+			err = json.Unmarshal(response.Data, item)
+			if err != nil {
+				bulkEditResults.Results[i] = false
+				continue
+			}
+			bulkEditResults.Results[i] = db.doEditItem(w, user, &entry.Payload, entry.UUID, false)
+		}
+		render.JSON(w, r, bulkEditResults)
 	}
+}
+
+func (db *GoDB) doEditItem(w http.ResponseWriter, user *User, request *Item, itemID string, noErrors bool) bool {
+	var err error
+	if request.VATPercent >= 1 {
+		// VAT provided as full % number instead of fraction as >=1 would mean >=100%
+		// e.g.: 19 provided => 19 / 100 = 0.19
+		request.VATPercent = request.VATPercent / 100
+	}
+	if request.Categories == nil {
+		request.Categories = make([]string, 0)
+	}
+	if request.Colors == nil {
+		request.Colors = make([]Category, 0)
+	}
+	if request.ThumbnailURLs == nil {
+		request.ThumbnailURLs = make([]ItemImage, 0)
+	} else {
+		newArray := make([]ItemImage, 0)
+		var uUID string
+		// Convert Base64 to URL
+		for _, img := range request.ThumbnailURLs {
+			if img.URL == "" {
+				continue
+			}
+			if len(img.URL) >= 5 && img.URL[0:5] == "files" {
+				newArray = append(newArray, img)
+				continue
+			}
+			uUID, err = saveThumbnailImage(db, user, img.URL)
+			if err != nil {
+				continue
+			}
+			newArray = append(newArray, ItemImage{
+				URL:     fmt.Sprintf("files/public/get/%s", uUID),
+				Caption: img.Caption,
+			})
+		}
+		if len(newArray) > 0 {
+			request.ThumbnailURLs = newArray
+		}
+	}
+	if request.ThumbnailAnimatedURLs == nil {
+		request.ThumbnailAnimatedURLs = make([]ItemImage, 0)
+	}
+	if request.BannerURLs == nil {
+		request.BannerURLs = make([]ItemImage, 0)
+	}
+	if request.BannerAnimatedURLs == nil {
+		request.BannerAnimatedURLs = make([]ItemImage, 0)
+	}
+	if request.Variations == nil {
+		request.Variations = make([]ItemVariation, 0)
+	} else {
+		// Check if there are duplicate variations
+		vars := map[string]string{}
+		var varVars map[string]string
+		for _, variation := range request.Variations {
+			if vars[variation.Name] != "" {
+				if !noErrors {
+					http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+				}
+				return false
+			}
+			vars[variation.Name] = "x"
+			// Check if there are duplicate variation variations
+			varVars = map[string]string{}
+			for _, varVar := range variation.Variations {
+				if varVars[varVar.StringValue] != "" {
+					if !noErrors {
+						http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+					}
+					return false
+				}
+				varVars[varVar.StringValue] = "x"
+			}
+		}
+		var done bool
+		for {
+			done = true
+			for ix, variation := range request.Variations {
+				if variation.Name == "" {
+					request.Variations = append(request.Variations[:ix], request.Variations[ix+1:]...)
+					done = false
+					break
+				}
+			}
+			if done {
+				break
+			}
+		}
+	}
+	if request.Attributes == nil {
+		request.Attributes = make([]ItemAttribute, 0)
+	} else {
+		var done bool
+		for {
+			done = true
+			for ix, att := range request.Attributes {
+				if att.Name == "" {
+					request.Attributes = append(request.Attributes[:ix], request.Attributes[ix+1:]...)
+					done = false
+					break
+				}
+			}
+			if done {
+				break
+			}
+		}
+	}
+	// Update
+	_, txn := db.Get(ItemDB, itemID)
+	jsonEntry, err := json.Marshal(request)
+	if err != nil {
+		if !noErrors {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		}
+		return false
+	}
+	index := map[string]string{
+		"pid": FIndex(request.StoreUUID),
+	}
+	index = createItemIndex(request, index, true)
+	err = db.Update(ItemDB, txn, itemID, jsonEntry, index)
+	if err != nil {
+		return false
+	}
+	return true
 }
 
 func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
@@ -1081,6 +1319,7 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 		}
 		queryResponse := &ItemFilters{
 			Variations: make([]ItemVariation, 0),
+			Colors:     make([]Category, 0),
 			MinCost:    0,
 			MaxCost:    0,
 			AvgCost:    0,
@@ -1095,6 +1334,7 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 		var count int
 		var groupKey string
 		variMap := map[string]bool{}
+		colorMap := map[string]bool{}
 		var groupKeyExists bool
 		var ix int
 		for _, entry := range response {
@@ -1151,6 +1391,18 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 					}
 				}
 			}
+			// Colors
+			if len(item.Colors) > 0 {
+				for _, color := range item.Colors {
+					// Check if color exists yet
+					groupKeyExists = colorMap[color.ColorHex]
+					if !groupKeyExists {
+						// Doesn't exist -> Add
+						colorMap[color.ColorHex] = true
+						queryResponse.Colors = append(queryResponse.Colors, color)
+					}
+				}
+			}
 		}
 		// Actually calculate average cost
 		if count > 0 && queryResponse.AvgCost != 0 {
@@ -1177,4 +1429,53 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 		}
 		render.JSON(w, r, queryResponse)
 	}
+}
+
+// createItemIndex() adds relevant data to the item's index, e.g. categories
+func createItemIndex(item *Item, index map[string]string, isUpdate bool) map[string]string {
+	// *** Categories ***
+	if len(item.Categories) > 0 {
+		for i, category := range item.Categories {
+			// We append "[i" to the key as the index type is map
+			// We omit "]" to save time on more truncating/splitting than necessary
+			index[fmt.Sprintf("pid-cat[%d", i)] = fmt.Sprintf("%s;%s", item.StoreUUID, category)
+		}
+	} else {
+		if isUpdate {
+			// When updating we need to clear previous entries
+			// ... in case the new item does not have those values
+			index["pid-cat"] = ""
+		}
+	}
+	// *** Brand ***
+	if item.Brand != "" {
+		index["pid-brand"] = fmt.Sprintf("%s;%s", item.StoreUUID, item.Brand)
+	} else {
+		if isUpdate {
+			index["pid-brand"] = ""
+		}
+	}
+	// *** Manufacturer ***
+	if item.Manufacturer != "" {
+		index["pid-manu"] = fmt.Sprintf("%s;%s", item.StoreUUID, item.Manufacturer)
+	} else {
+		if isUpdate {
+			index["pid-manu"] = ""
+		}
+	}
+	// *** Colors ***
+	if len(item.Colors) > 0 {
+		for i, color := range item.Colors {
+			// We append "[i" to the key as the index type is map
+			// We omit "]" to save time on more truncating/splitting than necessary
+			index[fmt.Sprintf("pid-clrs[%d", i)] = fmt.Sprintf("%s;%s", item.StoreUUID, color.Name)
+		}
+	} else {
+		if isUpdate {
+			// When updating we need to clear previous entries
+			// ... in case the new item does not have those values
+			index["pid-clrs"] = ""
+		}
+	}
+	return index
 }
