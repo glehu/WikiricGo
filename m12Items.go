@@ -142,6 +142,8 @@ type BulkItemModification struct {
 type ItemFilters struct {
 	Variations []ItemVariation `json:"vars"`
 	Colors     []Category      `json:"clrs"`
+	Categories []string        `json:"cats"`
+	Brands     []string        `json:"brands"`
 	MinCost    float64         `json:"min"`
 	MaxCost    float64         `json:"max"`
 	AvgCost    float64         `json:"avg"`
@@ -538,18 +540,21 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 		var customIndices = false
 		index := map[string]string{}
 		if request.Brand != "" {
-			index["pid-brand"] = fmt.Sprintf("%s;%s", storeID, request.Brand)
+			index["pid-brand"] =
+				fmt.Sprintf("%s;%s", storeID, strings.ToLower(request.Brand))
 			customIndices = true
 		}
 		if len(request.Categories) > 0 {
 			for i, category := range request.Categories {
-				index[fmt.Sprintf("pid-cat[%d", i)] = fmt.Sprintf("%s;%s", storeID, category)
+				index[fmt.Sprintf("pid-cat[%d", i)] =
+					fmt.Sprintf("%s;%s", storeID, strings.ToLower(category))
 			}
 			customIndices = true
 		}
 		if len(request.Colors) > 0 {
 			for i, color := range request.Colors {
-				index[fmt.Sprintf("pid-clrs[%d", i)] = fmt.Sprintf("%s;%s", storeID, color)
+				index[fmt.Sprintf("pid-clrs[%d", i)] =
+					fmt.Sprintf("%s;%s", storeID, strings.ToLower(color))
 			}
 			customIndices = true
 		}
@@ -1438,7 +1443,8 @@ func createItemIndex(item *Item, index map[string]string, isUpdate bool) map[str
 		for i, category := range item.Categories {
 			// We append "[i" to the key as the index type is map
 			// We omit "]" to save time on more truncating/splitting than necessary
-			index[fmt.Sprintf("pid-cat[%d", i)] = fmt.Sprintf("%s;%s", item.StoreUUID, category)
+			index[fmt.Sprintf("pid-cat[%d", i)] =
+				fmt.Sprintf("%s;%s", item.StoreUUID, strings.ToLower(category))
 		}
 	} else {
 		if isUpdate {
@@ -1449,7 +1455,8 @@ func createItemIndex(item *Item, index map[string]string, isUpdate bool) map[str
 	}
 	// *** Brand ***
 	if item.Brand != "" {
-		index["pid-brand"] = fmt.Sprintf("%s;%s", item.StoreUUID, item.Brand)
+		index["pid-brand"] =
+			fmt.Sprintf("%s;%s", item.StoreUUID, strings.ToLower(item.Brand))
 	} else {
 		if isUpdate {
 			index["pid-brand"] = ""
@@ -1457,7 +1464,8 @@ func createItemIndex(item *Item, index map[string]string, isUpdate bool) map[str
 	}
 	// *** Manufacturer ***
 	if item.Manufacturer != "" {
-		index["pid-manu"] = fmt.Sprintf("%s;%s", item.StoreUUID, item.Manufacturer)
+		index["pid-manu"] =
+			fmt.Sprintf("%s;%s", item.StoreUUID, strings.ToLower(item.Manufacturer))
 	} else {
 		if isUpdate {
 			index["pid-manu"] = ""
@@ -1468,7 +1476,8 @@ func createItemIndex(item *Item, index map[string]string, isUpdate bool) map[str
 		for i, color := range item.Colors {
 			// We append "[i" to the key as the index type is map
 			// We omit "]" to save time on more truncating/splitting than necessary
-			index[fmt.Sprintf("pid-clrs[%d", i)] = fmt.Sprintf("%s;%s", item.StoreUUID, color.Name)
+			index[fmt.Sprintf("pid-clrs[%d", i)] =
+				fmt.Sprintf("%s;%s", item.StoreUUID, strings.ToLower(color.Name))
 		}
 	} else {
 		if isUpdate {
