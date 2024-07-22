@@ -1325,6 +1325,8 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 		queryResponse := &ItemFilters{
 			Variations: make([]ItemVariation, 0),
 			Colors:     make([]Category, 0),
+			Categories: make([]string, 0),
+			Brands:     make([]string, 0),
 			MinCost:    0,
 			MaxCost:    0,
 			AvgCost:    0,
@@ -1338,8 +1340,7 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 		var gross float64
 		var count int
 		var groupKey string
-		variMap := map[string]bool{}
-		colorMap := map[string]bool{}
+		cacheMap := map[string]bool{}
 		var groupKeyExists bool
 		var ix int
 		for _, entry := range response {
@@ -1366,14 +1367,15 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 			if len(item.Variations) > 0 {
 				for _, variation := range item.Variations {
 					// Check if main variation exists yet
-					groupKeyExists = variMap[variation.Name]
+					groupKey = fmt.Sprintf("vari-%s", variation.Name)
+					groupKeyExists = cacheMap[groupKey]
 					if !groupKeyExists {
 						// Doesn't exist -> Add
-						variMap[variation.Name] = true
+						cacheMap[groupKey] = true
 						queryResponse.Variations = append(queryResponse.Variations, variation)
 						for _, subVariation := range variation.Variations {
-							groupKey = fmt.Sprintf("%s;%s", variation.Name, subVariation.StringValue)
-							variMap[groupKey] = true
+							groupKey = fmt.Sprintf("vari-%s;%s", variation.Name, subVariation.StringValue)
+							cacheMap[groupKey] = true
 						}
 					} else {
 						// Exists -> Check for missing sub variations
@@ -1384,11 +1386,11 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 							}
 						}
 						for _, subVariation := range variation.Variations {
-							groupKey = fmt.Sprintf("%s;%s", variation.Name, subVariation.StringValue)
-							groupKeyExists = variMap[groupKey]
+							groupKey = fmt.Sprintf("vari-%s;%s", variation.Name, subVariation.StringValue)
+							groupKeyExists = cacheMap[groupKey]
 							if !groupKeyExists {
 								// Doesn't exist -> Add
-								variMap[groupKey] = true
+								cacheMap[groupKey] = true
 								queryResponse.Variations[ix].Variations = append(
 									queryResponse.Variations[ix].Variations, subVariation)
 							}
@@ -1396,16 +1398,35 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 					}
 				}
 			}
+			// Categories
+			if len(item.Categories) > 0 {
+				for _, category := range item.Categories {
+					groupKey = fmt.Sprintf("cat-%s", category)
+					groupKeyExists = cacheMap[groupKey]
+					if !groupKeyExists {
+						cacheMap[groupKey] = true
+						queryResponse.Categories = append(queryResponse.Categories, category)
+					}
+				}
+			}
 			// Colors
 			if len(item.Colors) > 0 {
 				for _, color := range item.Colors {
-					// Check if color exists yet
-					groupKeyExists = colorMap[color.ColorHex]
+					groupKey = fmt.Sprintf("clrs-%s", color.Name)
+					groupKeyExists = cacheMap[groupKey]
 					if !groupKeyExists {
-						// Doesn't exist -> Add
-						colorMap[color.ColorHex] = true
+						cacheMap[groupKey] = true
 						queryResponse.Colors = append(queryResponse.Colors, color)
 					}
+				}
+			}
+			// Brands
+			if item.Brand != "" {
+				groupKey = fmt.Sprintf("brand-%s", item.Brand)
+				groupKeyExists = cacheMap[groupKey]
+				if !groupKeyExists {
+					cacheMap[groupKey] = true
+					queryResponse.Brands = append(queryResponse.Brands, item.Brand)
 				}
 			}
 		}
