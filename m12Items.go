@@ -547,14 +547,14 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 		if len(request.Categories) > 0 {
 			for i, category := range request.Categories {
 				index[fmt.Sprintf("pid-cat[%d", i)] =
-					fmt.Sprintf("%s;%s", storeID, strings.ToLower(category))
+					fmt.Sprintf("%s;%s;", storeID, strings.ToLower(category))
 			}
 			customIndices = true
 		}
 		if len(request.Colors) > 0 {
 			for i, color := range request.Colors {
 				index[fmt.Sprintf("pid-clrs[%d", i)] =
-					fmt.Sprintf("%s;%s", storeID, strings.ToLower(color))
+					fmt.Sprintf("%s;%s;", storeID, strings.ToLower(color))
 			}
 			customIndices = true
 		}
@@ -1465,7 +1465,7 @@ func createItemIndex(item *Item, index map[string]string, isUpdate bool) map[str
 			// We append "[i" to the key as the index type is map
 			// We omit "]" to save time on more truncating/splitting than necessary
 			index[fmt.Sprintf("pid-cat[%d", i)] =
-				fmt.Sprintf("%s;%s", item.StoreUUID, strings.ToLower(category))
+				fmt.Sprintf("%s;%s;", item.StoreUUID, strings.ToLower(category))
 		}
 	} else {
 		if isUpdate {
@@ -1498,7 +1498,7 @@ func createItemIndex(item *Item, index map[string]string, isUpdate bool) map[str
 			// We append "[i" to the key as the index type is map
 			// We omit "]" to save time on more truncating/splitting than necessary
 			index[fmt.Sprintf("pid-clrs[%d", i)] =
-				fmt.Sprintf("%s;%s", item.StoreUUID, strings.ToLower(color.Name))
+				fmt.Sprintf("%s;%s;", item.StoreUUID, strings.ToLower(color.Name))
 		}
 	} else {
 		if isUpdate {

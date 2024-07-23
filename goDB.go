@@ -345,27 +345,33 @@ func (db *GoDB) doUpdate(
 	// 		Main:	 	|	m1:12345           | User1, Sample Name |
 	// 		Sub:		|	m1:usr:User1;12345 | 12345              |
 	var ival string
+	// Since we can process array indices, we need to make sure
+	// ...not to delete indices more than once later on
+	delCache := make(map[string]bool)
 	for k, v := range indices {
-		// Delete existing index
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		opts.Reverse = true
-		it := txn.NewIterator(opts)
 		// Remove array index values
 		k = processArrayIndexKey(k)
-		ival = fmt.Sprintf("%s:%s:", mod, k)
-		prefix := []byte(ival)
-		for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
-			// Match!
-			item := it.Item()
-			_ = item.Value(func(val []byte) error {
-				if bytes.Equal(val, uUID) {
-					_ = txn.Delete(item.KeyCopy(nil))
-				}
-				return nil
-			})
+		// Delete existing indices once
+		if !delCache[k] {
+			delCache[k] = true
+			opts := badger.DefaultIteratorOptions
+			opts.PrefetchValues = false
+			opts.Reverse = true
+			it := txn.NewIterator(opts)
+			ival = fmt.Sprintf("%s:%s:", mod, k)
+			prefix := []byte(ival)
+			for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
+				// Match!
+				item := it.Item()
+				_ = item.Value(func(val []byte) error {
+					if bytes.Equal(val, uUID) {
+						_ = txn.Delete(item.KeyCopy(nil))
+					}
+					return nil
+				})
+			}
+			it.Close()
 		}
-		it.Close()
 		// Set new index
 		if v == "" {
 			// Skip empty values as their keys are only needed to clear old entries
