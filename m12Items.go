@@ -679,13 +679,13 @@ func GetItemQueryPoints(
 			// Since we might filter with multiple categories,
 			// ... we need to avoid results not fitting all categories
 			if len(query.Categories) > 1 {
+				for _, cat := range item.Categories {
+					cats += fmt.Sprintf("%s ", strings.ToLower(cat))
+				}
 				for _, cat := range query.Categories {
 					if !strings.Contains(cats, cat) {
 						return 0, 0
 					}
-				}
-				for _, cat := range item.Categories {
-					cats += fmt.Sprintf("%s ", strings.ToLower(cat))
 				}
 			} else {
 				for _, cat := range item.Categories {
