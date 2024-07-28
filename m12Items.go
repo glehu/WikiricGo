@@ -147,6 +147,7 @@ type ItemFilters struct {
 	MinCost    float64         `json:"min"`
 	MaxCost    float64         `json:"max"`
 	AvgCost    float64         `json:"avg"`
+	Amount     int             `json:"amt"`
 }
 
 func (db *GoDB) PublicItemsEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, mainDB *GoDB) {
@@ -175,7 +176,7 @@ func (db *GoDB) ProtectedItemEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 		// Bulk operations
 		r.Route("/bulk", func(r chi.Router) {
 			r.Post("/create/{storeID}", db.handleBulkItemCreate(mainDB))
-			r.Post("/edit/{storeID}", db.handleItemEdit(mainDB))
+			r.Post("/edit/{storeID}", db.handleBulkItemEdit(mainDB))
 		})
 		// ###########
 		// ### GET ###
@@ -267,6 +268,7 @@ func (db *GoDB) handleItemCreate(mainDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		}
 		_, _ = fmt.Fprintln(w, uUID)
+		db.createStoreFilterCache(storeID)
 	}
 }
 
@@ -305,6 +307,7 @@ func (db *GoDB) handleBulkItemCreate(mainDB *GoDB) http.HandlerFunc {
 			bulkResults.Results[i] = db.doCreateItem(w, user, &item, storeID, true)
 		}
 		render.JSON(w, r, bulkResults)
+		db.createStoreFilterCache(storeID)
 	}
 }
 
@@ -562,7 +565,7 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 		if !customIndices {
 			index["pid"] = storeID
 		}
-		resp, err := db.Select(ItemDB, index, nil)
+		response, err := db.SSelect(ItemDB, index, nil)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -590,14 +593,8 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 		var points int64
 		var accuracy float64
 		b := false
-		// Await response as late as possible
-		response := <-resp
-		if len(response) < 1 {
-			render.JSON(w, r, queryResponse)
-			return
-		}
 		// Iterate over all items found
-		for _, entry := range response {
+		for entry := range response {
 			item = &Item{}
 			err = json.Unmarshal(entry.Data, item)
 			if err != nil {
@@ -669,7 +666,7 @@ func GetItemQueryPoints(
 	item *Item, query *ItemQuery, p *regexp.Regexp, words map[string]*QueryWord, b bool,
 ) (float64, int64) {
 	// Get all matches in selected fields
-	var mAtts, mCats, mName, mDesc, mKeys, mClrs []string
+	var mAtts, mCats, mName, mDesc, mKeys, mBrand, mClrs []string
 	// *** Title ***
 	if query.Fields == "" || strings.Contains(query.Fields, "title") {
 		mName = p.FindAllString(item.Name, -1)
@@ -681,6 +678,10 @@ func GetItemQueryPoints(
 	// *** Keywords ***
 	if query.Fields == "" || strings.Contains(query.Fields, "keys") {
 		mKeys = p.FindAllString(item.Keywords, -1)
+	}
+	// *** Brand ***
+	if query.Fields == "" || strings.Contains(query.Fields, "brand") {
+		mBrand = p.FindAllString(item.Brand, -1)
 	}
 	// *** Categories ***
 	if query.Fields == "" || strings.Contains(query.Fields, "cats") {
@@ -712,7 +713,8 @@ func GetItemQueryPoints(
 			mClrs = p.FindAllString(clrs, -1)
 		}
 	}
-	if len(mName) < 1 && len(mDesc) < 1 && len(mKeys) < 1 && len(mAtts) < 1 && len(mCats) < 1 && len(mClrs) < 1 {
+	// Long spaghetti-guard
+	if len(mKeys) < 1 && len(mDesc) < 1 && len(mName) < 1 && len(mBrand) < 1 && len(mAtts) < 1 && len(mCats) < 1 && len(mClrs) < 1 {
 		// Return 0 if there were no matches
 		return 0.0, 0
 	}
@@ -765,6 +767,16 @@ func GetItemQueryPoints(
 		}
 	}
 	for _, word := range mKeys {
+		if words[strings.ToLower(word)] != nil {
+			words[strings.ToLower(word)].B = b
+		} else {
+			words[strings.ToLower(word)] = &QueryWord{
+				B:      b,
+				Points: 1,
+			}
+		}
+	}
+	for _, word := range mBrand {
 		if words[strings.ToLower(word)] != nil {
 			words[strings.ToLower(word)].B = b
 		} else {
@@ -882,6 +894,7 @@ func (db *GoDB) handleItemDelete(mainDB *GoDB) http.HandlerFunc {
 		}
 		// Delete item
 		_ = db.Delete(ItemDB, itemID, []string{"pid"})
+		db.createStoreFilterCache(item.StoreUUID)
 	}
 }
 
@@ -1126,6 +1139,7 @@ func (db *GoDB) handleItemEdit(mainDB *GoDB) http.HandlerFunc {
 			return
 		}
 		db.doEditItem(w, user, request, itemID, true)
+		db.createStoreFilterCache(storeID)
 	}
 }
 
@@ -1161,21 +1175,10 @@ func (db *GoDB) handleBulkItemEdit(mainDB *GoDB) http.HandlerFunc {
 		}
 		bulkEditResults := BulkItemEditResults{Results: make([]bool, len(request.Items))}
 		for i, entry := range request.Items {
-			// Retrieve item
-			response, ok := db.Read(ItemDB, entry.UUID)
-			if !ok {
-				bulkEditResults.Results[i] = false
-				continue
-			}
-			item := &Item{}
-			err = json.Unmarshal(response.Data, item)
-			if err != nil {
-				bulkEditResults.Results[i] = false
-				continue
-			}
 			bulkEditResults.Results[i] = db.doEditItem(w, user, &entry.Payload, entry.UUID, false)
 		}
 		render.JSON(w, r, bulkEditResults)
+		db.createStoreFilterCache(storeID)
 	}
 }
 
@@ -1314,146 +1317,29 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		// Retrieve all Item entries
-		resp, err := db.Select(ItemDB, map[string]string{
-			"pid": storeID,
-		}, nil)
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-		queryResponse := &ItemFilters{
-			Variations: make([]ItemVariation, 0),
-			Colors:     make([]Category, 0),
-			Categories: make([]string, 0),
-			Brands:     make([]string, 0),
-			MinCost:    0,
-			MaxCost:    0,
-			AvgCost:    0,
-		}
-		response := <-resp
-		if len(response) < 1 {
+		// First check if there is an up-to-date cached filter entry to use
+		// We can save a lot of time (seconds) generating this filter report by using an existing one
+		queryResponse := db.getStoreFilterCache(storeID)
+		if queryResponse != nil {
 			render.JSON(w, r, queryResponse)
 			return
 		}
-		var item *Item
-		var gross float64
-		var count int
-		var groupKey string
-		cacheMap := map[string]bool{}
-		var groupKeyExists bool
-		var ix int
-		for _, entry := range response {
-			item = &Item{}
-			err = json.Unmarshal(entry.Data, item)
-			if err != nil {
-				continue
-			}
-			// Cost
-			if item.NetPrice > 0 {
-				count += 1
-				gross = item.NetPrice * (1 + item.VATPercent)
-				// We will divide the average cost by the amount later on to get the actual average
-				queryResponse.AvgCost += gross
-				// Min/Max?
-				if queryResponse.MinCost == 0 || gross < queryResponse.MinCost {
-					queryResponse.MinCost = gross
-				}
-				if queryResponse.MaxCost == 0 || gross > queryResponse.MaxCost {
-					queryResponse.MaxCost = gross
-				}
-			}
-			// Variations
-			if len(item.Variations) > 0 {
-				for _, variation := range item.Variations {
-					// Check if main variation exists yet
-					groupKey = fmt.Sprintf("vari-%s", variation.Name)
-					groupKeyExists = cacheMap[groupKey]
-					if !groupKeyExists {
-						// Doesn't exist -> Add
-						cacheMap[groupKey] = true
-						queryResponse.Variations = append(queryResponse.Variations, variation)
-						for _, subVariation := range variation.Variations {
-							groupKey = fmt.Sprintf("vari-%s;%s", variation.Name, subVariation.StringValue)
-							cacheMap[groupKey] = true
-						}
-					} else {
-						// Exists -> Check for missing sub variations
-						for i, tVariation := range queryResponse.Variations {
-							if tVariation.Name == variation.Name {
-								ix = i
-								break
-							}
-						}
-						for _, subVariation := range variation.Variations {
-							groupKey = fmt.Sprintf("vari-%s;%s", variation.Name, subVariation.StringValue)
-							groupKeyExists = cacheMap[groupKey]
-							if !groupKeyExists {
-								// Doesn't exist -> Add
-								cacheMap[groupKey] = true
-								queryResponse.Variations[ix].Variations = append(
-									queryResponse.Variations[ix].Variations, subVariation)
-							}
-						}
-					}
-				}
-			}
-			// Categories
-			if len(item.Categories) > 0 {
-				for _, category := range item.Categories {
-					groupKey = fmt.Sprintf("cat-%s", category)
-					groupKeyExists = cacheMap[groupKey]
-					if !groupKeyExists {
-						cacheMap[groupKey] = true
-						queryResponse.Categories = append(queryResponse.Categories, category)
-					}
-				}
-			}
-			// Colors
-			if len(item.Colors) > 0 {
-				for _, color := range item.Colors {
-					groupKey = fmt.Sprintf("clrs-%s", color.Name)
-					groupKeyExists = cacheMap[groupKey]
-					if !groupKeyExists {
-						cacheMap[groupKey] = true
-						queryResponse.Colors = append(queryResponse.Colors, color)
-					}
-				}
-			}
-			// Brands
-			if item.Brand != "" {
-				groupKey = fmt.Sprintf("brand-%s", item.Brand)
-				groupKeyExists = cacheMap[groupKey]
-				if !groupKeyExists {
-					cacheMap[groupKey] = true
-					queryResponse.Brands = append(queryResponse.Brands, item.Brand)
-				}
-			}
+		// There is no cached filter entry -> Create one
+		queryResponse = db.createStoreFilterCache(storeID)
+		if queryResponse != nil {
+			render.JSON(w, r, queryResponse)
+		} else {
+			render.JSON(w, r, ItemFilters{
+				Variations: make([]ItemVariation, 0),
+				Colors:     make([]Category, 0),
+				Categories: make([]string, 0),
+				Brands:     make([]string, 0),
+				MinCost:    0,
+				MaxCost:    0,
+				AvgCost:    0,
+				Amount:     0,
+			})
 		}
-		// Actually calculate average cost
-		if count > 0 && queryResponse.AvgCost != 0 {
-			queryResponse.AvgCost = queryResponse.AvgCost / float64(count)
-		}
-		// Sort main variations
-		if len(queryResponse.Variations) > 0 {
-			sort.SliceStable(
-				queryResponse.Variations, func(i, j int) bool {
-					return queryResponse.Variations[i].Name < queryResponse.Variations[j].Name
-				},
-			)
-			// Sort sub variations
-			for ix := range queryResponse.Variations {
-				if len(queryResponse.Variations[ix].Variations) > 0 {
-					sort.SliceStable(
-						queryResponse.Variations[ix].Variations, func(i, j int) bool {
-							return queryResponse.Variations[ix].Variations[i].StringValue <
-								queryResponse.Variations[ix].Variations[j].StringValue
-						},
-					)
-				}
-			}
-		}
-		render.JSON(w, r, queryResponse)
 	}
 }
 
@@ -1508,4 +1394,181 @@ func createItemIndex(item *Item, index map[string]string, isUpdate bool) map[str
 		}
 	}
 	return index
+}
+
+func (db *GoDB) createStoreFilterCache(storeID string) *ItemFilters {
+	// Retrieve all Item entries
+	response, err := db.SSelect(ItemDB, map[string]string{
+		"pid": storeID,
+	}, nil)
+	if err != nil {
+		return nil
+	}
+	queryResponse := &ItemFilters{
+		Variations: make([]ItemVariation, 0),
+		Colors:     make([]Category, 0),
+		Categories: make([]string, 0),
+		Brands:     make([]string, 0),
+		MinCost:    0,
+		MaxCost:    0,
+		AvgCost:    0,
+		Amount:     0,
+	}
+	var item *Item
+	var gross float64
+	var count int
+	var groupKey string
+	cacheMap := map[string]bool{}
+	var groupKeyExists bool
+	var ix int
+	for entry := range response {
+		item = &Item{}
+		err = json.Unmarshal(entry.Data, item)
+		if err != nil {
+			continue
+		}
+		queryResponse.Amount += 1
+		// Cost
+		if item.NetPrice > 0 {
+			count += 1
+			gross = item.NetPrice * (1 + item.VATPercent)
+			// We will divide the average cost by the amount later on to get the actual average
+			queryResponse.AvgCost += gross
+			// Min/Max?
+			if queryResponse.MinCost == 0 || gross < queryResponse.MinCost {
+				queryResponse.MinCost = gross
+			}
+			if queryResponse.MaxCost == 0 || gross > queryResponse.MaxCost {
+				queryResponse.MaxCost = gross
+			}
+		}
+		// Variations
+		if len(item.Variations) > 0 {
+			for _, variation := range item.Variations {
+				// Check if main variation exists yet
+				groupKey = fmt.Sprintf("vari-%s", variation.Name)
+				groupKeyExists = cacheMap[groupKey]
+				if !groupKeyExists {
+					// Doesn't exist -> Add
+					cacheMap[groupKey] = true
+					queryResponse.Variations = append(queryResponse.Variations, variation)
+					for _, subVariation := range variation.Variations {
+						groupKey = fmt.Sprintf("vari-%s;%s", variation.Name, subVariation.StringValue)
+						cacheMap[groupKey] = true
+					}
+				} else {
+					// Exists -> Check for missing sub variations
+					for i, tVariation := range queryResponse.Variations {
+						if tVariation.Name == variation.Name {
+							ix = i
+							break
+						}
+					}
+					for _, subVariation := range variation.Variations {
+						groupKey = fmt.Sprintf("vari-%s;%s", variation.Name, subVariation.StringValue)
+						groupKeyExists = cacheMap[groupKey]
+						if !groupKeyExists {
+							// Doesn't exist -> Add
+							cacheMap[groupKey] = true
+							queryResponse.Variations[ix].Variations = append(
+								queryResponse.Variations[ix].Variations, subVariation)
+						}
+					}
+				}
+			}
+		}
+		// Categories
+		if len(item.Categories) > 0 {
+			for _, category := range item.Categories {
+				groupKey = fmt.Sprintf("cat-%s", category)
+				groupKeyExists = cacheMap[groupKey]
+				if !groupKeyExists {
+					cacheMap[groupKey] = true
+					queryResponse.Categories = append(queryResponse.Categories, category)
+				}
+			}
+		}
+		// Colors
+		if len(item.Colors) > 0 {
+			for _, color := range item.Colors {
+				groupKey = fmt.Sprintf("clrs-%s", color.Name)
+				groupKeyExists = cacheMap[groupKey]
+				if !groupKeyExists {
+					cacheMap[groupKey] = true
+					queryResponse.Colors = append(queryResponse.Colors, color)
+				}
+			}
+		}
+		// Brands
+		if item.Brand != "" {
+			groupKey = fmt.Sprintf("brand-%s", item.Brand)
+			groupKeyExists = cacheMap[groupKey]
+			if !groupKeyExists {
+				cacheMap[groupKey] = true
+				queryResponse.Brands = append(queryResponse.Brands, item.Brand)
+			}
+		}
+	}
+	// Did we find something?
+	if queryResponse.Amount < 1 {
+		return nil
+	}
+	// Actually calculate average cost
+	if count > 0 && queryResponse.AvgCost != 0 {
+		queryResponse.AvgCost = queryResponse.AvgCost / float64(count)
+	}
+	// Sort main variations
+	if len(queryResponse.Variations) > 0 {
+		sort.SliceStable(
+			queryResponse.Variations, func(i, j int) bool {
+				return queryResponse.Variations[i].Name < queryResponse.Variations[j].Name
+			},
+		)
+		// Sort sub variations
+		for ix := range queryResponse.Variations {
+			if len(queryResponse.Variations[ix].Variations) > 0 {
+				sort.SliceStable(
+					queryResponse.Variations[ix].Variations, func(i, j int) bool {
+						return queryResponse.Variations[ix].Variations[i].StringValue <
+							queryResponse.Variations[ix].Variations[j].StringValue
+					},
+				)
+			}
+		}
+	}
+	// Store
+	jsonEntry, err := json.Marshal(queryResponse)
+	if err != nil {
+		return nil
+	}
+	_, err = db.Insert(ItemDB, jsonEntry, map[string]string{
+		"pid-filter": FIndex(storeID),
+	})
+	if err != nil {
+		return nil
+	}
+	return queryResponse
+}
+
+func (db *GoDB) getStoreFilterCache(storeID string) *ItemFilters {
+	resp, err := db.Select(ItemDB, map[string]string{
+		"pid-filter": FIndex(storeID),
+	}, &SelectOptions{
+		MaxResults: 1,
+		Page:       0,
+		Skip:       0,
+	})
+	if err != nil {
+		return nil
+	}
+	response := <-resp
+	if len(response) < 1 {
+		return nil
+	}
+	filters := &ItemFilters{}
+	err = json.Unmarshal(response[0].Data, filters)
+	if err != nil {
+		return nil
+	}
+	return filters
 }

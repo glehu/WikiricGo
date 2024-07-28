@@ -193,7 +193,7 @@ func (db *GoDB) Read(mod, uUID string) (*EntryResponse, bool) {
 	return entryResponse, true
 }
 
-// Select returns entries from the database
+// Select searches, batches up and returns all entries from the database with the provided filters
 func (db *GoDB) Select(
 	mod string, indices map[string]string, options *SelectOptions,
 ) (chan []*EntryResponse, error) {
@@ -280,6 +280,103 @@ func (db *GoDB) Select(
 				if skipDone || attempts.Load() >= skip {
 					// Append the result to the slice
 					sortedEntries = append(sortedEntries, entry)
+					if hasMaxResults {
+						current = count.Add(1)
+						// Check if we've reached the maximum results
+						if current >= maxResults {
+							cancel()
+							gatherDone = true
+						}
+					}
+				} else {
+					attempts.Add(1)
+				}
+				break
+			}
+		}
+	}()
+	// Return response channel
+	return responsesExternal, nil
+}
+
+// SSelect searches and returns entries one by one from the database with the provided filters
+func (db *GoDB) SSelect(
+	mod string, indices map[string]string, options *SelectOptions,
+) (chan *EntryResponse, error) {
+	indicesClean, err := db.validateIndices(indices, true)
+	if err != nil {
+		return nil, err
+	}
+	// Set default SelectOptions
+	maxResults := int64(-1)
+	page := int64(0)
+	skip := int64(0)
+	// Check *SelectOptions
+	if options != nil {
+		maxResults = options.MaxResults
+		page = options.Page
+		skip = options.Skip
+	}
+	// Return if no results are wanted (probably malformed input)
+	if maxResults == 0 {
+		return nil, nil
+	}
+	hasMaxResults := maxResults != int64(-1)
+	// Calculate final skip count if page is not the first one + maxResults is set
+	if page > int64(0) && maxResults != int64(-1) {
+		// Skip an additional maxResults * page results
+		skip += maxResults * page
+	}
+	// Prepare wait group and response channels
+	wg := sync.WaitGroup{}
+	responsesInternal := make(chan *EntryResponse)
+	responsesExternal := make(chan *EntryResponse)
+	done := make(chan bool)
+	ctx, cancel := context.WithCancel(context.Background())
+	// Launch index search goroutines
+	for key, value := range indicesClean {
+		wg.Add(1)
+		go db.singleIndexQuery(mod, processArrayIndexKey(key), value, responsesInternal, &wg, ctx)
+	}
+	// Start goroutine awaiting a cancellation
+	go func() {
+		wg.Wait()
+		done <- true
+	}()
+	// Start goroutine collecting all results
+	go func() {
+		count := &atomic.Int64{}
+		attempts := &atomic.Int64{}
+		current := int64(0)
+		skipDone := skip == int64(0) // If skip = 0, skipDone is automatically true
+		gatherDone := false
+		cache := map[string]bool{} // Unique results only
+		for {
+			select {
+			case <-done:
+				// *** We are done collecting ***
+				close(responsesInternal)
+				close(responsesExternal)
+				return
+			case entry := <-responsesInternal:
+				// *** New result collected ***
+				if entry.uUID == "" {
+					continue
+				}
+				if gatherDone {
+					break
+				}
+				// Only collect unique results, so check cache first
+				if cache[entry.uUID] {
+					continue
+				} else {
+					// Not found yet, so remember it now
+					cache[entry.uUID] = true
+				}
+				// Collect all found values after having skipped all results that had to be skipped
+				if skipDone || attempts.Load() >= skip {
+					// Send back to caller
+					responsesExternal <- entry
 					if hasMaxResults {
 						current = count.Add(1)
 						// Check if we've reached the maximum results
