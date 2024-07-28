@@ -268,7 +268,7 @@ func (db *GoDB) handleItemCreate(mainDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		}
 		_, _ = fmt.Fprintln(w, uUID)
-		db.createStoreFilterCache(storeID)
+		go db.createStoreFilterCache(storeID)
 	}
 }
 
@@ -307,7 +307,7 @@ func (db *GoDB) handleBulkItemCreate(mainDB *GoDB) http.HandlerFunc {
 			bulkResults.Results[i] = db.doCreateItem(w, user, &item, storeID, true)
 		}
 		render.JSON(w, r, bulkResults)
-		db.createStoreFilterCache(storeID)
+		go db.createStoreFilterCache(storeID)
 	}
 }
 
@@ -549,8 +549,9 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 		}
 		if len(request.Categories) > 0 {
 			for i, category := range request.Categories {
+				request.Categories[i] = strings.ToLower(category)
 				index[fmt.Sprintf("pid-cat[%d", i)] =
-					fmt.Sprintf("%s;%s;", storeID, strings.ToLower(category))
+					fmt.Sprintf("%s;%s;", storeID, request.Categories[i])
 			}
 			customIndices = true
 		}
@@ -560,6 +561,9 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 					fmt.Sprintf("%s;%s;", storeID, strings.ToLower(color))
 			}
 			customIndices = true
+		}
+		if request.Brand != "" {
+			request.Brand = strings.ToLower(request.Brand)
 		}
 		// Search for all items if no index filters were supplied
 		if !customIndices {
@@ -665,33 +669,50 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 func GetItemQueryPoints(
 	item *Item, query *ItemQuery, p *regexp.Regexp, words map[string]*QueryWord, b bool,
 ) (float64, int64) {
+	points := int64(0)
 	// Get all matches in selected fields
 	var mAtts, mCats, mName, mDesc, mKeys, mBrand, mClrs []string
+	// *** Categories ***
+	if query.Fields == "" || strings.Contains(query.Fields, "cats") {
+		if len(item.Categories) > 0 {
+			var cats string
+			// Since we might filter with multiple categories,
+			// ... we need to avoid results not fitting all categories
+			if len(query.Categories) > 1 {
+				for _, cat := range query.Categories {
+					if !strings.Contains(cats, cat) {
+						return 0, 0
+					}
+				}
+				for _, cat := range item.Categories {
+					cats += fmt.Sprintf("%s ", strings.ToLower(cat))
+				}
+			} else {
+				for _, cat := range item.Categories {
+					cats += fmt.Sprintf("%s ", cat)
+				}
+			}
+			mCats = p.FindAllString(cats, -1)
+		}
+	}
+	// *** Brand ***
+	if query.Fields == "" || strings.Contains(query.Fields, "brand") {
+		if query.Brand != "" && strings.ToLower(item.Brand) != query.Brand {
+			return 0, 0
+		}
+		mBrand = p.FindAllString(item.Brand, -1)
+	}
 	// *** Title ***
 	if query.Fields == "" || strings.Contains(query.Fields, "title") {
 		mName = p.FindAllString(item.Name, -1)
 	}
 	// *** Description ***
 	if query.Fields == "" || strings.Contains(query.Fields, "desc") {
-		mDesc = p.FindAllString(item.Description, -1)
+		mDesc = p.FindAllString(EllipticalTruncate(item.Description, 200), -1)
 	}
 	// *** Keywords ***
 	if query.Fields == "" || strings.Contains(query.Fields, "keys") {
 		mKeys = p.FindAllString(item.Keywords, -1)
-	}
-	// *** Brand ***
-	if query.Fields == "" || strings.Contains(query.Fields, "brand") {
-		mBrand = p.FindAllString(item.Brand, -1)
-	}
-	// *** Categories ***
-	if query.Fields == "" || strings.Contains(query.Fields, "cats") {
-		if len(item.Categories) > 0 {
-			var cats string
-			for _, cat := range item.Categories {
-				cats += fmt.Sprintf("%s ", cat)
-			}
-			mCats = p.FindAllString(cats, -1)
-		}
 	}
 	// *** Attributes ***
 	if query.Fields == "" || strings.Contains(query.Fields, "attr") {
@@ -723,7 +744,6 @@ func GetItemQueryPoints(
 		word.B = !b
 	}
 	// Calculate points
-	points := int64(0)
 	pointsMax := len(words)
 	accuracy := 0.0
 	for _, word := range mCats {
@@ -1139,7 +1159,7 @@ func (db *GoDB) handleItemEdit(mainDB *GoDB) http.HandlerFunc {
 			return
 		}
 		db.doEditItem(w, user, request, itemID, true)
-		db.createStoreFilterCache(storeID)
+		go db.createStoreFilterCache(storeID)
 	}
 }
 
@@ -1178,7 +1198,7 @@ func (db *GoDB) handleBulkItemEdit(mainDB *GoDB) http.HandlerFunc {
 			bulkEditResults.Results[i] = db.doEditItem(w, user, &entry.Payload, entry.UUID, false)
 		}
 		render.JSON(w, r, bulkEditResults)
-		db.createStoreFilterCache(storeID)
+		go db.createStoreFilterCache(storeID)
 	}
 }
 
