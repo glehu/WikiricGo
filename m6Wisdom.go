@@ -1395,13 +1395,6 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 		if options.MaxResults <= 0 {
 			options.MaxResults = -1
 		}
-		resp, err := db.Select(WisdomDB, map[string]string{
-			"knowledgeID-type": fmt.Sprintf("%s;%s", knowledgeID, request.Type),
-		}, options)
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
 		queryResponse := &QueryResponse{
 			TimeSeconds: 0,
 			Lessons:     make([]*WisdomContainer, 0),
@@ -1414,11 +1407,6 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 			Courses:     make([]*WisdomContainer, 0),
 			Misc:        make([]*WisdomContainer, 0),
 		}
-		response := <-resp
-		if len(response) < 1 {
-			render.JSON(w, r, queryResponse)
-			return
-		}
 		// Turn query text into a full regex pattern
 		words, p := GetRegexQuery(request.Query)
 		var replies []*WisdomContainer
@@ -1429,7 +1417,14 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 		var points int64
 		var accuracy float64
 		b := false
-		for _, entry := range response {
+		response, err := db.SSelect(WisdomDB, map[string]string{
+			"knowledgeID-type": fmt.Sprintf("%s;%s", knowledgeID, request.Type),
+		}, options, 10, int(options.MaxResults))
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		for entry := range response {
 			wisdom = &Wisdom{}
 			err = json.Unmarshal(entry.Data, wisdom)
 			if err != nil {

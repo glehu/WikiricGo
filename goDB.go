@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ### CONST ###
@@ -230,7 +231,16 @@ func (db *GoDB) Select(
 	// Launch index search goroutines
 	for key, value := range indicesClean {
 		wg.Add(1)
-		go db.singleIndexQuery(mod, processArrayIndexKey(key), value, responsesInternal, &wg, ctx)
+		valueT := value
+		keyT := key
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					return
+				}
+			}()
+			db.singleIndexQuery(mod, processArrayIndexKey(keyT), valueT, responsesInternal, &wg, ctx)
+		}()
 	}
 	// Start goroutine awaiting a cancellation
 	go func() {
@@ -299,9 +309,15 @@ func (db *GoDB) Select(
 	return responsesExternal, nil
 }
 
-// SSelect searches and returns entries one by one from the database with the provided filters
+// SSelect searches and returns entries one by one from the database with the provided filters.
+//
+// Since there could be millions of items, a timeout (adjusted with timeoutSec)
+// in seconds is required to avoid searching forever.
+//
+// An unbuffered or low capacity response channel (adjusted with bufSize) paired with a low timeout
+// could lead to missing more responses as the timeout does not pause upon processing results.
 func (db *GoDB) SSelect(
-	mod string, indices map[string]string, options *SelectOptions,
+	mod string, indices map[string]string, options *SelectOptions, timeoutSec int, bufSize int,
 ) (chan *EntryResponse, error) {
 	indicesClean, err := db.validateIndices(indices, true)
 	if err != nil {
@@ -317,6 +333,12 @@ func (db *GoDB) SSelect(
 		page = options.Page
 		skip = options.Skip
 	}
+	if timeoutSec < 0 {
+		timeoutSec = 999999
+	}
+	if bufSize < 0 {
+		bufSize = 0
+	}
 	// Return if no results are wanted (probably malformed input)
 	if maxResults == 0 {
 		return nil, nil
@@ -330,13 +352,22 @@ func (db *GoDB) SSelect(
 	// Prepare wait group and response channels
 	wg := sync.WaitGroup{}
 	responsesInternal := make(chan *EntryResponse)
-	responsesExternal := make(chan *EntryResponse)
+	responsesExternal := make(chan *EntryResponse, bufSize)
 	done := make(chan bool)
 	ctx, cancel := context.WithCancel(context.Background())
 	// Launch index search goroutines
 	for key, value := range indicesClean {
 		wg.Add(1)
-		go db.singleIndexQuery(mod, processArrayIndexKey(key), value, responsesInternal, &wg, ctx)
+		valueT := value
+		keyT := key
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					return
+				}
+			}()
+			db.singleIndexQuery(mod, processArrayIndexKey(keyT), valueT, responsesInternal, &wg, ctx)
+		}()
 	}
 	// Start goroutine awaiting a cancellation
 	go func() {
@@ -348,11 +379,18 @@ func (db *GoDB) SSelect(
 		count := &atomic.Int64{}
 		attempts := &atomic.Int64{}
 		current := int64(0)
-		skipDone := skip == int64(0) // If skip = 0, skipDone is automatically true
 		gatherDone := false
-		cache := map[string]bool{} // Unique results only
+		skipDone := skip == int64(0)                                   // If skip = 0, skipDone is automatically true
+		cache := map[string]bool{}                                     // Unique results only
+		timeout := time.After(time.Duration(timeoutSec) * time.Second) // Added to avoid deadlock situations (1 GB RAM server moments)
 		for {
 			select {
+			case <-timeout:
+				// *** Timeout ***
+				cancel()
+				close(responsesInternal)
+				close(responsesExternal)
+				return
 			case <-done:
 				// *** We are done collecting ***
 				close(responsesInternal)
@@ -497,6 +535,10 @@ func (db *GoDB) singleIndexQuery(
 		defer it.Close()
 		ival := fmt.Sprintf("%s:%s:%s", mod, index, value)
 		prefix := []byte(ival)
+		var ix *badger.Item
+		var err error
+		var item *badger.Item
+		var ixEntry []byte
 		for SeekLast(it, prefix); it.ValidForPrefix(prefix); it.Next() {
 			// Listen to the Done-chanel to make sure we're not wasting resources
 			select {
@@ -504,30 +546,26 @@ func (db *GoDB) singleIndexQuery(
 				wg.Done()
 				return errors.New("CTX cancel received")
 			default:
-				// Match!
-				item := it.Item()
-				err := item.Value(func(v []byte) error {
-					// Since sub index entries' values point to the main index entry's uuid,
-					// we need to get the main index entry now
-					sTmp := fmt.Sprintf("%s", v)
-					if sTmp != "" {
-						sTmp = ""
-					}
-					ix, err := txn.Get([]byte(fmt.Sprintf("%s:uid:%s", mod, v)))
-					if err != nil {
-						return nil
-					}
-					ixEntry, err := ix.ValueCopy(nil)
-					noResults = false
-					responses <- &EntryResponse{
-						uUID: string(v),
-						Data: ixEntry,
-					}
-					return nil
-				})
+			}
+			// Match!
+			item = it.Item()
+			err = item.Value(func(v []byte) error {
+				// Since sub index entries' values point to the main index entry's uuid,
+				// we need to get the main index entry now
+				ix, err = txn.Get([]byte(fmt.Sprintf("%s:uid:%s", mod, v)))
 				if err != nil {
-					return err
+					return nil
 				}
+				ixEntry, err = ix.ValueCopy(nil)
+				noResults = false
+				responses <- &EntryResponse{
+					uUID: string(v),
+					Data: ixEntry,
+				}
+				return nil
+			})
+			if err != nil {
+				return err
 			}
 		}
 		return nil

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -520,150 +521,169 @@ func (db *GoDB) handleItemGet() http.HandlerFunc {
 
 func (db *GoDB) handleItemQuery() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		timeStart := time.Now()
-		storeID := chi.URLParam(r, "storeID")
-		if storeID == "" {
-			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-			return
+		// Don't imprison the caller
+		// ... we still need to handle an internal timeout, though,
+		// ... as this literally only protects the caller
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c := make(chan *ItemQueryResponse)
+		go db.doItemQuery(w, r, c, ctx)
+		select {
+		case <-ctx.Done():
+			http.Error(w, http.StatusText(http.StatusGatewayTimeout), http.StatusGatewayTimeout)
+		case resp := <-c:
+			render.JSON(w, r, resp)
 		}
-		// Retrieve POST payload
-		request := &ItemQuery{}
-		if err := render.Bind(r, request); err != nil {
-			fmt.Println(err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+	}
+}
+
+func (db *GoDB) doItemQuery(w http.ResponseWriter, r *http.Request, c chan *ItemQueryResponse, ctx context.Context) {
+	timeStart := time.Now()
+	queryResponse := &ItemQueryResponse{
+		TimeSeconds: 0,
+		Items:       make([]*ItemContainer, 0),
+	}
+	storeID := chi.URLParam(r, "storeID")
+	if storeID == "" {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		c <- queryResponse
+		return
+	}
+	// Retrieve POST payload
+	request := &ItemQuery{}
+	if err := render.Bind(r, request); err != nil {
+		fmt.Println(err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		c <- queryResponse
+		return
+	}
+	// Options?
+	options := r.Context().Value("pagination").(*SelectOptions)
+	if options.MaxResults <= 0 {
+		options.MaxResults = 25
+	}
+	maxResults := int(options.MaxResults)
+	// Retrieve all Item entries respecting the query index filters
+	var customIndices = false
+	index := map[string]string{}
+	if request.Brand != "" {
+		index["pid-brand"] =
+			fmt.Sprintf("%s;%s", storeID, strings.ToLower(request.Brand))
+		customIndices = true
+	}
+	if len(request.Categories) > 0 {
+		for i, category := range request.Categories {
+			request.Categories[i] = strings.ToLower(category)
+			index[fmt.Sprintf("pid-cat[%d", i)] =
+				fmt.Sprintf("%s;%s;", storeID, request.Categories[i])
 		}
-		// Options?
-		options := r.Context().Value("pagination").(*SelectOptions)
-		if options.MaxResults <= 0 {
-			options.MaxResults = 25
+		customIndices = true
+	}
+	if len(request.Colors) > 0 {
+		for i, color := range request.Colors {
+			index[fmt.Sprintf("pid-clrs[%d", i)] =
+				fmt.Sprintf("%s;%s;", storeID, strings.ToLower(color))
 		}
-		maxResults := int(options.MaxResults)
-		// Retrieve all Item entries respecting the query index filters
-		var customIndices = false
-		index := map[string]string{}
-		if request.Brand != "" {
-			index["pid-brand"] =
-				fmt.Sprintf("%s;%s", storeID, strings.ToLower(request.Brand))
-			customIndices = true
-		}
-		if len(request.Categories) > 0 {
-			for i, category := range request.Categories {
-				request.Categories[i] = strings.ToLower(category)
-				index[fmt.Sprintf("pid-cat[%d", i)] =
-					fmt.Sprintf("%s;%s;", storeID, request.Categories[i])
+		customIndices = true
+	}
+	if request.Brand != "" {
+		request.Brand = strings.ToLower(request.Brand)
+	}
+	// Search for all items if no index filters were supplied
+	if !customIndices {
+		index["pid"] = storeID
+	}
+	// Turn query text into a full regex pattern
+	words, p := GetRegexQuery(request.Query)
+	// Build csv (comma seperated values) content for variations query if provided
+	if len(request.Variations) > 0 {
+		for ix, variation := range request.Variations {
+			if len(variation.StringValues) > 0 {
+				for i := 0; i < len(variation.StringValues); i++ {
+					request.Variations[ix].Csv += fmt.Sprintf("|%s|", request.Variations[ix].StringValues[i])
+				}
 			}
-			customIndices = true
 		}
-		if len(request.Colors) > 0 {
-			for i, color := range request.Colors {
-				index[fmt.Sprintf("pid-clrs[%d", i)] =
-					fmt.Sprintf("%s;%s;", storeID, strings.ToLower(color))
-			}
-			customIndices = true
-		}
-		if request.Brand != "" {
-			request.Brand = strings.ToLower(request.Brand)
-		}
-		// Search for all items if no index filters were supplied
-		if !customIndices {
-			index["pid"] = storeID
-		}
-		response, err := db.SSelect(ItemDB, index, nil)
+	}
+	// Set up variables
+	var container *ItemContainer
+	var item *Item
+	var analytics *Analytics
+	var points int64
+	var accuracy float64
+	b := false
+	// Iterate over all items found
+	response, err := db.SSelect(ItemDB, index, nil, 4, int(options.MaxResults))
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		c <- queryResponse
+		return
+	}
+	for entry := range response {
+		item = &Item{}
+		err = json.Unmarshal(entry.Data, item)
 		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
+			continue
 		}
-		queryResponse := &ItemQueryResponse{
-			TimeSeconds: 0,
-			Items:       make([]*ItemContainer, 0),
+		// Compare cost if provided
+		if request.MinCost != 0.0 && item.NetPrice*(1+item.VATPercent) < request.MinCost {
+			continue
 		}
-		// Turn query text into a full regex pattern
-		words, p := GetRegexQuery(request.Query)
-		// Build csv (comma seperated values) content for variations query if provided
+		if request.MaxCost != 0.0 && item.NetPrice*(1+item.VATPercent) > request.MaxCost {
+			continue
+		}
+		// Compare variations if provided
 		if len(request.Variations) > 0 {
-			for ix, variation := range request.Variations {
-				if len(variation.StringValues) > 0 {
-					for i := 0; i < len(variation.StringValues); i++ {
-						request.Variations[ix].Csv += fmt.Sprintf("|%s|", request.Variations[ix].StringValues[i])
-					}
-				}
-			}
-		}
-		// Set up variables
-		var container *ItemContainer
-		var item *Item
-		var analytics *Analytics
-		var points int64
-		var accuracy float64
-		b := false
-		// Iterate over all items found
-		for entry := range response {
-			item = &Item{}
-			err = json.Unmarshal(entry.Data, item)
-			if err != nil {
-				continue
-			}
-			// Compare cost if provided
-			if request.MinCost != 0.0 && item.NetPrice*(1+item.VATPercent) < request.MinCost {
-				continue
-			}
-			if request.MaxCost != 0.0 && item.NetPrice*(1+item.VATPercent) > request.MaxCost {
-				continue
-			}
-			// Compare variations if provided
-			if len(request.Variations) > 0 {
-				points = GetItemVariationPoints(item, request)
-				if points <= 0 {
-					continue
-				}
-			}
-			// Flip boolean on each iteration
-			b = !b
-			accuracy, points = GetItemQueryPoints(item, request, p, words, b)
+			points = GetItemVariationPoints(item, request)
 			if points <= 0 {
 				continue
 			}
-			// Truncate item description
-			if item.Description != "" {
-				item.Description = EllipticalTruncate(item.Description, 200)
-			}
-			// Load analytics if available
-			analytics = &Analytics{}
-			if item.AnalyticsUUID != "" {
-				anaBytes, okAna := db.Read(AnaDB, item.AnalyticsUUID)
-				if okAna {
-					err = json.Unmarshal(anaBytes.Data, analytics)
-					if err != nil {
-						analytics = &Analytics{}
-					}
+		}
+		// Flip boolean on each iteration
+		b = !b
+		accuracy, points = GetItemQueryPoints(item, request, p, words, b)
+		if points <= 0 {
+			continue
+		}
+		// Truncate item description
+		if item.Description != "" {
+			item.Description = EllipticalTruncate(item.Description, 200)
+		}
+		// Load analytics if available
+		analytics = &Analytics{}
+		if item.AnalyticsUUID != "" {
+			anaBytes, okAna := db.Read(AnaDB, item.AnalyticsUUID)
+			if okAna {
+				err = json.Unmarshal(anaBytes.Data, analytics)
+				if err != nil {
+					analytics = &Analytics{}
 				}
 			}
-			// Add result
-			container = &ItemContainer{
-				UUID:      entry.uUID,
-				Item:      item,
-				Analytics: analytics,
-				Accuracy:  accuracy,
-			}
-			queryResponse.Items = append(queryResponse.Items, container)
-			// Stop if we have reached the maximum amount of results
-			if len(queryResponse.Items) >= maxResults {
-				break
-			}
 		}
-		// Sort entries by accuracy
-		if len(queryResponse.Items) > 1 {
-			sort.SliceStable(
-				queryResponse.Items, func(i, j int) bool {
-					return queryResponse.Items[i].Accuracy > queryResponse.Items[j].Accuracy
-				},
-			)
+		// Add result
+		container = &ItemContainer{
+			UUID:      entry.uUID,
+			Item:      item,
+			Analytics: analytics,
+			Accuracy:  accuracy,
 		}
-		duration := time.Since(timeStart)
-		queryResponse.TimeSeconds = duration.Seconds()
-		render.JSON(w, r, queryResponse)
+		queryResponse.Items = append(queryResponse.Items, container)
+		// Stop if we have reached the maximum amount of results
+		if len(queryResponse.Items) >= maxResults {
+			break
+		}
 	}
+	// Sort entries by accuracy
+	if len(queryResponse.Items) > 1 {
+		sort.SliceStable(
+			queryResponse.Items, func(i, j int) bool {
+				return queryResponse.Items[i].Accuracy > queryResponse.Items[j].Accuracy
+			},
+		)
+	}
+	duration := time.Since(timeStart)
+	queryResponse.TimeSeconds = duration.Seconds()
+	c <- queryResponse
 }
 
 func GetItemQueryPoints(
@@ -678,7 +698,7 @@ func GetItemQueryPoints(
 			var cats string
 			// Since we might filter with multiple categories,
 			// ... we need to avoid results not fitting all categories
-			if len(query.Categories) > 1 {
+			if len(query.Categories) > 0 {
 				for _, cat := range item.Categories {
 					cats += fmt.Sprintf("%s ", strings.ToLower(cat))
 				}
@@ -1420,7 +1440,7 @@ func (db *GoDB) createStoreFilterCache(storeID string) *ItemFilters {
 	// Retrieve all Item entries
 	response, err := db.SSelect(ItemDB, map[string]string{
 		"pid": storeID,
-	}, nil)
+	}, nil, 30, 0)
 	if err != nil {
 		return nil
 	}
