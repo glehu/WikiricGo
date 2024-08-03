@@ -152,6 +152,7 @@ func (db *GoDB) Delete(mod string, uUID string, indices []string) error {
 	return err
 }
 
+// Get retrieves a main index entry with the provided UUID and returns it with a transaction
 func (db *GoDB) Get(mod, uUID string) (*EntryResponse, *badger.Txn) {
 	var ixEntry []byte
 	err := db.db.View(func(txn *badger.Txn) error {
@@ -173,10 +174,11 @@ func (db *GoDB) Get(mod, uUID string) (*EntryResponse, *badger.Txn) {
 	return entryResponse, db.db.NewTransaction(true)
 }
 
+// Read retrieves a main index entry with the provided UUID and returns it
 func (db *GoDB) Read(mod, uUID string) (*EntryResponse, bool) {
 	var ixEntry []byte
 	err := db.db.View(func(txn *badger.Txn) error {
-		// Delete main index entry
+		// Get main index entry
 		ix, err := txn.Get([]byte(fmt.Sprintf("%s:uid:%s", mod, uUID)))
 		if err != nil {
 			return err
@@ -318,10 +320,10 @@ func (db *GoDB) Select(
 // could lead to missing more responses as the timeout does not pause upon processing results.
 func (db *GoDB) SSelect(
 	mod string, indices map[string]string, options *SelectOptions, timeoutSec int, bufSize int,
-) (chan *EntryResponse, error) {
+) (chan *EntryResponse, context.CancelFunc, error) {
 	indicesClean, err := db.validateIndices(indices, true)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Set default SelectOptions
 	maxResults := int64(-1)
@@ -341,7 +343,7 @@ func (db *GoDB) SSelect(
 	}
 	// Return if no results are wanted (probably malformed input)
 	if maxResults == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	hasMaxResults := maxResults != int64(-1)
 	// Calculate final skip count if page is not the first one + maxResults is set
@@ -431,7 +433,7 @@ func (db *GoDB) SSelect(
 		}
 	}()
 	// Return response channel
-	return responsesExternal, nil
+	return responsesExternal, cancel, nil
 }
 
 func (db *GoDB) doInsert(
@@ -525,6 +527,7 @@ func (db *GoDB) doUpdate(
 func (db *GoDB) singleIndexQuery(
 	mod, index, value string, responses chan *EntryResponse, wg *sync.WaitGroup, ctx context.Context,
 ) {
+	defer wg.Done()
 	noResults := true
 	// Prefix Iteration
 	err := db.db.View(func(txn *badger.Txn) error {
@@ -543,7 +546,6 @@ func (db *GoDB) singleIndexQuery(
 			// Listen to the Done-chanel to make sure we're not wasting resources
 			select {
 			case <-ctx.Done():
-				wg.Done()
 				return errors.New("CTX cancel received")
 			default:
 			}
@@ -579,7 +581,6 @@ func (db *GoDB) singleIndexQuery(
 			Data: nil,
 		}
 	}
-	wg.Done()
 }
 
 // ### Utility ###

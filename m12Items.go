@@ -41,6 +41,25 @@ type Item struct {
 	DateOfAppearance      string          `json:"doa"`
 }
 
+type ItemStock struct {
+	UUID        string  `json:"uid"`
+	TimeCreated int64   `json:"ts"`
+	Amount      float64 `json:"amt"`
+	Storage     string  `json:"stu"`
+	Type        string  `json:"type"`
+}
+
+type BulkItemStockModificationRequest struct {
+	Type          string                  `json:"type"` // ADD or SET
+	Modifications []ItemStockModification `json:"mods"`
+}
+
+type ItemStockModification struct {
+	UUID    string  `json:"uid"`
+	Amount  float64 `json:"amt"`
+	Storage string  `json:"stu"`
+}
+
 type BulkItem struct {
 	Items []Item `json:"items"`
 }
@@ -63,12 +82,14 @@ type BulkItemEditResults struct {
 }
 
 type ItemEntry struct {
-	UUID string `json:"uid"`
+	UUID  string  `json:"uid"`
+	Stock float64 `json:"stock"`
 	*Item
 }
 
 type ItemContainer struct {
-	UUID string `json:"uid"`
+	UUID  string  `json:"uid"`
+	Stock float64 `json:"stock"`
 	*Item
 	*Analytics
 	Accuracy float64 `json:"accuracy"`
@@ -115,6 +136,7 @@ type ItemQuery struct {
 	Categories []string         `json:"cats"`
 	Colors     []string         `json:"clrs"`
 	Brand      string           `json:"brand"`
+	MinStock   float64          `json:"minStock"`
 }
 
 type VariationQuery struct {
@@ -178,6 +200,7 @@ func (db *GoDB) ProtectedItemEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 		r.Route("/bulk", func(r chi.Router) {
 			r.Post("/create/{storeID}", db.handleBulkItemCreate(mainDB))
 			r.Post("/edit/{storeID}", db.handleBulkItemEdit(mainDB))
+			r.Post("/stock/{storeID}", db.handleBulkItemStockModification(mainDB))
 		})
 		// ###########
 		// ### GET ###
@@ -234,6 +257,17 @@ func (a *BulkItemModification) Bind(_ *http.Request) error {
 	return nil
 }
 
+func (a *BulkItemStockModificationRequest) Bind(_ *http.Request) error {
+	if len(a.Modifications) < 1 {
+		return errors.New("missing mods")
+	}
+	t := strings.ToLower(a.Type)
+	if t != "add" && t != "set" {
+		return errors.New("type not one of add or set")
+	}
+	return nil
+}
+
 func (db *GoDB) handleItemCreate(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -256,6 +290,10 @@ func (db *GoDB) handleItemCreate(mainDB *GoDB) http.HandlerFunc {
 		if err != nil {
 			fmt.Println(err)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if store.Username != user.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
 		// Retrieve POST payload
@@ -295,6 +333,10 @@ func (db *GoDB) handleBulkItemCreate(mainDB *GoDB) http.HandlerFunc {
 		if err != nil {
 			fmt.Println(err)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if store.Username != user.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
 		// Retrieve POST payload
@@ -369,7 +411,7 @@ func (db *GoDB) doCreateItem(w http.ResponseWriter, user *User, request *Item, s
 		for _, variation := range request.Variations {
 			if vars[variation.Name] != "" {
 				if !noErrors {
-					http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+					http.Error(w, "duplicate variations", http.StatusBadRequest)
 				}
 				return ""
 			}
@@ -379,7 +421,7 @@ func (db *GoDB) doCreateItem(w http.ResponseWriter, user *User, request *Item, s
 			for _, varVar := range variation.Variations {
 				if varVars[varVar.StringValue] != "" {
 					if !noErrors {
-						http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+						http.Error(w, "duplicate sub-variations", http.StatusBadRequest)
 					}
 					return ""
 				}
@@ -466,6 +508,8 @@ func (db *GoDB) handleItemGet() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
+		stockC, cncl := db.calculateItemStock(item.StoreUUID, itemID, "[main]")
+		defer cncl()
 		// Is there an analytics entry?
 		analytics := &Analytics{}
 		if item.AnalyticsUUID != "" {
@@ -512,9 +556,13 @@ func (db *GoDB) handleItemGet() http.HandlerFunc {
 				})
 			}
 		}
+		// Await stock response
+		stk := <-stockC
+		// Return item data to caller
 		render.JSON(w, r, &ItemEntry{
-			Item: item,
-			UUID: itemID,
+			Item:  item,
+			Stock: stk,
+			UUID:  itemID,
 		})
 	}
 }
@@ -524,10 +572,12 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 		// Don't imprison the caller
 		// ... we still need to handle an internal timeout, though,
 		// ... as this literally only protects the caller
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 		c := make(chan *ItemQueryResponse)
+		// *** Start the request ***
 		go db.doItemQuery(w, r, c, ctx)
+		// Await response
 		select {
 		case <-ctx.Done():
 			http.Error(w, http.StatusText(http.StatusGatewayTimeout), http.StatusGatewayTimeout)
@@ -606,14 +656,18 @@ func (db *GoDB) doItemQuery(w http.ResponseWriter, r *http.Request, c chan *Item
 		}
 	}
 	// Set up variables
+	hasStockFilter := request.MinStock > 0
 	var container *ItemContainer
 	var item *Item
 	var analytics *Analytics
 	var points int64
 	var accuracy float64
+	var stockC chan float64
+	var stk float64
+	var cncl context.CancelFunc
 	b := false
 	// Iterate over all items found
-	response, err := db.SSelect(ItemDB, index, nil, 4, int(options.MaxResults))
+	response, cancel, err := db.SSelect(ItemDB, index, nil, 4, int(options.MaxResults))
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		c <- queryResponse
@@ -641,9 +695,22 @@ func (db *GoDB) doItemQuery(w http.ResponseWriter, r *http.Request, c chan *Item
 		}
 		// Flip boolean on each iteration
 		b = !b
+		// Query content with provided prompt
 		accuracy, points = GetItemQueryPoints(item, request, p, words, b)
 		if points <= 0 {
 			continue
+		}
+		// Final (optional) check
+		if hasStockFilter {
+			stockC, cncl = db.calculateItemStock(storeID, entry.uUID, "[main]")
+			// Await answer
+			stk = <-stockC
+			if stk < request.MinStock {
+				cncl()
+				continue
+			}
+		} else {
+			stk = 0.0
 		}
 		// Truncate item description
 		if item.Description != "" {
@@ -663,6 +730,7 @@ func (db *GoDB) doItemQuery(w http.ResponseWriter, r *http.Request, c chan *Item
 		// Add result
 		container = &ItemContainer{
 			UUID:      entry.uUID,
+			Stock:     stk,
 			Item:      item,
 			Analytics: analytics,
 			Accuracy:  accuracy,
@@ -670,6 +738,7 @@ func (db *GoDB) doItemQuery(w http.ResponseWriter, r *http.Request, c chan *Item
 		queryResponse.Items = append(queryResponse.Items, container)
 		// Stop if we have reached the maximum amount of results
 		if len(queryResponse.Items) >= maxResults {
+			cancel()
 			break
 		}
 	}
@@ -1207,6 +1276,10 @@ func (db *GoDB) handleBulkItemEdit(mainDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
+		if store.Username != user.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
 		// Retrieve POST payload
 		request := &BulkItemEdit{}
 		if err := render.Bind(r, request); err != nil {
@@ -1220,6 +1293,109 @@ func (db *GoDB) handleBulkItemEdit(mainDB *GoDB) http.HandlerFunc {
 		render.JSON(w, r, bulkEditResults)
 		go db.createStoreFilterCache(storeID)
 	}
+}
+
+func (db *GoDB) handleBulkItemStockModification(mainDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		ts := TimeNowUnix()
+		storeID := chi.URLParam(r, "storeID")
+		if storeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		responseStore, ok := mainDB.Read(StoreDB, storeID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		store := &Store{}
+		err := json.Unmarshal(responseStore.Data, store)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if store.Username != user.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Retrieve POST payload
+		request := &BulkItemStockModificationRequest{}
+		if err := render.Bind(r, request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		modType := strings.ToLower(request.Type)
+		modResults := make([]bool, len(request.Modifications))
+		for i, entry := range request.Modifications {
+			switch modType {
+			case "set":
+				modResults[i] = db.handleItemStockSet(storeID, entry, ts)
+			case "add":
+				modResults[i] = db.handleItemStockAdd(storeID, entry, ts)
+			}
+		}
+		render.JSON(w, r, modResults)
+		// go db.createStoreFilterCache(storeID)
+	}
+}
+
+// handleItemStockSet adds a fixed stock update to the database
+func (db *GoDB) handleItemStockSet(storeID string, entry ItemStockModification, ts int64) bool {
+	if entry.Storage == "" {
+		entry.Storage = "[main]"
+	}
+	// Store
+	itemStock := ItemStock{
+		UUID:        entry.UUID,
+		TimeCreated: ts,
+		Amount:      entry.Amount,
+		Storage:     entry.Storage,
+		Type:        "SET",
+	}
+	jsonEntry, err := json.Marshal(itemStock)
+	if err != nil {
+		return false
+	}
+	_, err = db.Insert(ItemDB, jsonEntry, map[string]string{
+		"pid-uid-st": fmt.Sprintf("%s;%s;%s;%d", storeID, entry.UUID, entry.Storage, ts),
+	})
+	if err != nil {
+		return false
+	}
+	return true
+}
+
+// handleItemStockAdd modifies the current stock of an item
+// (e.g. a fixed stock update or starting with 0 if there has never been a stock update or modification)
+func (db *GoDB) handleItemStockAdd(storeID string, entry ItemStockModification, ts int64) bool {
+	if entry.Storage == "" {
+		entry.Storage = "[main]"
+	}
+	// Store
+	itemStock := ItemStock{
+		UUID:        entry.UUID,
+		TimeCreated: ts,
+		Amount:      entry.Amount,
+		Storage:     entry.Storage,
+		Type:        "ADD",
+	}
+	jsonEntry, err := json.Marshal(itemStock)
+	if err != nil {
+		return false
+	}
+	_, err = db.Insert(ItemDB, jsonEntry, map[string]string{
+		"pid-uid-st": fmt.Sprintf("%s;%s;%s;%d", storeID, entry.UUID, entry.Storage, ts),
+	})
+	if err != nil {
+		return false
+	}
+	return true
 }
 
 func (db *GoDB) doEditItem(w http.ResponseWriter, user *User, request *Item, itemID string, noErrors bool) bool {
@@ -1358,7 +1534,7 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 			return
 		}
 		// First check if there is an up-to-date cached filter entry to use
-		// We can save a lot of time (seconds) generating this filter report by using an existing one
+		// We can save a lot of time (around 20 seconds) generating this filter report by using an existing one
 		queryResponse := db.getStoreFilterCache(storeID)
 		if queryResponse != nil {
 			render.JSON(w, r, queryResponse)
@@ -1438,7 +1614,7 @@ func createItemIndex(item *Item, index map[string]string, isUpdate bool) map[str
 
 func (db *GoDB) createStoreFilterCache(storeID string) *ItemFilters {
 	// Retrieve all Item entries
-	response, err := db.SSelect(ItemDB, map[string]string{
+	response, _, err := db.SSelect(ItemDB, map[string]string{
 		"pid": storeID,
 	}, nil, 30, 0)
 	if err != nil {
@@ -1585,6 +1761,7 @@ func (db *GoDB) createStoreFilterCache(storeID string) *ItemFilters {
 		"pid-filter": FIndex(storeID),
 	})
 	if err != nil {
+		// TODO: We should try again...
 		return nil
 	}
 	return queryResponse
@@ -1611,4 +1788,93 @@ func (db *GoDB) getStoreFilterCache(storeID string) *ItemFilters {
 		return nil
 	}
 	return filters
+}
+
+func (db *GoDB) calculateItemStock(storeID, itemID, storageUnit string) (chan float64, context.CancelFunc) {
+	c := make(chan float64)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				return
+			}
+		}()
+		go db.doCalcItemStock(ctx, c, storeID, itemID, storageUnit)
+	}()
+	return c, cancel
+}
+
+func (db *GoDB) doCalcItemStock(ctx context.Context, c chan float64, storeID, itemID, storageUnit string) {
+	defer close(c)
+	// Start retrieving stock entries
+	response, cancel, err := db.SSelect(ItemDB, map[string]string{
+		"pid-uid-st": fmt.Sprintf("%s;%s;%s;", storeID, itemID, storageUnit),
+	}, nil, -1, 100)
+	if err != nil {
+		c <- 0.0
+		return
+	}
+	// We will filter the storage unit until we have reached a "SET" type stock entry
+	// ... or there are no more stock entries
+	stocks := make([]*ItemStock, 0)
+	var stock *ItemStock
+	for entry := range response {
+		stock = &ItemStock{}
+		err = json.Unmarshal(entry.Data, stock)
+		if err != nil {
+			continue
+		}
+		// Add stock amount to current stock amount
+		stocks = append(stocks, stock)
+		// Exit upon reaching "SET" type stock
+		if stock.Type == "SET" {
+			cancel()
+			break
+		}
+	}
+	if len(stocks) < 1 {
+		c <- 0.0
+		return
+	}
+	// Sort stock entries by date (highest to lowest as timestamp is UNIX int64)
+	// ... to ensure chronological order
+	sort.SliceStable(
+		stocks, func(i, j int) bool {
+			return stocks[i].TimeCreated > stocks[j].TimeCreated
+		},
+	)
+	// We will now calculate the stock
+	// Example:
+	//     ADD  5.0
+	//     ADD  3.0
+	//     ADD -7.0
+	//     SET  9.0
+	// The calculated stock in this example would be 10, because:
+	//     9 + (-7) =  2
+	//     2 +   3  =  5
+	//     5 +   5  = 10 -> return 10
+	// It also works the other way around, the way we have to calculate anyway:
+	//     5 +   3  =  8
+	//     8 + (-7) =  1
+	//     1 +   9  = 10 -> return 10
+	// Since a "SET" type stock entry is assumed to respect previous stock updates,
+	// ... we simply exit to allow for infinite stock entries reaching far into the past
+	stk := 0.0
+	lts := int64(-1)
+	for _, stock = range stocks {
+		select {
+		case <-ctx.Done():
+			c <- stk
+			return
+		default:
+		}
+		if lts == -1 {
+			lts = stock.TimeCreated
+		}
+		stk += stock.Amount
+		if stock.Type == "SET" {
+			break
+		}
+	}
+	c <- stk
 }

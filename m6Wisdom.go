@@ -1417,7 +1417,7 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 		var points int64
 		var accuracy float64
 		b := false
-		response, err := db.SSelect(WisdomDB, map[string]string{
+		response, _, err := db.SSelect(WisdomDB, map[string]string{
 			"knowledgeID-type": fmt.Sprintf("%s;%s", knowledgeID, request.Type),
 		}, options, 10, int(options.MaxResults))
 		if err != nil {
