@@ -160,7 +160,7 @@ func (server *SyncRoomServer) handleSyncedEndpoint(
 					},
 					Name:      rName,
 					RoomOwner: user.Username,
-					Data:      nil,
+					Data:      make(map[string]string),
 				},
 			)
 		}
