@@ -32,7 +32,7 @@ var cs chan bool
 var donePeriodic chan bool
 
 func StartServer(_cs, _donePeriodic chan bool, wg *sync.WaitGroup, config Config,
-	dbList *Databases, chatServer *ChatServer, syncRoomServer SyncRoomServer, connector *Connector,
+	dbList *Databases, chatServer *ChatServer, syncRoomServer *SyncRoomServer, connector *Connector,
 	fcmClient *messaging.Client, emailClient *EmailClient,
 ) {
 	startTime := time.Now()
@@ -175,7 +175,7 @@ func setShutdownURL(r chi.Router, url string) {
 }
 
 func setPublicRoutes(r chi.Router, dbList *Databases,
-	chatServer *ChatServer, connector *Connector, syncRoomServer SyncRoomServer,
+	chatServer *ChatServer, connector *Connector, syncRoomServer *SyncRoomServer,
 	callCounter *atomic.Int64, startTime time.Time,
 	fcmClient *messaging.Client, emailClient *EmailClient,
 ) {
