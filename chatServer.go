@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"firebase.google.com/go/messaging"
@@ -481,28 +480,6 @@ func ListenToMessages(
 		}
 	}()
 	return resp, closed
-}
-
-func WSSendJSON(
-	c *websocket.Conn,
-	ctx context.Context,
-	v interface{},
-) error {
-	buf := &bytes.Buffer{}
-	enc := json.NewEncoder(buf)
-	enc.SetEscapeHTML(true)
-	if err := enc.Encode(v); err != nil {
-		return err
-	}
-	err := c.Write(
-		ctx,
-		websocket.MessageText,
-		buf.Bytes(),
-	)
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 func (server *ChatServer) handleEditMessage(s *Session, text string, rapidDB *GoDB) {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"firebase.google.com/go/messaging"
@@ -25,17 +26,18 @@ type SyncedSession struct {
 	RoomName string
 }
 
-type SyncCacheEntry struct {
-	LastCheck time.Time
-	Usernames []string
+type SyncRoom struct {
+	Sessions  map[string]*SyncedSession
+	Name      string
+	RoomOwner string
+	Data      map[string]string
 }
 
 type SyncRoomServer struct {
 	SyncRoomsMu *sync.RWMutex
-	// Map of ChatGroupUUID as key and map of ChatMemberUsername and Session as value
-	SyncRooms *btree.Map[string, map[string]*SyncedSession]
-	tokenAuth *jwtauth.JWTAuth
-	// ChatMessageDB
+	// Map of RoomID as key and SyncRoom as value, containing the SyncedSession instances
+	SyncRooms           *btree.Map[string, SyncRoom]
+	tokenAuth           *jwtauth.JWTAuth
 	DB                  *GoDB
 	MainDB              *GoDB
 	NotificationCounter *atomic.Int64
@@ -62,7 +64,7 @@ type SyncMessage struct {
 func CreateSyncRoomServer(db, mainDB *GoDB, connector *Connector) *SyncRoomServer {
 	server := &SyncRoomServer{
 		SyncRoomsMu:         &sync.RWMutex{},
-		SyncRooms:           btree.NewMap[string, map[string]*SyncedSession](3),
+		SyncRooms:           btree.NewMap[string, SyncRoom](3),
 		DB:                  db,
 		MainDB:              mainDB,
 		NotificationCounter: &atomic.Int64{},
@@ -135,22 +137,30 @@ func (server *SyncRoomServer) handleSyncedEndpoint(
 			return
 		}
 		server.SyncRoomsMu.Lock()
-		sessions, ok := server.SyncRooms.Get(roomID)
+		room, ok := server.SyncRooms.Get(roomID)
 		session := &SyncedSession{
-			User:   user,
-			Conn:   c,
-			Ctx:    ctx,
-			R:      r,
-			RoomId: roomID,
+			User:     user,
+			Conn:     c,
+			Ctx:      ctx,
+			R:        r,
+			RoomId:   roomID,
+			RoomName: room.Name,
 		}
 		if ok {
-			sessions[user.Username] = session
-			server.SyncRooms.Set(roomID, sessions)
+			// Add to room's session
+			room.Sessions[user.Username] = session
+			server.SyncRooms.Set(roomID, room)
 		} else {
+			// Create room and session
 			server.SyncRooms.Set(
 				roomID,
-				map[string]*SyncedSession{
-					user.Username: session,
+				SyncRoom{
+					Sessions: map[string]*SyncedSession{
+						user.Username: session,
+					},
+					Name:      fmt.Sprintf("Room %s", roomID),
+					RoomOwner: user.Username,
+					Data:      nil,
 				},
 			)
 		}
@@ -243,14 +253,14 @@ func (server *SyncRoomServer) handleSyncedSession(s *SyncedSession,
 func (server *SyncRoomServer) dropConnection(s *SyncedSession) {
 	server.SyncRoomsMu.Lock()
 	defer server.SyncRoomsMu.Unlock()
-	sessions, ok := server.SyncRooms.Get(s.RoomId)
+	room, ok := server.SyncRooms.Get(s.RoomId)
 	if ok {
-		delete(sessions, s.User.Username)
+		delete(room.Sessions, s.User.Username)
 		// Are there any connections left? If not, then delete the chat session
-		if len(sessions) < 1 {
+		if len(room.Sessions) < 1 {
 			server.SyncRooms.Delete(s.RoomId)
 		} else {
-			server.SyncRooms.Set(s.RoomId, sessions)
+			server.SyncRooms.Set(s.RoomId, room)
 		}
 	}
 }
@@ -287,17 +297,23 @@ func (server *SyncRoomServer) handleIncomingMessage(
 func (server *SyncRoomServer) DistributeSyncedMessageJSON(msg *SyncMessageContainer) {
 	// Distribute chat message to all members of this channel
 	server.SyncRoomsMu.RLock()
-	sessions, ok := server.SyncRooms.Get(msg.RoomId)
+	room, ok := server.SyncRooms.Get(msg.RoomId)
 	server.SyncRoomsMu.RUnlock()
 	if !ok {
 		return
 	}
-	for _, value := range sessions {
+	buf := &bytes.Buffer{}
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(true)
+	if err := enc.Encode(msg); err != nil {
+		return
+	}
+	for _, value := range room.Sessions {
 		if value.User.Username == msg.Username {
 			// Do not distribute a message to the sender itself
 			continue
 		}
-		_ = WSSendJSON(value.Conn, value.Ctx, msg) // TODO: Drop connection?
+		_ = WSSendBytes(value.Conn, value.Ctx, buf.Bytes()) // TODO: Drop connection?
 	}
 }
 
