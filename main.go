@@ -31,7 +31,8 @@ type Databases struct {
 func main() {
 	// #### RUNTIME
 	// runtime.GOMAXPROCS(128)
-	// #### Debug
+	// #### DEBUG
+	// debug.SetMemoryLimit(700 * MiB)
 	dbug()
 	// #### Create wait group and done channels
 	wg := sync.WaitGroup{}
@@ -55,6 +56,8 @@ func main() {
 	connector := CreateConnector(dbList.Map["rapid"])
 	// Chat Server
 	chatServer := CreateChatServer(dbList.Map["rapid"], dbList.Map["main"], connector)
+	// Synced Room Server
+	syncRoomServer := CreateSyncRoomServer(dbList.Map["rapid"], dbList.Map["main"], connector)
 	// #### Firebase Cloud Messaging
 	fmt.Println(":: Checking for fbcm.json")
 	var fcmClient *messaging.Client
@@ -88,7 +91,7 @@ func main() {
 	}
 	// #### Start Server (with wait group delta)
 	wg.Add(1)
-	go StartServer(doneServer, donePeriodic, &wg, config, dbList, chatServer, connector, fcmClient, emailClient)
+	go StartServer(doneServer, donePeriodic, &wg, config, dbList, chatServer, syncRoomServer, connector, fcmClient, emailClient)
 	// #### Start periodic actions loop
 	dbList.Map["rapid"].StartPeriodicLoop(donePeriodic, dbList, connector, fcmClient)
 	// #### Wait for all processes to end

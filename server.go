@@ -32,7 +32,7 @@ var cs chan bool
 var donePeriodic chan bool
 
 func StartServer(_cs, _donePeriodic chan bool, wg *sync.WaitGroup, config Config,
-	dbList *Databases, chatServer *ChatServer, connector *Connector,
+	dbList *Databases, chatServer *ChatServer, syncRoomServer SyncRoomServer, connector *Connector,
 	fcmClient *messaging.Client, emailClient *EmailClient,
 ) {
 	startTime := time.Now()
@@ -43,11 +43,11 @@ func StartServer(_cs, _donePeriodic chan bool, wg *sync.WaitGroup, config Config
 	setupJWTAuth(config)
 	// Are we using HTTPS or not?
 	isSecure := checkHTTPS()
-	// Create Router (with rate limit 100r/10s/endpoint)
+	// Create Router (with rate limit 500r/10s/endpoint)
 	r := chi.NewRouter()
 	r.Use(
 		httprate.Limit(
-			100,
+			500,
 			10*time.Second,
 			httprate.WithKeyFuncs(httprate.KeyByIP, httprate.KeyByEndpoint),
 		),
@@ -66,7 +66,7 @@ func StartServer(_cs, _donePeriodic chan bool, wg *sync.WaitGroup, config Config
 	r.Use(PaginationMiddleware())
 	r.Use(CallCounterMiddleware(callCounter))
 	// Routes -> Public
-	setPublicRoutes(r, dbList, chatServer, connector, callCounter, startTime, fcmClient, emailClient)
+	setPublicRoutes(r, dbList, chatServer, connector, syncRoomServer, callCounter, startTime, fcmClient, emailClient)
 	// Routes -> Basic Auth
 	setBasicProtectedRoutes(r, dbList.Map["main"])
 	// Routes -> JWT Bearer Auth
@@ -175,7 +175,8 @@ func setShutdownURL(r chi.Router, url string) {
 }
 
 func setPublicRoutes(r chi.Router, dbList *Databases,
-	chatServer *ChatServer, connector *Connector, callCounter *atomic.Int64, startTime time.Time,
+	chatServer *ChatServer, connector *Connector, syncRoomServer SyncRoomServer,
+	callCounter *atomic.Int64, startTime time.Time,
 	fcmClient *messaging.Client, emailClient *EmailClient,
 ) {
 	r.Get("/sample", sampleMessage)
@@ -186,6 +187,7 @@ func setPublicRoutes(r chi.Router, dbList *Databases,
 	// #### Connector + Chat (WS Servers)
 	connector.PublicConnectorEndpoint(r, tokenAuth, dbList)
 	chatServer.PublicChatEndpoint(r, tokenAuth, dbList, connector, fcmClient)
+	syncRoomServer.PublicSyncRoomEndpoint(r, tokenAuth, dbList, connector, fcmClient)
 	// #### Stores
 	dbList.Map["main"].PublicStoreEndpoints(r, tokenAuth, dbList.Map["rapid"], connector, emailClient)
 	// #### Mockingbird

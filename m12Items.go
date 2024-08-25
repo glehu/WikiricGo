@@ -206,6 +206,7 @@ func (db *GoDB) ProtectedItemEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 		// ### GET ###
 		// ###########
 		r.Get("/delete/{itemID}", db.handleItemDelete(mainDB))
+		r.Get("/index/{storeID}", db.handleGenerateIndex(mainDB))
 	})
 }
 
@@ -298,7 +299,7 @@ func (db *GoDB) handleItemCreate(mainDB *GoDB) http.HandlerFunc {
 		}
 		// Retrieve POST payload
 		request := &Item{}
-		if err := render.Bind(r, request); err != nil {
+		if err = render.Bind(r, request); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -350,7 +351,6 @@ func (db *GoDB) handleBulkItemCreate(mainDB *GoDB) http.HandlerFunc {
 			bulkResults.Results[i] = db.doCreateItem(w, user, &item, storeID, true)
 		}
 		render.JSON(w, r, bulkResults)
-		go db.createStoreFilterCache(storeID)
 	}
 }
 
@@ -956,6 +956,38 @@ func GetItemVariationPoints(
 	return 0
 }
 
+func (db *GoDB) handleGenerateIndex(mainDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		storeID := chi.URLParam(r, "storeID")
+		if storeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve store
+		storeResp, ok := mainDB.Read(StoreDB, storeID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		store := &Store{}
+		err := json.Unmarshal(storeResp.Data, store)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if user.Username != store.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		db.createStoreFilterCache(storeID)
+	}
+}
+
 func (db *GoDB) handleItemDelete(mainDB *GoDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
@@ -1002,7 +1034,8 @@ func (db *GoDB) handleItemDelete(mainDB *GoDB) http.HandlerFunc {
 			_ = db.Delete(AnaDB, item.AnalyticsUUID, []string{})
 		}
 		// Delete item
-		_ = db.Delete(ItemDB, itemID, []string{"pid"})
+		index := []string{"pid", "pid-cat", "pid-brand", "pid-manu", "pid-clrs"}
+		_ = db.Delete(ItemDB, itemID, index)
 		db.createStoreFilterCache(item.StoreUUID)
 	}
 }
@@ -1248,7 +1281,6 @@ func (db *GoDB) handleItemEdit(mainDB *GoDB) http.HandlerFunc {
 			return
 		}
 		db.doEditItem(w, user, request, itemID, true)
-		go db.createStoreFilterCache(storeID)
 	}
 }
 
@@ -1291,7 +1323,6 @@ func (db *GoDB) handleBulkItemEdit(mainDB *GoDB) http.HandlerFunc {
 			bulkEditResults.Results[i] = db.doEditItem(w, user, &entry.Payload, entry.UUID, false)
 		}
 		render.JSON(w, r, bulkEditResults)
-		go db.createStoreFilterCache(storeID)
 	}
 }
 
@@ -1341,7 +1372,6 @@ func (db *GoDB) handleBulkItemStockModification(mainDB *GoDB) http.HandlerFunc {
 			}
 		}
 		render.JSON(w, r, modResults)
-		// go db.createStoreFilterCache(storeID)
 	}
 }
 
@@ -1727,7 +1757,18 @@ func (db *GoDB) createStoreFilterCache(storeID string) *ItemFilters {
 	}
 	// Did we find something?
 	if queryResponse.Amount < 1 {
-		return nil
+		// Store
+		jsonEntry, err := json.Marshal(queryResponse)
+		if err != nil {
+			return nil
+		}
+		_, err = db.Insert(ItemDB, jsonEntry, map[string]string{
+			"pid-filter": FIndex(storeID),
+		})
+		if err != nil {
+			return nil
+		}
+		return queryResponse
 	}
 	// Actually calculate average cost
 	if count > 0 && queryResponse.AvgCost != 0 {
@@ -1761,7 +1802,6 @@ func (db *GoDB) createStoreFilterCache(storeID string) *ItemFilters {
 		"pid-filter": FIndex(storeID),
 	})
 	if err != nil {
-		// TODO: We should try again...
 		return nil
 	}
 	return queryResponse
