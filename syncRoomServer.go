@@ -6,12 +6,13 @@ import (
 	"encoding/json"
 	"firebase.google.com/go/messaging"
 	"fmt"
+	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/tidwall/btree"
 	"net/http"
-	"nhooyr.io/websocket"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,7 +26,7 @@ type SyncedSession struct {
 	R        *http.Request
 	RoomId   string
 	RoomName string
-	// If 0 then Pong1, if 1 then Pong2
+	// PPState 0 = Pong1 else 1 = Pong2
 	PPState   int
 	Ping1Time time.Time
 	Pong1Time time.Time
@@ -34,11 +35,25 @@ type SyncedSession struct {
 	LatencyMS float32
 }
 
+type SyncedSessionSum struct {
+	Username  string  `json:"u"`
+	LatencyMS float32 `json:"l"`
+}
+
+type SyncedSessionDataSum struct {
+	Username string `json:"u"`
+	Key      string `json:"k"`
+	Value    string `json:"v"`
+}
+
 type SyncRoom struct {
 	Sessions  map[string]*SyncedSession
 	Name      string
 	RoomOwner string
-	Data      map[string]string
+	// Data is a key value map for arbitrary string data (most likely JSON)
+	Data map[string]string
+	// DataOwners keeps track of all data keys mapped to their owner
+	DataOwners map[string][]string
 }
 
 type SyncRoomServer struct {
@@ -158,9 +173,10 @@ func (server *SyncRoomServer) handleSyncedEndpoint(
 					Sessions: map[string]*SyncedSession{
 						user.Username: session,
 					},
-					Name:      rName,
-					RoomOwner: user.Username,
-					Data:      make(map[string]string),
+					Name:       rName,
+					RoomOwner:  user.Username,
+					Data:       make(map[string]string),
+					DataOwners: make(map[string][]string),
 				},
 			)
 		}
@@ -284,112 +300,39 @@ func (server *SyncRoomServer) handleIncomingMessage(
 	text := string(resp.Msg)
 	var act = ""
 	var targetSession *SyncedSession = nil
-	if len(text) >= 5 && text[0:5] == "[c:L]" {
-		// L stands for Latency. The client want's to calculate
-		// ...its ping/latency for performance reasons.
+	var exit = false
+	// Check for pre-defined commands
+	// If the message does not match with anything, it still gets distributed
+	if len(text) >= 5 && text[0:5] == "[c:B]" {
+		// B stands for Pong, the response to a Ping (or A)
+		act, targetSession = handlePongResponse(s)
+	} else if len(text) >= 5 && text[0:5] == "[c:L]" {
+		// L stands for Latency Check
 		s.PPState = 0
-		// Respond to this session only
 		targetSession = s
-		// A is the tiny Ping! Bandwidth savings
 		act = "[s:A]"
-	} else if len(text) >= 5 && text[0:5] == "[c:B]" {
-		// B stands for Pong, the response to a Ping (or A).
-		// Check response time to be able to calculate latency
-		if s.PPState == 0 {
-			// Remember this time
-			s.Pong1Time = time.Now()
-			s.PPState = 1
-			// ...and send another Ping
-			targetSession = s
-			act = "[s:A]"
-		} else if s.PPState == 1 {
-			// Remember this time
-			s.Pong2Time = time.Now()
-			// ...and calculate the latency
-			d1 := s.Pong1Time.Sub(s.Ping1Time)
-			d2 := s.Pong2Time.Sub(s.Ping2Time)
-			// Get average for both deltas and set it as the current latency
-			s.LatencyMS = (float32(d1.Milliseconds()) + float32(d2.Milliseconds())) / float32(2)
-			// Send back latency to client
-			targetSession = s
-			act = fmt.Sprintf("[s:L]%f", s.LatencyMS)
-		}
 	} else if len(text) >= 12 && text[0:12] == "[c:SET;NAME]" {
-		// Only allow this action for the owner of this room
-		server.SyncRoomsMu.RLock()
-		room, ok := server.SyncRooms.Get(s.RoomId)
-		server.SyncRoomsMu.RUnlock()
-		if !ok {
-			targetSession = s
-			act = "[s:ERR]404;Room Not Found"
-		}
-		if room.RoomOwner != s.User.Username {
-			targetSession = s
-			act = "[s:ERR]403;Forbidden"
-		} else {
-			// Change the room's name
-			server.SyncRoomsMu.Lock()
-			room, ok = server.SyncRooms.Get(s.RoomId)
-			if ok {
-				room.Name = text[12:]
-				server.SyncRooms.Set(s.RoomId, room)
-				targetSession = s
-				act = "[s:ANS]200;Name Changed"
-			}
-			server.SyncRoomsMu.Unlock()
-		}
+		act, targetSession = handleSetRoomName(server, s, text)
 	} else if len(text) >= 12 && text[0:12] == "[c:SET;DATA]" {
-		// Client wants to set data.
-		// Request needs to be in the format: KEY;VALUE
-		data := strings.SplitN(text[12:], ";", 2)
-		if len(data) < 2 {
-			targetSession = s
-			act = "[s:ERR]400;Wrong Format Expected KEY;VALUE"
-		} else {
-			server.SyncRoomsMu.Lock()
-			room, ok := server.SyncRooms.Get(s.RoomId)
-			if ok {
-				// Update data map with request payload for request data key
-				room.Data[data[0]] = data[1]
-				server.SyncRooms.Set(s.RoomId, room)
-				targetSession = s
-				act = "[s:ANS]200;Data Set"
-			}
-			server.SyncRoomsMu.Unlock()
-		}
+		act, targetSession = handleSetRoomData(server, s, text)
 	} else if len(text) >= 12 && text[0:12] == "[c:GET;DATA]" {
-		// Client wants to get data.
-		// Request needs to be in the format: KEY
-		key := text[12:]
-		if len(key) < 1 {
-			targetSession = s
-			act = "[s:ERR]400;Wrong Format Expected KEY"
-		} else {
-			server.SyncRoomsMu.RLock()
-			room, ok := server.SyncRooms.Get(s.RoomId)
-			if ok {
-				// Retrieve data for provided key and check if it exists
-				val, ok := room.Data[key]
-				if ok {
-					targetSession = s
-					act = fmt.Sprintf("[s:DAT]%s;%s", key, val)
-				} else {
-					targetSession = s
-					act = fmt.Sprintf("[s:ERR]400;Data Key %s Not Found", key)
-				}
-			}
-			server.SyncRoomsMu.RUnlock()
-		}
+		act, targetSession = handleGetRoomData(server, s, text)
+	} else if len(text) >= 12 && text[0:12] == "[c:GET;SESH]" {
+		act, targetSession, exit = handleGetRoomSessions(server, s, text)
+	} else if len(text) >= 12 && text[0:12] == "[c:GET;UDAT]" {
+		act, targetSession, exit = handleGetRoomSessionData(server, s, text)
+	} else if len(text) >= 6 && text[0:6] == "[c:DC]" {
+		act, targetSession = handleDisconnectUser(server, s, text)
+	}
+	if exit {
+		return
 	}
 	msg := &SyncMessage{
-		Text:        text,
-		Username:    s.User.Username,
-		Action:      act,
-		TimeCreated: TimeNowIsoString(),
+		Text:     text,
+		Username: s.User.Username,
+		Action:   act,
 	}
-	go server.DistributeSyncedMessageJSON(s.RoomId, &SyncMessageContainer{
-		SyncMessage: msg,
-	}, targetSession)
+	go server.DistributeSyncedMessageJSON(s.RoomId, &SyncMessageContainer{SyncMessage: msg}, targetSession)
 	if len(text) >= 5 && text[0:5] == "[c:S]" {
 		jsonEntry, err := json.Marshal(msg)
 		if err != nil {
@@ -459,4 +402,292 @@ func ListenToSyncedMessages(
 		}
 	}()
 	return resp, closed
+}
+
+func handlePongResponse(s *SyncedSession) (string, *SyncedSession) {
+	var targetSession *SyncedSession
+	var act string
+	if s.PPState == 0 {
+		// Remember this time
+		s.Pong1Time = time.Now()
+		s.PPState = 1
+		// ...and send another Ping
+		targetSession = s
+		act = "[s:A]"
+	} else if s.PPState == 1 {
+		// Remember this time
+		s.Pong2Time = time.Now()
+		// ...and calculate the latency
+		d1 := s.Pong1Time.Sub(s.Ping1Time)
+		d2 := s.Pong2Time.Sub(s.Ping2Time)
+		// Get average for both deltas and set it as the current latency
+		s.LatencyMS = (float32(d1.Milliseconds()) + float32(d2.Milliseconds())) / float32(2)
+		// Send back latency to client
+		targetSession = s
+		act = fmt.Sprintf("[s:L]%f", s.LatencyMS)
+	}
+	return act, targetSession
+}
+
+func handleSetRoomName(server *SyncRoomServer, s *SyncedSession, text string) (string, *SyncedSession) {
+	var targetSession *SyncedSession
+	var act string
+	// Only allow this action for the owner of this room
+	server.SyncRoomsMu.RLock()
+	room, ok := server.SyncRooms.Get(s.RoomId)
+	server.SyncRoomsMu.RUnlock()
+	if !ok {
+		targetSession = s
+		act = "[s:ERR]404;Room Not Found"
+	}
+	if room.RoomOwner != s.User.Username {
+		targetSession = s
+		act = "[s:ERR]403;Forbidden"
+	} else {
+		// Change the room's name
+		server.SyncRoomsMu.Lock()
+		room, ok = server.SyncRooms.Get(s.RoomId)
+		if ok {
+			room.Name = text[12:]
+			server.SyncRooms.Set(s.RoomId, room)
+			targetSession = s
+			act = "[s:ANS]200;Name Changed"
+		}
+		server.SyncRoomsMu.Unlock()
+	}
+	return act, targetSession
+}
+
+func handleSetRoomData(server *SyncRoomServer, s *SyncedSession, text string) (string, *SyncedSession) {
+	var targetSession *SyncedSession
+	var act string
+	// Request needs to be in the format: KEY;VALUE
+	data := strings.SplitN(text[12:], ";", 2)
+	if len(data) < 2 {
+		targetSession = s
+		act = "[s:ERR]400;Wrong Format Expected KEY;VALUE"
+	} else {
+		server.SyncRoomsMu.Lock()
+		room, ok := server.SyncRooms.Get(s.RoomId)
+		if ok {
+			// Update data map with request payload for request data key
+			room.Data[data[0]] = data[1]
+			server.SyncRooms.Set(s.RoomId, room)
+			// Remember client as owner of data key
+			keys, ok := room.DataOwners[s.User.Username]
+			if ok {
+				if !slices.Contains(keys, data[0]) {
+					keys = append(keys, data[0])
+				}
+			} else {
+				keys = []string{data[0]}
+			}
+			room.DataOwners[s.User.Username] = keys
+			// Reply
+			targetSession = s
+			act = "[s:ANS]200;Data Set"
+		}
+		server.SyncRoomsMu.Unlock()
+	}
+	return act, targetSession
+}
+
+func handleGetRoomData(server *SyncRoomServer, s *SyncedSession, text string) (string, *SyncedSession) {
+	var targetSession *SyncedSession
+	var act string
+	// Request needs to be in the format: KEY
+	key := text[12:]
+	if len(key) < 1 {
+		targetSession = s
+		act = "[s:ERR]400;Wrong Format Expected KEY"
+	} else {
+		server.SyncRoomsMu.RLock()
+		room, ok := server.SyncRooms.Get(s.RoomId)
+		if ok {
+			// Retrieve data for provided key and check if it exists
+			val, ok := room.Data[key]
+			if ok {
+				targetSession = s
+				act = fmt.Sprintf("[s:DAT]%s;%s", key, val)
+			} else {
+				targetSession = s
+				act = fmt.Sprintf("[s:ERR]400;Data Key %s Not Found", key)
+			}
+		}
+		server.SyncRoomsMu.RUnlock()
+	}
+	return act, targetSession
+}
+
+func handleGetRoomSessions(server *SyncRoomServer, s *SyncedSession, text string) (string, *SyncedSession, bool) {
+	var targetSession *SyncedSession
+	var act string
+	var sessionSum SyncedSessionSum
+	server.SyncRoomsMu.RLock()
+	room, ok := server.SyncRooms.Get(s.RoomId)
+	if !ok {
+		server.SyncRoomsMu.RUnlock()
+		return "", nil, true
+	}
+	if text[12:] == "DIST" {
+		// Distribute room sessions to all users (performance)
+		for _, sesh := range room.Sessions {
+			// Generate session summary
+			sessionSum = SyncedSessionSum{
+				Username:  sesh.User.Username,
+				LatencyMS: sesh.LatencyMS,
+			}
+			// Encode summary to JSON
+			buf := &bytes.Buffer{}
+			enc := json.NewEncoder(buf)
+			enc.SetEscapeHTML(true)
+			if err := enc.Encode(sessionSum); err != nil {
+				continue
+			}
+			// Append JSON to message
+			act = fmt.Sprintf("[s:SESH]%s", buf.Bytes())
+			msg := &SyncMessage{
+				Text:     text,
+				Username: s.User.Username,
+				Action:   act,
+			}
+			// ...and encode it as JSON, too
+			buf = &bytes.Buffer{}
+			enc = json.NewEncoder(buf)
+			enc.SetEscapeHTML(true)
+			if err := enc.Encode(msg); err != nil {
+				continue
+			}
+			// Send message to all members
+			for _, seshTarget := range room.Sessions {
+				_ = WSSendBytes(seshTarget.Conn, seshTarget.Ctx, buf.Bytes()) // TODO: Drop connection?
+			}
+		}
+	} else {
+		// Send room sessions to client
+		for _, sesh := range room.Sessions {
+			// Generate session summary
+			sessionSum = SyncedSessionSum{
+				Username:  sesh.User.Username,
+				LatencyMS: sesh.LatencyMS,
+			}
+			// Encode summary to JSON
+			buf := &bytes.Buffer{}
+			enc := json.NewEncoder(buf)
+			enc.SetEscapeHTML(true)
+			if err := enc.Encode(sessionSum); err != nil {
+				continue
+			}
+			// Append JSON to message and send it to the client
+			targetSession = s
+			act = fmt.Sprintf("[s:SESH]%s", buf.Bytes())
+			msg := &SyncMessage{
+				Text:     text,
+				Username: s.User.Username,
+				Action:   act,
+			}
+			go server.DistributeSyncedMessageJSON(s.RoomId, &SyncMessageContainer{SyncMessage: msg}, targetSession)
+		}
+	}
+	server.SyncRoomsMu.RUnlock()
+	return act, targetSession, true
+}
+
+func handleGetRoomSessionData(server *SyncRoomServer, s *SyncedSession, text string) (string, *SyncedSession, bool) {
+	var act string
+	var sessionSum SyncedSessionDataSum
+	var keys []string
+	var data string
+	// Retrieve room to iterate over all sessions
+	server.SyncRoomsMu.RLock()
+	room, ok := server.SyncRooms.Get(s.RoomId)
+	if !ok {
+		server.SyncRoomsMu.RUnlock()
+		return "", nil, true
+	}
+	if text[12:] == ";ALL" {
+		// Distribute all room sessions' data to all users
+		for _, sesh := range room.Sessions {
+			// Generate session data summary for each data key there is for this session
+			keys, ok = room.DataOwners[sesh.User.Username]
+			if !ok {
+				continue
+			}
+			for _, key := range keys {
+				data, ok = room.Data[key]
+				if !ok {
+					continue
+				}
+				sessionSum = SyncedSessionDataSum{
+					Username: sesh.User.Username,
+					Key:      key,
+					Value:    data,
+				}
+				// Encode summary to JSON
+				buf := &bytes.Buffer{}
+				enc := json.NewEncoder(buf)
+				enc.SetEscapeHTML(true)
+				if err := enc.Encode(sessionSum); err != nil {
+					continue
+				}
+				// Append JSON to message
+				act = fmt.Sprintf("[s:UDAT]%s", buf.Bytes())
+				msg := &SyncMessage{
+					Text:     text,
+					Username: s.User.Username,
+					Action:   act,
+				}
+				// ...and encode it as JSON, too
+				buf = &bytes.Buffer{}
+				enc = json.NewEncoder(buf)
+				enc.SetEscapeHTML(true)
+				if err := enc.Encode(msg); err != nil {
+					continue
+				}
+				// Send message to all members
+				for _, seshTarget := range room.Sessions {
+					_ = WSSendBytes(seshTarget.Conn, seshTarget.Ctx, buf.Bytes()) // TODO: Drop connection?
+				}
+			}
+		}
+	}
+	server.SyncRoomsMu.RUnlock()
+	return "", nil, true
+}
+
+func handleDisconnectUser(server *SyncRoomServer, s *SyncedSession, text string) (string, *SyncedSession) {
+	var targetSession *SyncedSession
+	var act string
+	// Only allow this action for the owner of this room
+	server.SyncRoomsMu.RLock()
+	room, ok := server.SyncRooms.Get(s.RoomId)
+	if !ok {
+		targetSession = s
+		act = "[s:ERR]404;Room Not Found"
+		server.SyncRoomsMu.RUnlock()
+		return act, targetSession
+	}
+	if room.RoomOwner != s.User.Username {
+		targetSession = s
+		act = "[s:ERR]403;Forbidden"
+		server.SyncRoomsMu.RUnlock()
+		return act, targetSession
+	}
+	// Retrieve and close session
+	var target *SyncedSession
+	if target, ok = room.Sessions[text[6:]]; !ok {
+		targetSession = s
+		act = "[s:ERR]404;User Not Found"
+		server.SyncRoomsMu.RUnlock()
+		return act, targetSession
+	}
+	err := target.Conn.CloseNow()
+	if err != nil {
+		targetSession = s
+		act = "[s:ERR]500;Error Disconnecting User: " + err.Error()
+		server.SyncRoomsMu.RUnlock()
+		return act, targetSession
+	}
+	server.SyncRoomsMu.RUnlock()
+	return act, targetSession
 }

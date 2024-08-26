@@ -224,7 +224,7 @@ func setJWTProtectedRoutes(
 		func(r chi.Router) {
 			// Seek, verify and validate JWT tokens
 			r.Use(jwtauth.Verifier(tokenAuth))
-			r.Use(jwtauth.Authenticator)
+			r.Use(jwtauth.Authenticator(tokenAuth))
 			r.Use(BearerAuth(dbList.Map["main"]))
 			// Debug/Testing Route
 			r.Get(

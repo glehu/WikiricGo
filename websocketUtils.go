@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 func WSSendJSON(
