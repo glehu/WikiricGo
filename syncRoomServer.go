@@ -605,49 +605,64 @@ func handleGetRoomSessionData(server *SyncRoomServer, s *SyncedSession, text str
 		server.SyncRoomsMu.RUnlock()
 		return "", nil, true
 	}
-	if text[12:] == ";ALL" {
-		// Distribute all room sessions' data to all users
-		for _, sesh := range room.Sessions {
-			// Generate session data summary for each data key there is for this session
-			keys, ok = room.DataOwners[sesh.User.Username]
+	var filter = ""
+	var fLen = 0
+	if len(text) > 12 {
+		// E.g.: [c:GET;UDAT]POS to filter all position data
+		// ...(assuming it was saved with a key starting with POS like POS-wiki)
+		filter = text[12:]
+		fLen = len(filter)
+	}
+	// Distribute all room sessions' data to all users
+	for _, sesh := range room.Sessions {
+		// Generate session data summary for each data key there is for this session
+		keys, ok = room.DataOwners[sesh.User.Username]
+		if !ok {
+			continue
+		}
+		for _, key := range keys {
+			if fLen > 0 && key[0:fLen] != filter {
+				// Filters out irrelevant keys by checking if their beginnings match
+				// E.g.: Filter       Key
+				//       POS    ->    POS-wiki
+				//       123          123
+				//       POS    ==    POS
+				//       This key would be relevant thus not being skipped
+				continue
+			}
+			data, ok = room.Data[key]
 			if !ok {
 				continue
 			}
-			for _, key := range keys {
-				data, ok = room.Data[key]
-				if !ok {
-					continue
-				}
-				sessionSum = SyncedSessionDataSum{
-					Username: sesh.User.Username,
-					Key:      key,
-					Value:    data,
-				}
-				// Encode summary to JSON
-				buf := &bytes.Buffer{}
-				enc := json.NewEncoder(buf)
-				enc.SetEscapeHTML(true)
-				if err := enc.Encode(sessionSum); err != nil {
-					continue
-				}
-				// Append JSON to message
-				act = fmt.Sprintf("[s:UDAT]%s", buf.Bytes())
-				msg := &SyncMessage{
-					Text:     text,
-					Username: s.User.Username,
-					Action:   act,
-				}
-				// ...and encode it as JSON, too
-				buf = &bytes.Buffer{}
-				enc = json.NewEncoder(buf)
-				enc.SetEscapeHTML(true)
-				if err := enc.Encode(msg); err != nil {
-					continue
-				}
-				// Send message to all members
-				for _, seshTarget := range room.Sessions {
-					_ = WSSendBytes(seshTarget.Conn, seshTarget.Ctx, buf.Bytes()) // TODO: Drop connection?
-				}
+			sessionSum = SyncedSessionDataSum{
+				Username: sesh.User.Username,
+				Key:      key,
+				Value:    data,
+			}
+			// Encode summary to JSON
+			buf := &bytes.Buffer{}
+			enc := json.NewEncoder(buf)
+			enc.SetEscapeHTML(true)
+			if err := enc.Encode(sessionSum); err != nil {
+				continue
+			}
+			// Append JSON to message
+			act = fmt.Sprintf("[s:UDAT]%s", buf.Bytes())
+			msg := &SyncMessage{
+				Text:     text,
+				Username: s.User.Username,
+				Action:   act,
+			}
+			// ...and encode it as JSON, too
+			buf = &bytes.Buffer{}
+			enc = json.NewEncoder(buf)
+			enc.SetEscapeHTML(true)
+			if err := enc.Encode(msg); err != nil {
+				continue
+			}
+			// Send message to all members
+			for _, seshTarget := range room.Sessions {
+				_ = WSSendBytes(seshTarget.Conn, seshTarget.Ctx, buf.Bytes()) // TODO: Drop connection?
 			}
 		}
 	}
