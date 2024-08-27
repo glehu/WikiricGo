@@ -38,6 +38,7 @@ type SyncedSession struct {
 type SyncedSessionSum struct {
 	Username  string  `json:"u"`
 	LatencyMS float32 `json:"l"`
+	IsOwner   bool    `json:"o"`
 }
 
 type SyncedSessionDataSum struct {
@@ -464,31 +465,38 @@ func handleSetRoomData(server *SyncRoomServer, s *SyncedSession, text string) (s
 	// Request needs to be in the format: KEY;VALUE
 	data := strings.SplitN(text[12:], ";", 2)
 	if len(data) < 2 {
+		server.SyncRoomsMu.Unlock()
 		targetSession = s
 		act = "[s:ERR]400;Wrong Format Expected KEY;VALUE"
-	} else {
-		server.SyncRoomsMu.Lock()
-		room, ok := server.SyncRooms.Get(s.RoomId)
-		if ok {
-			// Update data map with request payload for request data key
-			room.Data[data[0]] = data[1]
-			server.SyncRooms.Set(s.RoomId, room)
-			// Remember client as owner of data key
-			keys, ok := room.DataOwners[s.User.Username]
-			if ok {
-				if !slices.Contains(keys, data[0]) {
-					keys = append(keys, data[0])
-				}
-			} else {
-				keys = []string{data[0]}
-			}
-			room.DataOwners[s.User.Username] = keys
-			// Reply
-			targetSession = s
-			act = "[s:ANS]200;Data Set"
-		}
-		server.SyncRoomsMu.Unlock()
+		return act, targetSession
 	}
+	server.SyncRoomsMu.Lock()
+	room, ok := server.SyncRooms.Get(s.RoomId)
+	if ok {
+		if len(room.Data) >= 10_000 {
+			server.SyncRoomsMu.Unlock()
+			targetSession = s
+			act = "[s:ERR]405;Max Data Amount Exceeded (Max 10k)"
+			return act, targetSession
+		}
+		// Update data map with request payload for request data key
+		room.Data[data[0]] = data[1]
+		server.SyncRooms.Set(s.RoomId, room)
+		// Remember client as owner of data key
+		keys, ok := room.DataOwners[s.User.Username]
+		if ok {
+			if !slices.Contains(keys, data[0]) {
+				keys = append(keys, data[0])
+			}
+		} else {
+			keys = []string{data[0]}
+		}
+		room.DataOwners[s.User.Username] = keys
+		// Reply
+		targetSession = s
+		act = "[s:ANS]200;Data Set"
+	}
+	server.SyncRoomsMu.Unlock()
 	return act, targetSession
 }
 
@@ -536,6 +544,7 @@ func handleGetRoomSessions(server *SyncRoomServer, s *SyncedSession, text string
 			sessionSum = SyncedSessionSum{
 				Username:  sesh.User.Username,
 				LatencyMS: sesh.LatencyMS,
+				IsOwner:   sesh.User.Username == room.RoomOwner,
 			}
 			// Encode summary to JSON
 			buf := &bytes.Buffer{}
@@ -570,6 +579,7 @@ func handleGetRoomSessions(server *SyncRoomServer, s *SyncedSession, text string
 			sessionSum = SyncedSessionSum{
 				Username:  sesh.User.Username,
 				LatencyMS: sesh.LatencyMS,
+				IsOwner:   sesh.User.Username == room.RoomOwner,
 			}
 			// Encode summary to JSON
 			buf := &bytes.Buffer{}
