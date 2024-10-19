@@ -689,8 +689,10 @@ func (db *GoDB) handleWisdomFinish(mainDB *GoDB, connector *Connector,
 		_, canFinish := CheckWisdomAccess(user, wisdom, mainDB, db, r)
 		if canFinish {
 			// Set meta data
-			wisdom.TimeFinished = TimeNowIsoString()
-			wisdom.IsFinished = true
+			wisdom.IsFinished = !wisdom.IsFinished
+			if wisdom.IsFinished {
+				wisdom.TimeFinished = TimeNowIsoString()
+			}
 			// Update entry
 			jsonEntry, err := json.Marshal(wisdom)
 			if err != nil {
