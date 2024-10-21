@@ -714,7 +714,7 @@ func (db *GoDB) doItemQuery(w http.ResponseWriter, r *http.Request, c chan *Item
 		}
 		// Truncate item description
 		if item.Description != "" {
-			item.Description = EllipticalTruncate(item.Description, 200)
+			item.Description = EllipticalTruncate(item.Description, 500)
 		}
 		// Load analytics if available
 		analytics = &Analytics{}

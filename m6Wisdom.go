@@ -82,6 +82,7 @@ type QueryResponse struct {
 	Tasks           []*WisdomContainer `json:"tasks"`
 	Courses         []*WisdomContainer `json:"courses"`
 	Posts           []*WisdomContainer `json:"posts"`
+	Proposals       []*WisdomContainer `json:"proposals"`
 	Misc            []*WisdomContainer `json:"misc"`
 	ReferenceWisdom *WisdomContainer   `json:"ref"`
 }
@@ -344,14 +345,15 @@ func (db *GoDB) handleWisdomCreate(mainDB *GoDB, connector *Connector) http.Hand
 			request.Type != "box" &&
 			request.Type != "task" &&
 			request.Type != "post" &&
-			request.Type != "course" {
-			http.Error(w, "type must be one of lesson or answer or box or task or post or course",
+			request.Type != "course" &&
+			request.Type != "proposal" {
+			http.Error(w, "type must be one of lesson or answer or box or task or post or course or proposal",
 				http.StatusBadRequest)
 			return
 		}
-		if request.Type == "task" {
+		if request.Type == "task" || request.Type == "proposal" {
 			if request.ReferenceUUID == "" {
-				http.Error(w, "refID cannot be empty for tasks",
+				http.Error(w, "refID cannot be empty for tasks or proposals",
 					http.StatusBadRequest)
 				return
 			}
@@ -464,14 +466,15 @@ func (db *GoDB) handleWisdomEdit(mainDB *GoDB, connector *Connector,
 			request.Type != "box" &&
 			request.Type != "task" &&
 			request.Type != "post" &&
-			request.Type != "course" {
-			http.Error(w, "type must be one of lesson or reply or question or answer or box or task or post or course",
+			request.Type != "course" &&
+			request.Type != "proposal" {
+			http.Error(w, "type must be one of lesson or reply or question or answer or box or task or post or course or proposal",
 				http.StatusBadRequest)
 			return
 		}
-		if request.Type == "task" {
+		if request.Type == "task" || request.Type == "proposal" {
 			if request.ReferenceUUID == "" {
-				http.Error(w, "refID cannot be empty for tasks",
+				http.Error(w, "refID cannot be empty for tasks or proposals",
 					http.StatusBadRequest)
 				return
 			}
@@ -1844,9 +1847,9 @@ func (db *GoDB) handleWisdomInvestigate(mainDB *GoDB,
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
-		resp, err := db.Select(WisdomDB, map[string]string{
+		resp, _, err := db.SSelect(WisdomDB, map[string]string{
 			"refID-state": wisdomID,
-		}, nil)
+		}, nil, 10, 0)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -1861,6 +1864,7 @@ func (db *GoDB) handleWisdomInvestigate(mainDB *GoDB,
 			Tasks:       make([]*WisdomContainer, 0),
 			Posts:       make([]*WisdomContainer, 0),
 			Courses:     make([]*WisdomContainer, 0),
+			Proposals:   make([]*WisdomContainer, 0),
 			Misc:        make([]*WisdomContainer, 0),
 		}
 		var analytics *Analytics
@@ -1890,13 +1894,13 @@ func (db *GoDB) handleWisdomInvestigate(mainDB *GoDB,
 				}
 			}
 		}
-		responseRef := <-resp
-		if len(responseRef) < 1 {
-			render.JSON(w, r, queryResponse)
-			return
-		}
+		// responseRef := <-resp
+		// if len(responseRef) < 1 {
+		//   render.JSON(w, r, queryResponse)
+		//   return
+		// }
 		var container *WisdomContainer
-		for _, entry := range responseRef {
+		for entry := range resp {
 			wisdom = &Wisdom{}
 			err = json.Unmarshal(entry.Data, wisdom)
 			if err != nil {
@@ -1935,6 +1939,8 @@ func (db *GoDB) handleWisdomInvestigate(mainDB *GoDB,
 				queryResponse.Posts = append(queryResponse.Posts, container)
 			case "course":
 				queryResponse.Courses = append(queryResponse.Courses, container)
+			case "proposal":
+				queryResponse.Proposals = append(queryResponse.Proposals, container)
 			default:
 				queryResponse.Misc = append(queryResponse.Misc, container)
 			}
@@ -2081,7 +2087,7 @@ func (db *GoDB) handleWisdomAcceptAnswer(mainDB *GoDB, connector *Connector,
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		// Get reply
+		// Get reply or proposal
 		resp, ok := db.Read(WisdomDB, wisdomID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
@@ -2093,11 +2099,11 @@ func (db *GoDB) handleWisdomAcceptAnswer(mainDB *GoDB, connector *Connector,
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		if wisdom.Type != "reply" || wisdom.ReferenceUUID == "" {
+		if wisdom.ReferenceUUID == "" || (wisdom.Type != "reply" && wisdom.Type != "proposal") {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		// Get referenced question
+		// Get referenced entry
 		respQ, txnQ := db.Get(WisdomDB, wisdom.ReferenceUUID)
 		if txnQ == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
@@ -2110,43 +2116,55 @@ func (db *GoDB) handleWisdomAcceptAnswer(mainDB *GoDB, connector *Connector,
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		if wisdomQ.Type != "question" {
+		// Replies need a question as a parent, proposals just need some parent
+		if wisdom.Type == "reply" && wisdomQ.Type != "question" {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
 		// Check if user has right to accept answers for this question
+		// In case or a proposal, we check if user can accept proposals for the parent entry
 		_, canFinish := CheckWisdomAccess(user, wisdomQ, mainDB, db, r)
 		if !canFinish {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
-		// Mark answer as actual answer by switching its type from reply to answer
-		wisdom.Type = "answer"
-		// Mark question as answered by switching its state and setting current date as finished date
-		wisdomQ.IsFinished = true
-		wisdomQ.TimeFinished = TimeNowIsoString()
-		// Commit changes by first attempting to update the question itself
-		jsonEntry, err := json.Marshal(wisdomQ)
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
+		if wisdom.Type == "reply" {
+			// Mark answer as actual answer by switching its type from reply to answer
+			wisdom.Type = "answer"
+			// Mark question as answered by switching its state and setting current date as finished date
+			wisdomQ.IsFinished = true
+			wisdomQ.TimeFinished = TimeNowIsoString()
+			// Commit changes by first attempting to update the question itself
+			jsonEntry, err := json.Marshal(wisdomQ)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			err = db.Update(WisdomDB, txnQ, wisdom.ReferenceUUID, jsonEntry, map[string]string{
+				"knowledgeID-type": fmt.Sprintf("%s;%s", wisdomQ.KnowledgeUUID, wisdomQ.Type),
+				"refID-state":      fmt.Sprintf("%s;%t", wisdomQ.ReferenceUUID, wisdomQ.IsFinished),
+			})
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			// We will not modify the referenced entry
+			txnQ.Discard()
+			if wisdom.Type == "proposal" {
+				// Mark proposal as done
+				wisdom.IsFinished = true
+				wisdom.TimeFinished = TimeNowIsoString()
+			}
 		}
-		err = db.Update(WisdomDB, txnQ, wisdom.ReferenceUUID, jsonEntry, map[string]string{
-			"knowledgeID-type": fmt.Sprintf("%s;%s", wisdomQ.KnowledgeUUID, wisdomQ.Type),
-			"refID-state":      fmt.Sprintf("%s;%t", wisdomQ.ReferenceUUID, wisdomQ.IsFinished),
-		})
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-		// ...now save answer
+		// ...now save the accepted entry
 		_, txn := db.Get(WisdomDB, wisdomID)
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 		// Store
-		jsonEntry, err = json.Marshal(wisdom)
+		jsonEntry, err := json.Marshal(wisdom)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -2160,10 +2178,19 @@ func (db *GoDB) handleWisdomAcceptAnswer(mainDB *GoDB, connector *Connector,
 			return
 		}
 		// Notify question collaborators
+		var title string
+		var desc string
+		if wisdom.Type == "reply" || wisdom.Type == "answer" {
+			title = "Question Answered"
+			desc = fmt.Sprintf("Question %s answered", wisdomQ.Name)
+		} else if wisdom.Type == "proposal" {
+			title = "New Accepted Proposal"
+			desc = fmt.Sprintf("%s received an accepted proposal", wisdomQ.Name)
+		}
 		go func() {
 			NotifyWisdomCollaborators(
-				"Question Answered",
-				fmt.Sprintf("Question %s answered", wisdomQ.Name),
+				title,
+				desc,
 				user,
 				wisdomQ,
 				respQ.uUID,
@@ -2172,10 +2199,17 @@ func (db *GoDB) handleWisdomAcceptAnswer(mainDB *GoDB, connector *Connector,
 			go db.NotifyTaskChange(user, wisdomQ, respQ.uUID, mainDB, connector)
 		}()
 		// Notify answerer
+		if wisdom.Type == "reply" || wisdom.Type == "answer" {
+			title = "Answer Accepted"
+			desc = fmt.Sprintf("Your answer for %s got accepted", wisdomQ.Name)
+		} else if wisdom.Type == "proposal" {
+			title = "Proposal Accepted"
+			desc = fmt.Sprintf("Your proposal for %s got accepted", wisdomQ.Name)
+		}
 		go func() {
 			NotifyWisdomCollaborators(
-				"Answer Accepted",
-				fmt.Sprintf("Your answer for %s got accepted", wisdomQ.Name),
+				title,
+				desc,
 				user,
 				wisdom,
 				resp.uUID,
@@ -2405,45 +2439,45 @@ func (db *GoDB) handleWisdomExport(mainDB *GoDB) http.HandlerFunc {
 			textContent.WriteString(wisdom.Description)
 			// Respond to client
 			_, _ = fmt.Fprintln(w, textContent.String())
-		} else {
-			// Retrieve tasks and export those
-			// Are we selecting with a predefined status?
-			stateFilter := r.URL.Query().Get("state")
-			if stateFilter == "done" {
-				stateFilter = ";true"
-			} else if stateFilter == "todo" {
-				stateFilter = ";false"
-			} else {
-				stateFilter = ""
-			}
-			var task *Wisdom
-			respTask, err := db.Select(WisdomDB, map[string]string{
-				"refID-state": wisdomID + stateFilter,
-			}, nil)
-			if err != nil {
-				fmt.Println(err)
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				return
-			}
-			responseTask := <-respTask
-			if len(responseTask) < 1 {
-				fmt.Println(err)
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				return
-			}
-			textContent := strings.Builder{}
-			for _, taskEntry := range responseTask {
-				task = &Wisdom{}
-				err = json.Unmarshal(taskEntry.Data, task)
-				if err != nil {
-					continue
-				}
-				textContent.WriteString(fmt.Sprintf("%s\n", task.Name))
-				textContent.WriteString(fmt.Sprintf("%s\n\n", task.Description))
-			}
-			// Respond to client
-			_, _ = fmt.Fprintln(w, textContent.String())
+			return
 		}
+		// Retrieve tasks and export those
+		// Are we selecting with a predefined status?
+		stateFilter := r.URL.Query().Get("state")
+		if stateFilter == "done" {
+			stateFilter = ";true"
+		} else if stateFilter == "todo" {
+			stateFilter = ";false"
+		} else {
+			stateFilter = ""
+		}
+		var task *Wisdom
+		respTask, err := db.Select(WisdomDB, map[string]string{
+			"refID-state": wisdomID + stateFilter,
+		}, nil)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		responseTask := <-respTask
+		if len(responseTask) < 1 {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		textContent := strings.Builder{}
+		for _, taskEntry := range responseTask {
+			task = &Wisdom{}
+			err = json.Unmarshal(taskEntry.Data, task)
+			if err != nil {
+				continue
+			}
+			textContent.WriteString(fmt.Sprintf("%s\n", task.Name))
+			textContent.WriteString(fmt.Sprintf("%s\n\n", task.Description))
+		}
+		// Respond to client
+		_, _ = fmt.Fprintln(w, textContent.String())
 	}
 }
 
