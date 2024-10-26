@@ -121,8 +121,7 @@ func (db *GoDB) periodicCheckMessages() {
 }
 
 func (db *GoDB) periodicCheck(connector *Connector, fcmClient *messaging.Client) {
-	var respNow, respLast chan []*EntryResponse
-	var response []*EntryResponse
+	var respNow, respLast chan *EntryResponse
 	var err error
 	// Retrieve periodic actions that are due
 	// We will query periodic actions by day and a portion of the time string as follows:
@@ -154,12 +153,14 @@ func (db *GoDB) periodicCheck(connector *Connector, fcmClient *messaging.Client)
 	nowQuery := nowISO[0:13] // YYYY-MM-DDTHH
 	if twoQueries {
 		lastQuery := lastISO[0:13] // YYYY-MM-DDTHH
-		respLast, err = db.Select(PeriodDB, map[string]string{"due": lastQuery}, nil)
+		respLast, _, err = db.SSelect(PeriodDB, map[string]string{"due": lastQuery},
+			nil, 10, 100)
 		if err != nil {
 			return
 		}
 	}
-	respNow, err = db.Select(PeriodDB, map[string]string{"due": nowQuery}, nil)
+	respNow, _, err = db.SSelect(PeriodDB, map[string]string{"due": nowQuery},
+		nil, 10, 100)
 	if err != nil {
 		return
 	}
@@ -168,11 +169,9 @@ func (db *GoDB) periodicCheck(connector *Connector, fcmClient *messaging.Client)
 	periodicActions := make([]*PeriodicActionEntry, 0)
 	// Collect responses
 	if twoQueries {
-		response = <-respLast
-		periodicActions = checkAndAddDuePeriodicActions(response, periodicActions, action, now)
+		periodicActions = checkAndAddDuePeriodicActions(respLast, periodicActions, action, now)
 	}
-	response = <-respNow
-	periodicActions = checkAndAddDuePeriodicActions(response, periodicActions, action, now)
+	periodicActions = checkAndAddDuePeriodicActions(respNow, periodicActions, action, now)
 	// Process
 	db.processPeriodicActions(periodicActions, connector, fcmClient)
 	return
@@ -371,10 +370,10 @@ func sendPushNotifications(
 }
 
 func checkAndAddDuePeriodicActions(
-	response []*EntryResponse, list []*PeriodicActionEntry, actionTmp *PeriodicAction, now time.Time,
+	response chan *EntryResponse, list []*PeriodicActionEntry, actionTmp *PeriodicAction, now time.Time,
 ) []*PeriodicActionEntry {
 	var dueDate time.Time
-	for _, value := range response {
+	for value := range response {
 		actionTmp = &PeriodicAction{}
 		err := json.Unmarshal(value.Data, actionTmp)
 		// Skip if json unmarshal failed...
@@ -623,6 +622,9 @@ func (db *GoDB) handlePeriodicActionCreate() http.HandlerFunc {
 		}
 		if request.WebhookURLs == nil {
 			request.WebhookURLs = make([]Webhook, 0)
+		}
+		if request.ReoccurringAmount > 0 {
+			request.IsReoccurring = true
 		}
 		// Store
 		jsonEntry, err := json.Marshal(request)
