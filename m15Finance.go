@@ -191,16 +191,10 @@ func (db *GoDB) handleFinanceCollectionViewTransactions() http.HandlerFunc {
 			Summary:      []FinanceUserSummary{},
 			Compensation: []FinanceUserSummary{},
 		}
-		respTrx, errTrx := db.Select(FinanceDB,
-			map[string]string{"pid": FIndex(collectionID)}, nil,
+		respTrx, _, errTrx := db.SSelect(FinanceDB,
+			map[string]string{"pid": FIndex(collectionID)}, nil, 10, 100,
 		)
 		if errTrx != nil {
-			// Respond to client
-			render.JSON(w, r, overview)
-			return
-		}
-		responseTrx := <-respTrx
-		if len(responseTrx) < 1 {
 			// Respond to client
 			render.JSON(w, r, overview)
 			return
@@ -208,7 +202,7 @@ func (db *GoDB) handleFinanceCollectionViewTransactions() http.HandlerFunc {
 		var tmpSummary FinanceUserSummary
 		var found bool
 		// Iterate over all transactions
-		for _, rsp := range responseTrx {
+		for rsp := range respTrx {
 			rspT := &FinanceTransaction{}
 			err = json.Unmarshal(rsp.Data, rspT)
 			if err != nil {
