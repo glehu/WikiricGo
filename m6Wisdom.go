@@ -1410,6 +1410,7 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 			Tasks:       make([]*WisdomContainer, 0),
 			Posts:       make([]*WisdomContainer, 0),
 			Courses:     make([]*WisdomContainer, 0),
+			Proposals:   make([]*WisdomContainer, 0),
 			Misc:        make([]*WisdomContainer, 0),
 		}
 		// Turn query text into a full regex pattern
@@ -1510,6 +1511,8 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 				queryResponse.Posts = append(queryResponse.Posts, container)
 			case "course":
 				queryResponse.Courses = append(queryResponse.Courses, container)
+			case "proposal":
+				queryResponse.Proposals = append(queryResponse.Proposals, container)
 			default:
 				queryResponse.Misc = append(queryResponse.Misc, container)
 			}
@@ -1556,6 +1559,20 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 				sort.SliceStable(
 					queryResponse.Tasks, func(i, j int) bool {
 						return queryResponse.Tasks[i].Accuracy > queryResponse.Tasks[j].Accuracy
+					},
+				)
+			}
+			if len(queryResponse.Courses) > 1 {
+				sort.SliceStable(
+					queryResponse.Courses, func(i, j int) bool {
+						return queryResponse.Courses[i].Accuracy > queryResponse.Courses[j].Accuracy
+					},
+				)
+			}
+			if len(queryResponse.Proposals) > 1 {
+				sort.SliceStable(
+					queryResponse.Proposals, func(i, j int) bool {
+						return queryResponse.Proposals[i].Accuracy > queryResponse.Proposals[j].Accuracy
 					},
 				)
 			}
