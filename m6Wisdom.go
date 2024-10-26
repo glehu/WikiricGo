@@ -1114,6 +1114,12 @@ func CheckWisdomAccess(
 		return false, false
 	}
 	canRead = CheckReadRights(chatMember.ChatMember, chatGroup.ChatGroup)
+	// Proposals can only be read by the author or collaborators unless they are accepted
+	if wisdom.Type == "proposal" {
+		if !wisdom.IsFinished && !canWrite {
+			canRead = false
+		}
+	}
 	return canRead, canWrite
 }
 
@@ -1512,7 +1518,17 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 			case "course":
 				queryResponse.Courses = append(queryResponse.Courses, container)
 			case "proposal":
-				queryResponse.Proposals = append(queryResponse.Proposals, container)
+				// Proposals can only be read by the author or collaborators unless they are accepted
+				if wisdom.IsFinished || wisdom.Author == user.Username {
+					queryResponse.Proposals = append(queryResponse.Proposals, container)
+				} else {
+					for _, collaborator := range wisdom.Collaborators {
+						if collaborator == user.Username {
+							queryResponse.Proposals = append(queryResponse.Proposals, container)
+							break
+						}
+					}
+				}
 			default:
 				queryResponse.Misc = append(queryResponse.Misc, container)
 			}
@@ -1957,7 +1973,17 @@ func (db *GoDB) handleWisdomInvestigate(mainDB *GoDB,
 			case "course":
 				queryResponse.Courses = append(queryResponse.Courses, container)
 			case "proposal":
-				queryResponse.Proposals = append(queryResponse.Proposals, container)
+				// Proposals can only be read by the author or collaborators unless they are accepted
+				if wisdom.IsFinished || wisdom.Author == user.Username {
+					queryResponse.Proposals = append(queryResponse.Proposals, container)
+				} else {
+					for _, collaborator := range wisdom.Collaborators {
+						if collaborator == user.Username {
+							queryResponse.Proposals = append(queryResponse.Proposals, container)
+							break
+						}
+					}
+				}
 			default:
 				queryResponse.Misc = append(queryResponse.Misc, container)
 			}
