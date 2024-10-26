@@ -42,6 +42,7 @@ type Wisdom struct {
 	BannerAnimatedURL    string          `json:"burla"`
 	RowIndex             float64         `json:"row"`
 	Chapters             []WisdomChapter `json:"chapters"`
+	IsDraft              bool            `json:"draft"`
 }
 
 type WisdomContainer struct {
@@ -690,42 +691,48 @@ func (db *GoDB) handleWisdomFinish(mainDB *GoDB, connector *Connector,
 		}
 		// Check if user has right to finish this task
 		_, canFinish := CheckWisdomAccess(user, wisdom, mainDB, db, r)
-		if canFinish {
-			// Set meta data
-			wisdom.IsFinished = !wisdom.IsFinished
-			if wisdom.IsFinished {
-				wisdom.TimeFinished = TimeNowIsoString()
-			}
-			// Update entry
-			jsonEntry, err := json.Marshal(wisdom)
-			if err != nil {
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				return
-			}
-			err = db.Update(WisdomDB, txn, wisdomID, jsonEntry, map[string]string{
-				"refID-state": fmt.Sprintf("%s;%t", wisdom.ReferenceUUID, wisdom.IsFinished),
-			})
-			if err != nil {
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				return
-			}
-			// Create a notification for the author and all collaborators
-			go func() {
-				NotifyWisdomCollaborators(
-					"Task Finished",
-					fmt.Sprintf("%s finished %s", user.DisplayName, wisdom.Name),
-					user,
-					wisdom,
-					resp.uUID,
-					db,
-					connector)
-				go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
-			}()
-		} else {
+		if !canFinish {
 			txn.Discard()
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
+		// Set meta data
+		var setTo = ""
+		if wisdom.IsFinished {
+			wisdom.IsFinished = false
+			setTo = "Unfinished"
+		} else {
+			wisdom.IsFinished = true
+			setTo = "Finished"
+		}
+		if wisdom.IsFinished {
+			wisdom.TimeFinished = TimeNowIsoString()
+		}
+		// Update entry
+		jsonEntry, err := json.Marshal(wisdom)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		err = db.Update(WisdomDB, txn, wisdomID, jsonEntry, map[string]string{
+			"refID-state": fmt.Sprintf("%s;%t", wisdom.ReferenceUUID, wisdom.IsFinished),
+		})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Create a notification for the author and all collaborators
+		go func() {
+			NotifyWisdomCollaborators(
+				fmt.Sprintf("Task %s", setTo),
+				fmt.Sprintf("%s changed %s's progress to: %s", user.DisplayName, wisdom.Name, setTo),
+				user,
+				wisdom,
+				resp.uUID,
+				db,
+				connector)
+			go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
+		}()
 	}
 }
 
@@ -2042,6 +2049,46 @@ func (db *GoDB) handleWisdomModification(mainDB *GoDB, connector *Connector,
 				wisdom.Description = request.NewValue
 			} else if request.Field == "chapters" {
 				wisdom = db.handleWisdomChaptersEdit(wisdom, request)
+			} else if request.Field == "draft" {
+				if request.NewValue == "" {
+					wisdom.IsDraft = !wisdom.IsDraft
+				} else if request.NewValue == "true" {
+					wisdom.IsDraft = true
+				} else if request.NewValue == "false" {
+					wisdom.IsDraft = false
+				}
+				// Was this a proposal? If so, then we need to notify the parent wisdom's author and collaborators.
+				if wisdom.Type == "proposal" {
+					resp2, txn2 := db.Get(WisdomDB, wisdom.ReferenceUUID)
+					if txn2 == nil {
+						http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+						return
+					}
+					wisdom2 := &Wisdom{}
+					err2 := json.Unmarshal(resp2.Data, wisdom2)
+					txn2.Discard()
+					if err2 != nil {
+						http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+						return
+					}
+					var draftStatus = ""
+					if wisdom.IsDraft {
+						draftStatus = "Work In Progress"
+					} else {
+						draftStatus = "Completed"
+					}
+					go func() {
+						NotifyWisdomCollaborators(
+							fmt.Sprintf("Proposal Draft Status: %s", draftStatus),
+							fmt.Sprintf("%s changed %s's progress to: %s", user.DisplayName, wisdom.Name, draftStatus),
+							user,
+							wisdom2,
+							wisdomID,
+							db,
+							connector)
+						go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
+					}()
+				}
 			}
 			// Store
 			jsonEntry, err := json.Marshal(wisdom)
