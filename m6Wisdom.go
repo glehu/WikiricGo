@@ -1741,22 +1741,17 @@ func (db *GoDB) handleGetContributors(mainDB *GoDB,
 			return
 		}
 		// Now retrieve all wisdom entries and count contributors (authors in this case)
-		resp, err := db.Select(WisdomDB, map[string]string{
+		resp, _, err := db.SSelect(WisdomDB, map[string]string{
 			"knowledgeID-type": knowledgeEntry.uUID,
-		}, nil)
+		}, nil, 10, 10)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		response := <-resp
 		contributors := TopContributors{Contributors: make([]*ContributorStat, 0)}
-		if len(response) < 1 {
-			render.JSON(w, r, contributors)
-			return
-		}
 		conMap := map[string]*ContributorStat{}
 		var box *Wisdom
-		for _, entry := range response {
+		for entry := range resp {
 			box = &Wisdom{}
 			err = json.Unmarshal(entry.Data, box)
 			if err != nil {
@@ -2059,14 +2054,13 @@ func (db *GoDB) handleWisdomModification(mainDB *GoDB, connector *Connector,
 				}
 				// Was this a proposal? If so, then we need to notify the parent wisdom's author and collaborators.
 				if wisdom.Type == "proposal" {
-					resp2, txn2 := db.Get(WisdomDB, wisdom.ReferenceUUID)
-					if txn2 == nil {
+					resp2, ok := db.Read(WisdomDB, wisdom.ReferenceUUID)
+					if !ok {
 						http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 						return
 					}
 					wisdom2 := &Wisdom{}
 					err2 := json.Unmarshal(resp2.Data, wisdom2)
-					txn2.Discard()
 					if err2 != nil {
 						http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 						return
@@ -2191,6 +2185,11 @@ func (db *GoDB) handleWisdomAcceptAnswer(mainDB *GoDB, connector *Connector,
 		}
 		if wisdom.ReferenceUUID == "" || (wisdom.Type != "reply" && wisdom.Type != "proposal") {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Proposals cannot be accepted if they're still in draft state
+		if wisdom.Type == "proposal" && wisdom.IsDraft {
+			http.Error(w, http.StatusText(http.StatusConflict), http.StatusConflict)
 			return
 		}
 		// Get referenced entry

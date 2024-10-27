@@ -19,6 +19,7 @@ type Sandbox struct {
 	KnowledgeUUID string `json:"pid"`
 	TimeCreated   string `json:"ts"`
 	AnalyticsUUID string `json:"ana"` // Views, likes etc. will be stored in a separate database
+	AllowEdit     bool   `json:"oedit"`
 }
 
 type SandboxElement struct {
@@ -36,6 +37,7 @@ type SandboxElement struct {
 	Width         float64 `json:"w"`
 	Height        float64 `json:"h"`
 	Hide          bool    `json:"hide"`
+	AllowEdit     bool    `json:"oedit"`
 }
 
 type SandboxEntry struct {
@@ -247,6 +249,11 @@ func (db *GoDB) handleSandboxModification(mainDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
+		// Others may not be able to edit or change this sandbox
+		if !sandbox.AllowEdit && user.Username != sandbox.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
 		// Check write right
 		_, knowledgeAccess := CheckKnowledgeAccess(
 			user, sandbox.KnowledgeUUID, mainDB, r)
@@ -289,7 +296,7 @@ func (db *GoDB) handleSandboxView(mainDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		// Is user owner?
+		// Get sandbox
 		response, ok := db.Read(SandboxDB, sandboxID)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
@@ -309,20 +316,15 @@ func (db *GoDB) handleSandboxView(mainDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Retrieve all elements of this sandbox
-		resp, err := db.Select(SandboxDB, map[string]string{
-			"usr-pid": fmt.Sprintf("%s-%s", FIndex(user.Username), sandboxID),
-		}, nil)
+		responseContainer := SandboxElementsContainer{Elements: make([]SandboxElementEntry, 0)}
+		resp, _, err := db.SSelect(SandboxDB, map[string]string{
+			"pid-usr": fmt.Sprintf("%s-", sandboxID),
+		}, nil, 10, 100)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		responseElements := <-resp
-		if len(responseElements) < 1 {
-			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
-			return
-		}
-		responseContainer := SandboxElementsContainer{Elements: make([]SandboxElementEntry, len(responseElements))}
-		for _, sandboxResponse := range responseElements {
+		for sandboxResponse := range resp {
 			element := &SandboxElement{}
 			err = json.Unmarshal(sandboxResponse.Data, element)
 			if err != nil {
@@ -375,6 +377,11 @@ func (db *GoDB) handleSandboxElementCreate(mainDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
+		// Others may not be able to edit or change this sandbox
+		if !sandbox.AllowEdit && user.Username != sandbox.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
 		// Check write right
 		_, knowledgeAccess := CheckKnowledgeAccess(
 			user, sandbox.KnowledgeUUID, mainDB, r)
@@ -398,7 +405,7 @@ func (db *GoDB) handleSandboxElementCreate(mainDB *GoDB) http.HandlerFunc {
 			return
 		}
 		uUID, err := db.Insert(SandboxDB, jsonEntry, map[string]string{
-			"usr-pid": fmt.Sprintf("%s-%s", FIndex(user.Username), sandboxID),
+			"pid-usr": fmt.Sprintf("%s-%s", sandboxID, FIndex(user.Username)),
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -437,6 +444,11 @@ func (db *GoDB) handleSandboxElementEdit(mainDB *GoDB) http.HandlerFunc {
 		err = json.Unmarshal(response.Data, sandboxElement)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Others may not be able to edit or change this sandbox
+		if !sandboxElement.AllowEdit && user.Username != sandboxElement.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
 		// Retrieve sandbox element transaction
@@ -484,6 +496,11 @@ func (db *GoDB) handleSandboxDelete(mainDB *GoDB) http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
+		// Others may not be able to edit or change this sandbox
+		if !sandbox.AllowEdit && user.Username != sandbox.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
 		// Check write right
 		_, knowledgeAccess := CheckKnowledgeAccess(
 			user, sandbox.KnowledgeUUID, mainDB, r)
@@ -524,7 +541,7 @@ func (db *GoDB) handleSandboxElementDelete() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		if user.Username != element.Username {
+		if !element.AllowEdit && user.Username != element.Username {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
@@ -533,6 +550,6 @@ func (db *GoDB) handleSandboxElementDelete() http.HandlerFunc {
 			_ = db.Delete(AnaDB, element.AnalyticsUUID, []string{})
 		}
 		// Delete item
-		_ = db.Delete(SandboxDB, elementID, []string{"usr-pid"})
+		_ = db.Delete(SandboxDB, elementID, []string{"pid-usr"})
 	}
 }

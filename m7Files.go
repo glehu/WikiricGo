@@ -138,6 +138,9 @@ func GetBase64FileType(mimeType string) (fileExt, fileType string) {
 		case "csv":
 			fileExt = ".csv"
 			break
+		case "markdown":
+			fileExt = ".md"
+			break
 		}
 		break
 	case "image":
@@ -173,6 +176,9 @@ func GetBase64FileType(mimeType string) (fileExt, fileType string) {
 			break
 		case "x-7z-compressed":
 			fileExt = ".7z"
+			break
+		case "x-rar-compressed":
+			fileExt = ".rar"
 			break
 		case "msword":
 			fileExt = ".doc"

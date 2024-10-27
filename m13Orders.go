@@ -477,20 +477,15 @@ func (db *GoDB) handleOrdersGetOwn() http.HandlerFunc {
 		}
 		// Retrieve user's orders
 		query := FIndex(user.Username)
-		resp, err := db.Select(OrderDB, map[string]string{
-			"usr": query}, nil)
+		resp, _, err := db.SSelect(OrderDB, map[string]string{
+			"usr": query}, nil, 10, 100)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 		orderList := make([]*OrderEntry, 0)
-		response := <-resp
-		if len(response) < 1 {
-			render.JSON(w, r, orderList)
-			return
-		}
 		var order *Order
-		for _, orderResp := range response {
+		for orderResp := range resp {
 			order = &Order{}
 			err = json.Unmarshal(orderResp.Data, order)
 			if err != nil {
@@ -539,20 +534,15 @@ func (db *GoDB) handleOrdersGetCommissions(mainDB *GoDB) http.HandlerFunc {
 		}
 		// Retrieve commissions
 		query = fmt.Sprintf("%s;%s", response[0].uUID, OrderStateOpen)
-		resp, err = db.Select(OrderDB, map[string]string{
-			"pid-state": query}, nil)
+		respCom, _, err := db.SSelect(OrderDB, map[string]string{
+			"pid-state": query}, nil, 10, 100)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 		orderList := &OrderList{Orders: make([]*OrderEntry, 0)}
-		response = <-resp
-		if len(response) < 1 {
-			render.JSON(w, r, orderList)
-			return
-		}
 		var order *Order
-		for _, orderResp := range response {
+		for orderResp := range respCom {
 			order = &Order{}
 			err = json.Unmarshal(orderResp.Data, order)
 			if err != nil || order.State == OrderStateCancelled { // TODO: Allow cancelled with query parameter
