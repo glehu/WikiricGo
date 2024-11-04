@@ -251,6 +251,32 @@ func (db *GoDB) handleChatMessageFromChat(
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
+		// Does the user only want to count the messages?
+		countOnlyT := r.URL.Query().Get("qcount")
+		if countOnlyT == "true" {
+			// Count the messages of the provided channel
+			// We use getEntry=false to only retrieve UUIDs. Less memory consumption and less CPU time needed!
+			resp, _, err := db.SSelect(MessageDB, map[string]string{
+				"chatID": chatID}, nil, 20, 0, false)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			countResponse := MessageContributor{
+				Username:  "",
+				Count:     0,
+				Reactions: 0,
+			}
+			count := 0
+			for elem := range resp {
+				if elem.uUID != "" {
+					count += 1
+				}
+			}
+			countResponse.Count = int64(count)
+			render.JSON(w, r, countResponse)
+			return
+		}
 		// Options?
 		options := r.Context().Value("pagination").(*SelectOptions)
 		if options.MaxResults <= 0 {

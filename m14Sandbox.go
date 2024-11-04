@@ -38,6 +38,7 @@ type SandboxElement struct {
 	Height        float64 `json:"h"`
 	Hide          bool    `json:"hide"`
 	AllowEdit     bool    `json:"oedit"`
+	ZIndex        int     `json:"z"`
 }
 
 type SandboxEntry struct {
@@ -319,7 +320,7 @@ func (db *GoDB) handleSandboxView(mainDB *GoDB) http.HandlerFunc {
 		responseContainer := SandboxElementsContainer{Elements: make([]SandboxElementEntry, 0)}
 		resp, _, err := db.SSelect(SandboxDB, map[string]string{
 			"pid-usr": fmt.Sprintf("%s-", sandboxID),
-		}, nil, 10, 100)
+		}, nil, 10, 100, true)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return

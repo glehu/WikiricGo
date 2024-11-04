@@ -192,7 +192,8 @@ func (db *GoDB) handleFinanceCollectionViewTransactions() http.HandlerFunc {
 			Compensation: []FinanceUserSummary{},
 		}
 		respTrx, _, errTrx := db.SSelect(FinanceDB,
-			map[string]string{"pid": FIndex(collectionID)}, nil, 10, 100,
+			map[string]string{"pid": FIndex(collectionID)},
+			nil, 10, 100, true,
 		)
 		if errTrx != nil {
 			// Respond to client

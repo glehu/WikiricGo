@@ -1438,7 +1438,7 @@ func (db *GoDB) handleWisdomQuery(mainDB *GoDB) http.HandlerFunc {
 		b := false
 		response, _, err := db.SSelect(WisdomDB, map[string]string{
 			"knowledgeID-type": fmt.Sprintf("%s;%s", knowledgeID, request.Type),
-		}, options, 10, int(options.MaxResults))
+		}, options, 10, int(options.MaxResults), true)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -1743,7 +1743,7 @@ func (db *GoDB) handleGetContributors(mainDB *GoDB,
 		// Now retrieve all wisdom entries and count contributors (authors in this case)
 		resp, _, err := db.SSelect(WisdomDB, map[string]string{
 			"knowledgeID-type": knowledgeEntry.uUID,
-		}, nil, 10, 10)
+		}, nil, 10, 10, true)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -1884,7 +1884,7 @@ func (db *GoDB) handleWisdomInvestigate(mainDB *GoDB,
 		}
 		resp, _, err := db.SSelect(WisdomDB, map[string]string{
 			"refID-state": wisdomID,
-		}, nil, 10, 0)
+		}, nil, 10, 0, true)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return

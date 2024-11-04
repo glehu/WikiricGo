@@ -478,7 +478,7 @@ func (db *GoDB) handleOrdersGetOwn() http.HandlerFunc {
 		// Retrieve user's orders
 		query := FIndex(user.Username)
 		resp, _, err := db.SSelect(OrderDB, map[string]string{
-			"usr": query}, nil, 10, 100)
+			"usr": query}, nil, 10, 100, true)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -535,7 +535,7 @@ func (db *GoDB) handleOrdersGetCommissions(mainDB *GoDB) http.HandlerFunc {
 		// Retrieve commissions
 		query = fmt.Sprintf("%s;%s", response[0].uUID, OrderStateOpen)
 		respCom, _, err := db.SSelect(OrderDB, map[string]string{
-			"pid-state": query}, nil, 10, 100)
+			"pid-state": query}, nil, 10, 100, true)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return

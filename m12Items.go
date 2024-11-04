@@ -667,7 +667,7 @@ func (db *GoDB) doItemQuery(w http.ResponseWriter, r *http.Request, c chan *Item
 	var cncl context.CancelFunc
 	b := false
 	// Iterate over all items found
-	response, cancel, err := db.SSelect(ItemDB, index, nil, 4, int(options.MaxResults))
+	response, cancel, err := db.SSelect(ItemDB, index, nil, 4, int(options.MaxResults), true)
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		c <- queryResponse
@@ -1646,7 +1646,7 @@ func (db *GoDB) createStoreFilterCache(storeID string) *ItemFilters {
 	// Retrieve all Item entries
 	response, _, err := db.SSelect(ItemDB, map[string]string{
 		"pid": storeID,
-	}, nil, 30, 0)
+	}, nil, 30, 0, true)
 	if err != nil {
 		return nil
 	}
@@ -1849,7 +1849,7 @@ func (db *GoDB) doCalcItemStock(ctx context.Context, c chan float64, storeID, it
 	// Start retrieving stock entries
 	response, cancel, err := db.SSelect(ItemDB, map[string]string{
 		"pid-uid-st": fmt.Sprintf("%s;%s;%s;", storeID, itemID, storageUnit),
-	}, nil, -1, 100)
+	}, nil, -1, 100, true)
 	if err != nil {
 		c <- 0.0
 		return

@@ -182,9 +182,6 @@ func (db *GoDB) handleChatGroupCreate() http.HandlerFunc {
 		if request.IsCommunity == true {
 			// Communities are not encrypted to make thousands of members possible!
 			request.IsEncrypted = false
-		} else {
-			// Encrypt non-community chat groups
-			request.IsEncrypted = true
 		}
 		// Save it
 		newChatGroup, err := json.Marshal(request)

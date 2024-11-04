@@ -40,6 +40,7 @@ type FileSubmission struct {
 	ChatGroupUUID string `json:"pid"`
 	IsPrivate     bool   `json:"priv"`
 	IsEmote       bool   `json:"emote"`
+	ReferenceUUID string `json:"ref"` // References another Wisdom
 }
 
 type FileMeta struct {
@@ -52,6 +53,7 @@ type FileMeta struct {
 	ChatGroupUUID string  `json:"pid"`
 	IsPrivate     bool    `json:"priv"`
 	Type          string  `json:"type"`
+	ReferenceUUID string  `json:"ref"` // References another Wisdom
 }
 
 type FileMetaEntry struct {
@@ -85,6 +87,7 @@ func (db *GoDB) ProtectedFileEndpoints(
 		// ###########
 		r.Get("/meta/{fileID}", db.handleFileMetaGet(mainDB))
 		r.Get("/chat/{chatID}", db.handleFilesGetFromChat(mainDB))
+		r.Get("/wisdom/{wisdomID}", db.handleFilesGetFromWisdom(mainDB))
 		r.Get("/delete/{fileID}", db.handleFileDelete(mainDB))
 	})
 }
@@ -391,10 +394,16 @@ func (db *GoDB) saveBase64AsFile(
 		return "", err
 	}
 	// Prepare indices
-	indices := map[string]string{"chatID": request.ChatGroupUUID}
+	indices := map[string]string{}
+	if request.ChatGroupUUID != "" {
+		indices["chatID"] = request.ChatGroupUUID
+	}
 	// Do we need an extra index for a custom emote?
 	if request.IsEmote {
 		indices["chatID-type"] = fmt.Sprintf("%s;%s;", request.ChatGroupUUID, "emote")
+	}
+	if request.ReferenceUUID != "" {
+		indices["ref"] = request.ReferenceUUID
 	}
 	// Save meta data
 	uUID, err := db.Insert(FileDB, jsonEntry, indices)
@@ -450,11 +459,8 @@ func (db *GoDB) handleFileCreate(mainDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Is a chat group referenced?
-		var chatGroup *ChatGroupEntry
-		var chatMember *ChatMemberEntry
-		var err error
 		if request.ChatGroupUUID != "" {
-			chatGroup, chatMember, _, err = ReadChatGroupAndMember(
+			chatGroup, chatMember, _, err := ReadChatGroupAndMember(
 				mainDB, db, nil,
 				request.ChatGroupUUID, user.Username, "", r)
 			if err != nil {
@@ -464,6 +470,28 @@ func (db *GoDB) handleFileCreate(mainDB *GoDB) http.HandlerFunc {
 			canWrite := CheckWriteRights(chatMember.ChatMember, chatGroup.ChatGroup)
 			if !canWrite {
 				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+				return
+			}
+		}
+		// Is a wisdom entry referenced?
+		if request.ReferenceUUID != "" {
+			response, ok := db.Read(WisdomDB, request.ReferenceUUID)
+			if !ok {
+				http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+				return
+			}
+			wisdom := &Wisdom{}
+			err := json.Unmarshal(response.Data, wisdom)
+			if err != nil {
+				fmt.Println(err)
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			// If Wisdom is not public, check member and read right
+			canRead, _ := CheckWisdomAccess(
+				user, wisdom, mainDB, db, r)
+			if !canRead {
+				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 				return
 			}
 		}
@@ -603,18 +631,74 @@ func (db *GoDB) handleFilesGetFromChat(mainDB *GoDB) http.HandlerFunc {
 		// Prepare response
 		files := &FileList{Files: make([]*FileMetaEntry, 0)}
 		// Retrieve all files
-		respFiles, err := db.Select(FileDB, index, nil)
+		respFiles, _, err := db.SSelect(FileDB, index,
+			nil, 10, 100, true)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		responseFiles := <-respFiles
-		if len(responseFiles) < 1 {
-			// Respond
-			render.JSON(w, r, files)
+		for entry := range respFiles {
+			file := &FileMeta{}
+			err = json.Unmarshal(entry.Data, file)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			// Sanitize
+			file.Path = fmt.Sprintf("files/public/get/%s", entry.uUID)
+			files.Files = append(files.Files, &FileMetaEntry{
+				FileMeta: file,
+				UUID:     entry.uUID,
+			})
+		}
+		// Respond
+		render.JSON(w, r, files)
+	}
+}
+
+func (db *GoDB) handleFilesGetFromWisdom(mainDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
 		}
-		for _, entry := range responseFiles {
+		wisdomID := chi.URLParam(r, "wisdomID")
+		if wisdomID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		response, ok := db.Read(WisdomDB, wisdomID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		wisdom := &Wisdom{}
+		err := json.Unmarshal(response.Data, wisdom)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// If Wisdom is not public, check member and read right
+		canRead, _ := CheckWisdomAccess(
+			user, wisdom, mainDB, db, r)
+		if !canRead {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Prepare index query
+		index := map[string]string{"ref": wisdomID}
+		// Prepare response
+		files := &FileList{Files: make([]*FileMetaEntry, 0)}
+		// Retrieve all files
+		respFiles, _, err := db.SSelect(FileDB, index,
+			nil, 10, 100, true)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		for entry := range respFiles {
 			file := &FileMeta{}
 			err = json.Unmarshal(entry.Data, file)
 			if err != nil {
@@ -675,7 +759,7 @@ func (db *GoDB) handleFileDelete(mainDB *GoDB) http.HandlerFunc {
 				return
 			}
 		}
-		err = db.Delete(FileDB, fileID, []string{"chatID"})
+		err = db.Delete(FileDB, fileID, []string{"chatID", "ref"})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return

@@ -241,7 +241,7 @@ func (db *GoDB) Select(
 					return
 				}
 			}()
-			db.singleIndexQuery(mod, processArrayIndexKey(keyT), valueT, responsesInternal, &wg, ctx)
+			db.singleIndexQuery(mod, processArrayIndexKey(keyT), valueT, responsesInternal, &wg, ctx, true)
 		}()
 	}
 	// Start goroutine awaiting a cancellation
@@ -318,8 +318,10 @@ func (db *GoDB) Select(
 //
 // An unbuffered or low capacity response channel (adjusted with bufSize) paired with a low timeout
 // could lead to missing more responses as the timeout does not pause upon processing results.
+//
+// When using getEntry=false, only UUIDs will be returned. This speeds up the query allowing for counting.
 func (db *GoDB) SSelect(
-	mod string, indices map[string]string, options *SelectOptions, timeoutSec int, bufSize int,
+	mod string, indices map[string]string, options *SelectOptions, timeoutSec int, bufSize int, getEntry bool,
 ) (chan *EntryResponse, context.CancelFunc, error) {
 	indicesClean, err := db.validateIndices(indices, true)
 	if err != nil {
@@ -368,7 +370,7 @@ func (db *GoDB) SSelect(
 					return
 				}
 			}()
-			db.singleIndexQuery(mod, processArrayIndexKey(keyT), valueT, responsesInternal, &wg, ctx)
+			db.singleIndexQuery(mod, processArrayIndexKey(keyT), valueT, responsesInternal, &wg, ctx, getEntry)
 		}()
 	}
 	// Start goroutine awaiting a cancellation
@@ -525,7 +527,7 @@ func (db *GoDB) doUpdate(
 }
 
 func (db *GoDB) singleIndexQuery(
-	mod, index, value string, responses chan *EntryResponse, wg *sync.WaitGroup, ctx context.Context,
+	mod, index, value string, responses chan *EntryResponse, wg *sync.WaitGroup, ctx context.Context, getEntry bool,
 ) {
 	defer wg.Done()
 	noResults := true
@@ -552,17 +554,25 @@ func (db *GoDB) singleIndexQuery(
 			// Match!
 			item = it.Item()
 			err = item.Value(func(v []byte) error {
-				// Since sub index entries' values point to the main index entry's uuid,
-				// we need to get the main index entry now
-				ix, err = txn.Get([]byte(fmt.Sprintf("%s:uid:%s", mod, v)))
-				if err != nil {
-					return nil
-				}
-				ixEntry, err = ix.ValueCopy(nil)
-				noResults = false
-				responses <- &EntryResponse{
-					uUID: string(v),
-					Data: ixEntry,
+				if getEntry {
+					// Since sub index entries' values point to the main index entry's uuid,
+					// we need to get the main index entry now
+					ix, err = txn.Get([]byte(fmt.Sprintf("%s:uid:%s", mod, v)))
+					if err != nil {
+						return nil
+					}
+					ixEntry, err = ix.ValueCopy(nil)
+					noResults = false
+					responses <- &EntryResponse{
+						uUID: string(v),
+						Data: ixEntry,
+					}
+				} else {
+					noResults = false
+					responses <- &EntryResponse{
+						uUID: string(v),
+						Data: nil,
+					}
 				}
 				return nil
 			})
