@@ -18,16 +18,27 @@ type Category struct {
 }
 
 type Knowledge struct {
-	Name          string     `json:"t"`
-	Description   string     `json:"desc"`
-	TimeCreated   string     `json:"ts"`
-	ChatGroupUUID string     `json:"pid"`
-	Categories    []Category `json:"cats"`
+	Name                string     `json:"t"`
+	Description         string     `json:"desc"`
+	TimeCreated         string     `json:"ts"`
+	ChatGroupUUID       string     `json:"pid"`
+	Categories          []Category `json:"cats"`
+	ThumbnailURL        string     `json:"iurl"`
+	BannerURL           string     `json:"burl"`
+	PlannerThumbnailURL string     `json:"piurl"`
+	PlannerBannerURL    string     `json:"pburl"`
 }
 
 type KnowledgeEntry struct {
 	*Knowledge
 	UUID string `json:"uid"`
+}
+
+type KnowledgeModification struct {
+	Type     string `json:"type"`
+	Field    string `json:"field"`
+	OldValue string `json:"old"`
+	NewValue string `json:"new"`
 }
 
 func (db *GoDB) ProtectedKnowledgeEndpoints(
@@ -39,6 +50,7 @@ func (db *GoDB) ProtectedKnowledgeEndpoints(
 		// ############
 		r.Post("/create", db.handleKnowledgeCreate(rapidDB, chatServer))
 		r.Post("/cats/mod/{knowledgeID}", db.handleKnowledgeCategoryModification())
+		r.Post("/mod/{knowledgeID}", db.handleKnowledgeModification())
 		// ###########
 		// ### GET ###
 		// ###########
@@ -60,6 +72,16 @@ func (a *Knowledge) Bind(_ *http.Request) error {
 func (a *Category) Bind(_ *http.Request) error {
 	if a.Name == "" {
 		return errors.New("missing name")
+	}
+	return nil
+}
+
+func (a *KnowledgeModification) Bind(_ *http.Request) error {
+	if a.Type == "" {
+		return errors.New("missing type")
+	}
+	if a.Field == "" {
+		return errors.New("missing field")
 	}
 	return nil
 }
@@ -277,6 +299,76 @@ func (db *GoDB) handleKnowledgeCategoryModification() http.HandlerFunc {
 				knowledge.Categories[index] = *request
 			}
 		}
+		// Update knowledge
+		jsonEntry, err := json.Marshal(knowledge)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		err = db.Update(KnowledgeDB, txn, response.uUID, jsonEntry, map[string]string{
+			"chatID": knowledge.ChatGroupUUID,
+		})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+	}
+}
+
+func (db *GoDB) handleKnowledgeModification() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		knowledgeID := chi.URLParam(r, "knowledgeID")
+		if knowledgeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Retrieve POST payload
+		request := &KnowledgeModification{}
+		if err := render.Bind(r, request); err != nil {
+			fmt.Println(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Retrieve knowledge
+		response, txn := db.Get(KnowledgeDB, knowledgeID)
+		if txn == nil {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		defer txn.Discard()
+		knowledge := &Knowledge{}
+		err := json.Unmarshal(response.Data, knowledge)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		didUpdate := false
+		if request.Type == "edit" {
+			if request.Field == "iurl" {
+				knowledge.ThumbnailURL = fmt.Sprintf("files/public/get/%s", request.NewValue)
+				didUpdate = true
+			} else if request.Field == "burl" {
+				knowledge.BannerURL = fmt.Sprintf("files/public/get/%s", request.NewValue)
+				didUpdate = true
+			} else if request.Field == "piurl" {
+				knowledge.PlannerThumbnailURL = fmt.Sprintf("files/public/get/%s", request.NewValue)
+				didUpdate = true
+			} else if request.Field == "pburl" {
+				knowledge.PlannerBannerURL = fmt.Sprintf("files/public/get/%s", request.NewValue)
+				didUpdate = true
+			}
+		}
+		if !didUpdate {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// Update knowledge
 		jsonEntry, err := json.Marshal(knowledge)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
