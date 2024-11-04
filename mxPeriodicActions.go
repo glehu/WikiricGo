@@ -405,11 +405,18 @@ func (db *GoDB) handlePeriodicActionsGet() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
 		}
-		// Retrieve all periodic actions of this user
-		// TODO: More filters
 		actions := PeriodicActionsResponse{PeriodicActions: make([]*PeriodicActionEntry, 0)}
-		// Retrieve all files
-		respActions, err := db.Select(PeriodDB, map[string]string{"usr": FIndex(user.Username)}, nil)
+		// Check if user wants to query reference UUID
+		refQuery := r.URL.Query().Get("qref")
+		var respActions chan []*EntryResponse
+		var err error
+		if refQuery != "" {
+			// Retrieve all periodic actions of this reference UUID
+			respActions, err = db.Select(PeriodDB, map[string]string{"ref": FIndex(refQuery)}, nil)
+		} else {
+			// Retrieve all periodic actions of this user
+			respActions, err = db.Select(PeriodDB, map[string]string{"usr": FIndex(user.Username)}, nil)
+		}
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -635,6 +642,7 @@ func (db *GoDB) handlePeriodicActionCreate() http.HandlerFunc {
 		_, err = db.Insert(PeriodDB, jsonEntry, map[string]string{
 			"usr": FIndex(user.Username),
 			"due": request.TriggerDateTime,
+			"ref": FIndex(request.Reference),
 		})
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
