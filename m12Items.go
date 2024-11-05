@@ -1538,7 +1538,8 @@ func (db *GoDB) doEditItem(w http.ResponseWriter, user *User, request *Item, ite
 	}
 	// Update
 	// _, txn := db.Get(ItemDB, itemID)
-	txn := db.db.NewTransaction(true)
+	txn := db.NewTransaction(true)
+	defer txn.Discard()
 	jsonEntry, err := json.Marshal(request)
 	if err != nil {
 		if !noErrors {
