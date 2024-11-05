@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 )
 
 const MessageDB = "m3"
@@ -54,6 +55,11 @@ type MessageContributor struct {
 	Username  string `json:"usr"`
 	Count     int64  `json:"count"`
 	Reactions int64  `json:"reacts"`
+}
+
+type ChannelStatistics struct {
+	LastUpdated  []byte `json:"lastUpdated"`
+	MessageCount int64  `json:"msgs"`
 }
 
 func (db *GoDB) ProtectedChatMessagesEndpoints(
@@ -255,27 +261,7 @@ func (db *GoDB) handleChatMessageFromChat(
 		// Does the user only want to count the messages?
 		countOnlyT := r.URL.Query().Get("qcount")
 		if countOnlyT == "true" {
-			// Count the messages of the provided channel
-			// We use getEntry=false to only retrieve UUIDs. Less memory consumption and less CPU time needed!
-			resp, _, err := db.SSelect(MessageDB, map[string]string{
-				"chatID": chatID}, nil, 20, 0, false)
-			if err != nil {
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				return
-			}
-			countResponse := MessageContributor{
-				Username:  "",
-				Count:     0,
-				Reactions: 0,
-			}
-			count := 0
-			for elem := range resp {
-				if elem.uUID != "" {
-					count += 1
-				}
-			}
-			countResponse.Count = int64(count)
-			render.JSON(w, r, countResponse)
+			db.countMessages(w, r, chatID)
 			return
 		}
 		// Options?
@@ -321,6 +307,82 @@ func (db *GoDB) handleChatMessageFromChat(
 		}
 		render.JSON(w, r, messages)
 	}
+}
+
+func (db *GoDB) countMessages(w http.ResponseWriter, r *http.Request, chatID string) {
+	// Is there a channel report cached already?
+	// Since we may iterate over millions of entries, it's smart to only do this once in a while.
+	stats := db.getChannelStatsCache(chatID)
+	if stats != nil {
+		render.JSON(w, r, stats)
+		return
+	}
+	// Count the messages of the provided channel
+	// We use getEntry=false to only retrieve UUIDs. Less memory consumption and less CPU time needed!
+	resp, _, err := db.SSelect(MessageDB, map[string]string{
+		"chatID": chatID}, nil, 30, 10, false)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	stats = &ChannelStatistics{
+		LastUpdated:  make([]byte, 0),
+		MessageCount: 0,
+	}
+	count := 0
+	for elem := range resp {
+		if elem.uUID != "" {
+			count += 1
+		}
+	}
+	textBytes, err := time.Now().MarshalText()
+	if err != nil {
+		return
+	}
+	stats.LastUpdated = textBytes
+	stats.MessageCount = int64(count)
+	render.JSON(w, r, stats)
+	// Store
+	jsonEntry, err := json.Marshal(stats)
+	if err != nil {
+		return
+	}
+	_, err = db.Insert(MessageDB, jsonEntry, map[string]string{
+		"pid-filter": FIndex(chatID),
+	})
+}
+
+func (db *GoDB) getChannelStatsCache(chatID string) *ChannelStatistics {
+	resp, err := db.Select(MessageDB, map[string]string{
+		"pid-filter": FIndex(chatID),
+	}, &SelectOptions{
+		MaxResults: 1,
+		Page:       0,
+		Skip:       0,
+	})
+	if err != nil {
+		return nil
+	}
+	response := <-resp
+	if len(response) < 1 {
+		return nil
+	}
+	stats := &ChannelStatistics{}
+	err = json.Unmarshal(response[0].Data, stats)
+	if err != nil {
+		return nil
+	}
+	// If the stats are old, we simply don't return them
+	t := time.Time{}
+	err = t.UnmarshalText(stats.LastUpdated)
+	if err != nil {
+		return nil
+	}
+	delta := time.Since(t)
+	if delta.Minutes() > 1 {
+		return nil
+	}
+	return stats
 }
 
 func (db *GoDB) handleChatMessageDelete(chatServer *ChatServer, mainDB *GoDB) http.HandlerFunc {
@@ -575,14 +637,10 @@ func (db *GoDB) GetChatMessageDistribution(chatMember *ChatMember, mainDB *GoDB,
 		return nil
 	}
 	// Retrieve messages from this chat group
-	resp, err := db.Select(MessageDB, map[string]string{
+	resp, _, err := db.SSelect(MessageDB, map[string]string{
 		"chatID": chatID,
-	}, nil)
+	}, nil, 30, 10, true)
 	if err != nil {
-		return nil
-	}
-	response := <-resp
-	if len(response) < 1 {
 		return nil
 	}
 	dist := &MessageDistribution{
@@ -592,7 +650,7 @@ func (db *GoDB) GetChatMessageDistribution(chatMember *ChatMember, mainDB *GoDB,
 	}
 	contributors := map[string]int64{}
 	reactors := map[string]int64{}
-	for _, result := range response {
+	for result := range resp {
 		msg := &ChatMessage{}
 		err = json.Unmarshal(result.Data, msg)
 		if err != nil {

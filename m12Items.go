@@ -1648,7 +1648,7 @@ func (db *GoDB) createStoreFilterCache(storeID string) *ItemFilters {
 	// Retrieve all Item entries
 	response, _, err := db.SSelect(ItemDB, map[string]string{
 		"pid": storeID,
-	}, nil, 30, 0, true)
+	}, nil, 30, 10, true)
 	if err != nil {
 		return nil
 	}
