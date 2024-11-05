@@ -47,6 +47,8 @@ type SelectOptions struct {
 	Skip       int64
 }
 
+// ### Public Functions ###
+
 // OpenDB creates a named database (e.g. users), initialized with the provided named indices (e.g. username)
 func OpenDB(module string) *GoDB {
 	// Set working directory
@@ -438,6 +440,16 @@ func (db *GoDB) SSelect(
 	return responsesExternal, cancel, nil
 }
 
+// NewTransaction returns a BadgerDB Transaction for read (update=false) or write (update=true) purposes.
+// When updating entries using new data without checking its previous value
+// ...(basically forcefully overwriting the old value) it is faster to just generate a new transaction
+// ...without retrieving the old entry from disk.
+func (db *GoDB) NewTransaction(update bool) *badger.Txn {
+	return db.db.NewTransaction(update)
+}
+
+// ### Internal ###
+
 func (db *GoDB) doInsert(
 	mod string, uUID []byte, data []byte, indices map[string]string,
 ) error {
@@ -452,7 +464,7 @@ func (db *GoDB) doInsert(
 		// E.G.: (DB: UserDB = m1; IX: Username = usr)
 		//				   	|      Index          |        Data        |
 		//            | ------------------- | ------------------ |
-		// 		Main:	 	|	m1:12345				    |	User1, Sample Name |
+		// 		Main:	 	|	m1:uid:12345		    |	User1, Sample Name |
 		// 		Sub:		|	m1:usr:User1;12345	|	12345							 |
 		var ival string
 		for k, v := range indices {
@@ -481,7 +493,7 @@ func (db *GoDB) doUpdate(
 	// E.G.: (DB: UserDB = m1; IX: Username = usr)
 	//				   	|      Index         |        Data        |
 	//            | ------------------ | ------------------ |
-	// 		Main:	 	|	m1:12345           | User1, Sample Name |
+	// 		Main:	 	|	m1:uid:12345       | User1, Sample Name |
 	// 		Sub:		|	m1:usr:User1;12345 | 12345              |
 	var ival string
 	// Since we can process array indices, we need to make sure
