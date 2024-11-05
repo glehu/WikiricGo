@@ -665,7 +665,9 @@ func (db *GoDB) handleProcessEdit(mainDB *GoDB, connector *Connector,
 			process.Description = request.NewValue
 		}
 		// Update
-		_, txn := db.Get(ProcessDB, processID)
+		// _, txn := db.Get(ProcessDB, processID)
+		txn := db.NewTransaction(true)
+		defer txn.Discard()
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return

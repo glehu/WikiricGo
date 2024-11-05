@@ -288,7 +288,9 @@ func (db *GoDB) processSinglePeriodicAction(
 	action.ReoccurringAmount -= 1
 	// Update action
 	jsonAction, err := json.Marshal(action)
-	_, txn := db.Get(PeriodDB, action.UUID)
+	// _, txn := db.Get(PeriodDB, action.UUID)
+	txn := db.NewTransaction(true)
+	defer txn.Discard()
 	_ = db.Update(PeriodDB, txn, action.UUID, jsonAction, map[string]string{"due": action.TriggerDateTime})
 }
 

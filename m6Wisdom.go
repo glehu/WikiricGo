@@ -393,7 +393,9 @@ func (db *GoDB) handleWisdomCreate(mainDB *GoDB, connector *Connector) http.Hand
 			"refID-state":      fmt.Sprintf("%s;%t", request.ReferenceUUID, request.IsFinished),
 		})
 		if request.Type == "task" {
-			_, txn := db.Get(WisdomDB, uUID)
+			// _, txn := db.Get(WisdomDB, uUID)
+			txn := db.NewTransaction(true)
+			defer txn.Discard()
 			db.rearrangeTasks(request, uUID)
 			jsonEntry, err = json.Marshal(request)
 			if err != nil {
@@ -2247,7 +2249,9 @@ func (db *GoDB) handleWisdomAcceptAnswer(mainDB *GoDB, connector *Connector,
 			}
 		}
 		// ...now save the accepted entry
-		_, txn := db.Get(WisdomDB, wisdomID)
+		// _, txn := db.Get(WisdomDB, wisdomID)
+		txn := db.NewTransaction(true)
+		defer txn.Discard()
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return

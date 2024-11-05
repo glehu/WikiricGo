@@ -317,7 +317,8 @@ func (db *GoDB) handleUserModification() http.HandlerFunc {
 }
 
 func (db *GoDB) changeUserDisplayName(user *User, userUUID string, request *UserModification) error {
-	_, txn := db.Get(UserDB, userUUID)
+	// _, txn := db.Get(UserDB, userUUID)
+	txn := db.NewTransaction(true)
 	defer txn.Discard()
 	user.DisplayName = request.NewValue
 	userBytes, err := json.Marshal(user)
@@ -334,7 +335,8 @@ func (db *GoDB) changeUserDisplayName(user *User, userUUID string, request *User
 }
 
 func (db *GoDB) changeUserPassword(user *User, userUUID string, request *UserModification) error {
-	_, txn := db.Get(UserDB, userUUID)
+	// _, txn := db.Get(UserDB, userUUID)
+	txn := db.NewTransaction(true)
 	defer txn.Discard()
 	hOld := sha256.New()
 	hOld.Write([]byte(request.OldValue))
@@ -689,7 +691,8 @@ func (db *GoDB) createUserHome(user *User) {
 	if len(response) < 1 {
 		return
 	}
-	_, txn := db.Get(UserDB, response[0].uUID)
+	// _, txn := db.Get(UserDB, response[0].uUID)
+	txn := db.NewTransaction(true)
 	defer txn.Discard()
 	user.ChatGroupId = uUID
 	userBytes, err := json.Marshal(user)

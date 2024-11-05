@@ -223,12 +223,13 @@ func (db *GoDB) handleMockingbirdConfigEdit() http.HandlerFunc {
 			requestConfig.ResponseStatusCode = 200
 		}
 		// Lock and update
-		_, txn := db.Get(MockDB, mockID)
+		// _, txn := db.Get(MockDB, mockID)
+		txn := db.NewTransaction(true)
+		defer txn.Discard()
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
-		defer txn.Discard()
 		// Save
 		jsonEntry, err := json.Marshal(requestConfig)
 		if err != nil {

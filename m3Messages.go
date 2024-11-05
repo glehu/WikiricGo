@@ -166,7 +166,8 @@ func (db *GoDB) handleChatMessageEdit(chatServer *ChatServer, mainDB *GoDB) http
 			return
 		}
 		// Get message
-		_, txn := db.Get(MessageDB, msgID)
+		// _, txn := db.Get(MessageDB, msgID)
+		txn := db.NewTransaction(true)
 		defer txn.Discard()
 		// Initialize message
 		request.TimeCreated = TimeNowIsoString()

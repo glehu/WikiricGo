@@ -817,7 +817,8 @@ func (db *GoDB) handleChatMemberRoleModification() http.HandlerFunc {
 				chatMember.Roles[index] = request.Role
 			}
 		}
-		_, txn := db.Get(MemberDB, chatMember.UUID)
+		// _, txn := db.Get(MemberDB, chatMember.UUID)
+		txn := db.NewTransaction(true)
 		defer txn.Discard()
 		jsonEntry, err := json.Marshal(chatMember)
 		err = db.Update(MemberDB, txn, chatMember.UUID, jsonEntry, map[string]string{
@@ -878,7 +879,8 @@ func (db *GoDB) handleChatGroupBanMember() http.HandlerFunc {
 		// Ban member
 		chatMember.IsBanned = true
 		// Update member entry
-		_, txn := db.Get(MemberDB, chatMember.UUID)
+		// _, txn := db.Get(MemberDB, chatMember.UUID)
+		txn := db.NewTransaction(true)
 		defer txn.Discard()
 		jsonEntry, err := json.Marshal(chatMember)
 		err = db.Update(MemberDB, txn, chatMember.UUID, jsonEntry, map[string]string{

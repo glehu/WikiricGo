@@ -263,7 +263,9 @@ func (db *GoDB) handleSandboxModification(mainDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Retrieve sandbox transaction
-		_, txn := db.Get(SandboxDB, sandboxID)
+		// _, txn := db.Get(SandboxDB, sandboxID)
+		txn := db.NewTransaction(true)
+		defer txn.Discard()
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -453,7 +455,9 @@ func (db *GoDB) handleSandboxElementEdit(mainDB *GoDB) http.HandlerFunc {
 			return
 		}
 		// Retrieve sandbox element transaction
-		_, txn := db.Get(SandboxDB, elementID)
+		// _, txn := db.Get(SandboxDB, elementID)
+		txn := db.NewTransaction(true)
+		defer txn.Discard()
 		if txn == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
