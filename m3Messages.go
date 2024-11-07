@@ -260,7 +260,7 @@ func (db *GoDB) handleChatMessageFromChat(
 		}
 		// Does the user only want to count the messages?
 		countOnlyT := r.URL.Query().Get("qcount")
-		if countOnlyT == "true" {
+		if countOnlyT == "true" || countOnlyT == "1" {
 			db.countMessages(w, r, chatID)
 			return
 		}

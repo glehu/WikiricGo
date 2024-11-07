@@ -512,7 +512,11 @@ func (db *GoDB) handleWisdomEdit(mainDB *GoDB, connector *Connector,
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		go db.NotifyTaskChange(user, request, wisdomID, mainDB, connector)
+		// Notify users if requester did not specify silent mode
+		silent := r.URL.Query().Get("silent")
+		if silent != "true" && silent != "1" {
+			go db.NotifyTaskChange(user, request, wisdomID, mainDB, connector)
+		}
 	}
 }
 
@@ -2028,6 +2032,11 @@ func (db *GoDB) handleWisdomModification(mainDB *GoDB, connector *Connector,
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
+		silentT := r.URL.Query().Get("silent")
+		isSilent := false
+		if silentT == "true" || silentT == "1" {
+			isSilent = true
+		}
 		// Retrieve POST payload
 		request := &WisdomModification{}
 		if err := render.Bind(r, request); err != nil {
@@ -2046,6 +2055,13 @@ func (db *GoDB) handleWisdomModification(mainDB *GoDB, connector *Connector,
 				wisdom.Description = request.NewValue
 			} else if request.Field == "chapters" {
 				wisdom = db.handleWisdomChaptersEdit(wisdom, request)
+			} else if request.Field == "row" {
+				flt, err := strconv.ParseFloat(request.NewValue, 64)
+				if err != nil {
+					http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+					return
+				}
+				wisdom.RowIndex = flt
 			} else if request.Field == "draft" {
 				if request.NewValue == "" {
 					wisdom.IsDraft = !wisdom.IsDraft
@@ -2073,17 +2089,19 @@ func (db *GoDB) handleWisdomModification(mainDB *GoDB, connector *Connector,
 					} else {
 						draftStatus = "Completed"
 					}
-					go func() {
-						NotifyWisdomCollaborators(
-							fmt.Sprintf("Proposal Draft Status: %s", draftStatus),
-							fmt.Sprintf("%s changed %s's progress to: %s", user.DisplayName, wisdom.Name, draftStatus),
-							user,
-							wisdom2,
-							wisdomID,
-							db,
-							connector)
-						go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
-					}()
+					if !isSilent {
+						go func() {
+							NotifyWisdomCollaborators(
+								fmt.Sprintf("Proposal Draft Status: %s", draftStatus),
+								fmt.Sprintf("%s changed %s's progress to: %s", user.DisplayName, wisdom.Name, draftStatus),
+								user,
+								wisdom2,
+								wisdomID,
+								db,
+								connector)
+							go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
+						}()
+					}
 				}
 			}
 			// Store
@@ -2100,7 +2118,9 @@ func (db *GoDB) handleWisdomModification(mainDB *GoDB, connector *Connector,
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
-			go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
+			if !isSilent {
+				go db.NotifyTaskChange(user, wisdom, wisdomID, mainDB, connector)
+			}
 		}
 	}
 }

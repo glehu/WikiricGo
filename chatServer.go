@@ -698,9 +698,9 @@ func (server *ChatServer) handleCommandLeaderboard(s *Session, text string, rapi
 	}
 	// Let the server send the distribution as a formatted message
 	sb := strings.Builder{}
-	sb.WriteString("# Leaderboard\n\n")
+	sb.WriteString("#### Leaderboard\n\n") // H4
 	sb.WriteString(fmt.Sprintf(
-		"Across %d channels, a total of %d messages and %d reactions have been sent!\n\n---\n\n",
+		"Across **%d** channels, a total of **%d** messages and **%d** reactions have been sent!\n\n---\n\n",
 		totalChannels, totalMessages, totalReactions))
 	sb.WriteString(
 		"The following list displays the current ranking of this group's members including all channels:\n\n")
@@ -708,13 +708,13 @@ func (server *ChatServer) handleCommandLeaderboard(s *Session, text string, rapi
 		if i > 0 {
 			sb.WriteString("---\n\n")
 		}
-		sb.WriteString(fmt.Sprintf("## %s\n\n", d.Name))
+		sb.WriteString(fmt.Sprintf("##### %s\n\n", d.Name)) // H5
 		sb.WriteString(fmt.Sprintf(
-			"A total of %d messages and %d reactions have been sent between %d people!\n\n",
+			"A total of **%d** messages and **%d** reactions have been sent between **%d** people!\n\n",
 			d.Count, d.Reactions, len(d.Contributors)))
 		for j, c := range d.Contributors {
 			sb.WriteString(fmt.Sprintf(
-				"### %d. %s\n\nMessages: %d  \nReactions: %d\n\n",
+				"###### %d. %s\n\n* Messages: **%d**\n* Reactions: **%d**\n\n", // H6
 				j+1, c.Username, c.Count, c.Reactions))
 		}
 	}
