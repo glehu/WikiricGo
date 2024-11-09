@@ -2026,23 +2026,26 @@ func (db *GoDB) handleWisdomModification(mainDB *GoDB, connector *Connector,
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		// Check if user has right to delete this Wisdom
-		_, canEdit := CheckWisdomAccess(user, wisdom, mainDB, db, r)
-		if !canEdit {
-			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
-			return
-		}
-		silentT := r.URL.Query().Get("silent")
-		isSilent := false
-		if silentT == "true" || silentT == "1" {
-			isSilent = true
-		}
 		// Retrieve POST payload
 		request := &WisdomModification{}
 		if err := render.Bind(r, request); err != nil {
 			fmt.Println(err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		// Check if user has right to modify this Wisdom
+		// If the row is being modified, we let it pass, since this keeps the planner moving smoothly!
+		if request.Type != "edit" || request.Field != "row" {
+			_, canEdit := CheckWisdomAccess(user, wisdom, mainDB, db, r)
+			if !canEdit {
+				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+				return
+			}
+		}
+		silentT := r.URL.Query().Get("silent")
+		isSilent := false
+		if silentT == "true" || silentT == "1" {
+			isSilent = true
 		}
 		if request.Type == "edit" {
 			if request.Field == "due" {
