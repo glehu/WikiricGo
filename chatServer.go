@@ -362,7 +362,7 @@ func (server *ChatServer) DistributeChatMessageJSON(msg *ChatMessageContainer, s
 			if mainChatUUID == "" {
 				mainChatUUID = value.ChatMember.ChatGroupUUID
 			}
-			_ = WSSendJSON(value.Conn, value.Ctx, msg) // TODO: Drop connection?
+			_ = WSSendJSON(value.Conn, value.Ctx, msg)
 		}
 	}
 	// Send connector messages to all users (e.g. for user tagging)
@@ -413,7 +413,7 @@ func (server *ChatServer) NotifyChatMembers(chatID string, msg *ChatMessageConta
 		if !ok {
 			continue
 		}
-		_ = WSSendJSON(user.Conn, user.Ctx, cMsg) // TODO: Drop connection?
+		_ = WSSendJSON(user.Conn, user.Ctx, cMsg)
 	}
 }
 
@@ -453,7 +453,7 @@ func (server *ChatServer) DistributeChatActionMessageJSON(msg *ChatActionMessage
 	server.ChatGroupsMu.RUnlock()
 	if ok {
 		for _, value := range sessions {
-			_ = WSSendJSON(value.Conn, value.Ctx, msg) // TODO: Drop connection?
+			_ = WSSendJSON(value.Conn, value.Ctx, msg)
 		}
 	}
 }

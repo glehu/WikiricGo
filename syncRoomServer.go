@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/pion/webrtc/v4"
 	"github.com/tidwall/btree"
 	"net/http"
 	"slices"
@@ -20,12 +21,13 @@ import (
 )
 
 type SyncedSession struct {
-	User     *User
-	Conn     *websocket.Conn
-	Ctx      context.Context
-	R        *http.Request
-	RoomId   string
-	RoomName string
+	Mu     *sync.RWMutex
+	User   *User
+	Conn   *websocket.Conn
+	Ctx    context.Context
+	R      *http.Request
+	RoomId string
+	Room   *SyncRoom
 	// PPState 0 = Pong1 else 1 = Pong2
 	PPState   int
 	Ping1Time time.Time
@@ -33,6 +35,8 @@ type SyncedSession struct {
 	Ping2Time time.Time
 	Pong2Time time.Time
 	LatencyMS float32
+	PeerCon   *webrtc.PeerConnection
+	PeerData  *webrtc.DataChannel
 }
 
 type SyncedSessionSum struct {
@@ -48,6 +52,7 @@ type SyncedSessionDataSum struct {
 }
 
 type SyncRoom struct {
+	Mu        *sync.RWMutex
 	Sessions  map[string]*SyncedSession
 	Name      string
 	RoomOwner string
@@ -60,7 +65,7 @@ type SyncRoom struct {
 type SyncRoomServer struct {
 	SyncRoomsMu *sync.RWMutex
 	// Map of RoomID as key and SyncRoom as value, containing the SyncedSession instances
-	SyncRooms           *btree.Map[string, SyncRoom]
+	SyncRooms           *btree.Map[string, *SyncRoom]
 	tokenAuth           *jwtauth.JWTAuth
 	DB                  *GoDB
 	MainDB              *GoDB
@@ -87,7 +92,7 @@ type SyncMessage struct {
 func CreateSyncRoomServer(db, mainDB *GoDB, connector *Connector) *SyncRoomServer {
 	server := &SyncRoomServer{
 		SyncRoomsMu:         &sync.RWMutex{},
-		SyncRooms:           btree.NewMap[string, SyncRoom](3),
+		SyncRooms:           btree.NewMap[string, *SyncRoom](3),
 		DB:                  db,
 		MainDB:              mainDB,
 		NotificationCounter: &atomic.Int64{},
@@ -152,12 +157,13 @@ func (server *SyncRoomServer) handleSyncedEndpoint(
 		server.SyncRoomsMu.Lock()
 		room, ok := server.SyncRooms.Get(roomID)
 		session := &SyncedSession{
-			User:     user,
-			Conn:     c,
-			Ctx:      ctx,
-			R:        r,
-			RoomId:   roomID,
-			RoomName: room.Name,
+			Mu:     &sync.RWMutex{},
+			User:   user,
+			Conn:   c,
+			Ctx:    ctx,
+			R:      r,
+			RoomId: roomID,
+			Room:   room,
 		}
 		var rName string
 		if ok {
@@ -170,7 +176,8 @@ func (server *SyncRoomServer) handleSyncedEndpoint(
 			rName = fmt.Sprintf("Room %s", roomID)
 			server.SyncRooms.Set(
 				roomID,
-				SyncRoom{
+				&SyncRoom{
+					Mu: &sync.RWMutex{},
 					Sessions: map[string]*SyncedSession{
 						user.Username: session,
 					},
@@ -304,26 +311,29 @@ func (server *SyncRoomServer) handleIncomingMessage(
 	var exit = false
 	// Check for pre-defined commands
 	// If the message does not match with anything, it still gets distributed
-	if len(text) >= 5 && text[0:5] == "[c:B]" {
+	if CheckPrefix(text, "[c:B]") {
 		// B stands for Pong, the response to a Ping (or A)
 		act, targetSession = handlePongResponse(s)
-	} else if len(text) >= 5 && text[0:5] == "[c:L]" {
+	} else if CheckPrefix(text, "[c:L]") {
 		// L stands for Latency Check
 		s.PPState = 0
 		targetSession = s
 		act = "[s:A]"
-	} else if len(text) >= 12 && text[0:12] == "[c:SET;NAME]" {
+	} else if CheckPrefix(text, "[c:SET;NAME]") {
 		act, targetSession = handleSetRoomName(server, s, text)
-	} else if len(text) >= 12 && text[0:12] == "[c:SET;DATA]" {
+	} else if CheckPrefix(text, "[c:SET;DATA]") {
 		act, targetSession = handleSetRoomData(server, s, text)
-	} else if len(text) >= 12 && text[0:12] == "[c:GET;DATA]" {
+	} else if CheckPrefix(text, "[c:GET;DATA]") {
 		act, targetSession = handleGetRoomData(server, s, text)
-	} else if len(text) >= 12 && text[0:12] == "[c:GET;SESH]" {
+	} else if CheckPrefix(text, "[c:GET;SESH]") {
 		act, targetSession, exit = handleGetRoomSessions(server, s, text)
-	} else if len(text) >= 12 && text[0:12] == "[c:GET;UDAT]" {
+	} else if CheckPrefix(text, "[c:GET;UDAT]") {
 		act, targetSession, exit = handleGetRoomSessionData(server, s, text)
-	} else if len(text) >= 6 && text[0:6] == "[c:DC]" {
+	} else if CheckPrefix(text, "[c:DC]") {
 		act, targetSession = handleDisconnectUser(server, s, text)
+	} else if CheckPrefix(text, "[c:WRTC]") {
+		HandleWebRTCRequest(server, s, text)
+		exit = true
 	}
 	if exit {
 		return
@@ -334,7 +344,7 @@ func (server *SyncRoomServer) handleIncomingMessage(
 		Action:   act,
 	}
 	go server.DistributeSyncedMessageJSON(s.RoomId, &SyncMessageContainer{SyncMessage: msg}, targetSession)
-	if len(text) >= 5 && text[0:5] == "[c:S]" {
+	if CheckPrefix(text, "[c:S]") {
 		jsonEntry, err := json.Marshal(msg)
 		if err != nil {
 			return
@@ -362,7 +372,7 @@ func (server *SyncRoomServer) DistributeSyncedMessageJSON(roomId string, msg *Sy
 			}
 		}
 		// Distribute chat message to provided user
-		_ = WSSendBytes(targetSession.Conn, targetSession.Ctx, buf.Bytes()) // TODO: Drop connection?
+		_ = WSSendBytes(targetSession.Conn, targetSession.Ctx, buf.Bytes())
 		return
 	}
 	// Distribute SyncMessage to all members of this room
@@ -377,7 +387,7 @@ func (server *SyncRoomServer) DistributeSyncedMessageJSON(roomId string, msg *Sy
 			// Do not distribute a message to the sender itself
 			continue
 		}
-		_ = WSSendBytes(value.Conn, value.Ctx, buf.Bytes()) // TODO: Drop connection?
+		_ = WSSendBytes(value.Conn, value.Ctx, buf.Bytes())
 	}
 }
 
@@ -569,7 +579,7 @@ func handleGetRoomSessions(server *SyncRoomServer, s *SyncedSession, text string
 			}
 			// Send message to all members
 			for _, seshTarget := range room.Sessions {
-				_ = WSSendBytes(seshTarget.Conn, seshTarget.Ctx, buf.Bytes()) // TODO: Drop connection?
+				_ = WSSendBytes(seshTarget.Conn, seshTarget.Ctx, buf.Bytes())
 			}
 		}
 	} else {
@@ -672,7 +682,7 @@ func handleGetRoomSessionData(server *SyncRoomServer, s *SyncedSession, text str
 			}
 			// Send message to all members
 			for _, seshTarget := range room.Sessions {
-				_ = WSSendBytes(seshTarget.Conn, seshTarget.Ctx, buf.Bytes()) // TODO: Drop connection?
+				_ = WSSendBytes(seshTarget.Conn, seshTarget.Ctx, buf.Bytes())
 			}
 		}
 	}
@@ -715,4 +725,22 @@ func handleDisconnectUser(server *SyncRoomServer, s *SyncedSession, text string)
 	}
 	server.SyncRoomsMu.RUnlock()
 	return act, targetSession
+}
+
+func SendMsg(s *SyncedSession, text, message string) {
+	msg := &SyncMessage{
+		Text:     text,
+		Username: s.User.Username,
+		Action:   message,
+	}
+	_ = WSSendJSON(s.Conn, s.Ctx, msg)
+}
+
+func (s *SyncedSession) GetRoom() (*SyncRoom, bool) {
+	s.Mu.RLock()
+	defer s.Mu.RUnlock()
+	if s.Room == nil {
+		return nil, false
+	}
+	return s.Room, true
 }
