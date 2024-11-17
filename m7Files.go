@@ -531,8 +531,9 @@ func (db *GoDB) handleFileGet() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Disposition",
-			fmt.Sprintf("attachment; filename=\"%s\"", fileMeta.Filename))
+		// Set headers to allow browsers to know what is supposed to happen
+		w.Header().Add("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileMeta.Filename))
+		w.Header().Add("Content-Type", fmt.Sprintf("%s; application/octet-stream", fileMeta.MimeType))
 		http.ServeFile(w, r, fileMeta.Path)
 	}
 }

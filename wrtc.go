@@ -153,7 +153,7 @@ func CreatePeerConnection(server *SyncRoomServer, s *SyncedSession) (*webrtc.Pee
 						if CheckPrefix(content, "[c:") {
 							handleDataChannelCommand(server, s, content)
 						} else {
-							DistributeDataChannelMessage(s, content)
+							DistributeDataChannelMessage(server, s, content)
 						}
 					}
 				})
@@ -168,8 +168,8 @@ func handleDataChannelCommand(server *SyncRoomServer, s *SyncedSession, content 
 	// TODO: Actually do something here
 }
 
-func DistributeDataChannelMessage(s *SyncedSession, content string) bool {
-	room, ok := s.GetRoom()
+func DistributeDataChannelMessage(server *SyncRoomServer, s *SyncedSession, content string) bool {
+	room, ok := s.GetRoom(server)
 	if !ok {
 		return false
 	}
