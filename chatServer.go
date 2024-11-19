@@ -419,7 +419,7 @@ func (server *ChatServer) NotifyChatMembers(chatID string, msg *ChatMessageConta
 
 func (server *ChatServer) setCache(chatUUID string) bool {
 	// Retrieve usernames of all chat members
-	members := server.MainDB.GetChatGroupMembers(chatUUID)
+	members := server.MainDB.GetChatGroupMembers(chatUUID, false)
 	if members == nil || len(members.ChatMembers) < 1 {
 		return false
 	}

@@ -870,14 +870,20 @@ func (db *GoDB) handleChatGroupBanMember() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		// Is user authorized to ban?
+		// Is user authorized to ban or unban?
 		userRole := chatMemberUser.GetRoleInformation(mainChatGroup.ChatGroup)
 		if !userRole.IsAdmin {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
-		// Ban member
-		chatMember.IsBanned = true
+		ban := true
+		// Does the requester want to undo the ban?
+		undoQuery := r.URL.Query().Get("undo")
+		if undoQuery == "true" {
+			ban = false
+		}
+		// Ban or unban member
+		chatMember.IsBanned = ban
 		// Update member entry
 		// _, txn := db.Get(MemberDB, chatMember.UUID)
 		txn := db.NewTransaction(true)
@@ -900,7 +906,12 @@ func (db *GoDB) handleChatGroupGetMembers() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			return
 		}
-		members := db.GetChatGroupMembers(chatID)
+		banFilter := false
+		banQuery := r.URL.Query().Get("banned")
+		if banQuery == "true" {
+			banFilter = true
+		}
+		members := db.GetChatGroupMembers(chatID, banFilter)
 		if members == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -913,7 +924,7 @@ func (db *GoDB) handleChatGroupGetMembers() http.HandlerFunc {
 	}
 }
 
-func (db *GoDB) GetChatGroupMembers(chatID string) *ChatMemberList {
+func (db *GoDB) GetChatGroupMembers(chatID string, banFilter bool) *ChatMemberList {
 	// Check if we're targeting a sub chat since only main chat rooms have members technically
 	dataOriginal, ok := db.Read(GroupDB, chatID)
 	if !ok {
@@ -952,7 +963,7 @@ func (db *GoDB) GetChatGroupMembers(chatID string) *ChatMemberList {
 	for _, entry := range responseMember {
 		chatMember := &ChatMember{}
 		err = json.Unmarshal(entry.Data, chatMember)
-		if err == nil && !chatMember.IsBanned {
+		if err == nil && chatMember.IsBanned == banFilter {
 			members.ChatMembers = append(members.ChatMembers, chatMember)
 		}
 	}
