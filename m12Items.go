@@ -171,6 +171,7 @@ type ItemFilters struct {
 	MaxCost    float64         `json:"max"`
 	AvgCost    float64         `json:"avg"`
 	Amount     int             `json:"amt"`
+	LastUpdate int64           `json:"lastUpdate"`
 }
 
 func (db *GoDB) PublicItemsEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, mainDB *GoDB) {
@@ -833,73 +834,89 @@ func GetItemQueryPoints(
 		word.B = !b
 	}
 	// Calculate points
-	pointsMax := len(words)
 	accuracy := 0.0
+	var wrd *QueryWord
+	var sml string
 	for _, word := range mCats {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		if words[sml] != nil {
+			words[sml].B = b
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
 		}
 	}
 	for _, word := range mAtts {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		if words[sml] != nil {
+			words[sml].B = b
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
 		}
 	}
 	for _, word := range mName {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		// Reward matches for the title as it means the most
+		wrd = words[sml]
+		if wrd != nil {
+			words[sml].B = b
+			points += wrd.Points * 2
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
+			points += 2
 		}
 	}
 	for _, word := range mDesc {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		if words[sml] != nil {
+			words[sml].B = b
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
 		}
 	}
 	for _, word := range mKeys {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		// Reward matches for the keywords as they mean a lot
+		wrd = words[sml]
+		if wrd != nil {
+			words[sml].B = b
+			points += wrd.Points * 2
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
+			points += 2
 		}
 	}
 	for _, word := range mBrand {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		if words[sml] != nil {
+			words[sml].B = b
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
 		}
 	}
 	for _, word := range mClrs {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		if words[sml] != nil {
+			words[sml].B = b
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
@@ -911,7 +928,7 @@ func GetItemQueryPoints(
 			points += word.Points
 		}
 	}
-	accuracy = float64(points) / float64(pointsMax)
+	accuracy = float64(points) / float64(len(words))
 	return accuracy, points
 }
 
@@ -1586,6 +1603,7 @@ func (db *GoDB) handleItemGetFilters() http.HandlerFunc {
 				MaxCost:    0,
 				AvgCost:    0,
 				Amount:     0,
+				LastUpdate: TimeNowUnix(),
 			})
 		}
 	}
@@ -1796,6 +1814,7 @@ func (db *GoDB) createStoreFilterCache(storeID string) *ItemFilters {
 		}
 	}
 	// Store
+	queryResponse.LastUpdate = TimeNowUnix()
 	jsonEntry, err := json.Marshal(queryResponse)
 	if err != nil {
 		return nil

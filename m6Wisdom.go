@@ -1653,53 +1653,67 @@ func GetWisdomQueryPoints(
 	}
 	// Calculate points
 	points := int64(0)
-	pointsMax := len(words)
 	accuracy := 0.0
+	var wrd *QueryWord
+	var sml string
 	for _, word := range mUser {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		if words[sml] != nil {
+			words[sml].B = b
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
 		}
 	}
 	for _, word := range mName {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		// Reward matches for the title as it means the most
+		wrd = words[sml]
+		if wrd != nil {
+			words[sml].B = b
+			points += wrd.Points * 2
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
+			points += 2
 		}
 	}
 	for _, word := range mDesc {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		if words[sml] != nil {
+			words[sml].B = b
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
 		}
 	}
 	for _, word := range mKeys {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		// Reward matches for the keywords as they mean a lot
+		wrd = words[sml]
+		if wrd != nil {
+			words[sml].B = b
+			points += wrd.Points * 2
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
+			points += 2
 		}
 	}
 	for _, word := range mCats {
-		if words[strings.ToLower(word)] != nil {
-			words[strings.ToLower(word)].B = b
+		sml = strings.ToLower(word)
+		if words[sml] != nil {
+			words[sml].B = b
 		} else {
-			words[strings.ToLower(word)] = &QueryWord{
+			words[sml] = &QueryWord{
 				B:      b,
 				Points: 1,
 			}
@@ -1711,7 +1725,7 @@ func GetWisdomQueryPoints(
 			points += word.Points
 		}
 	}
-	accuracy = float64(points) / float64(pointsMax)
+	accuracy = float64(points) / float64(len(words))
 	return accuracy, points
 }
 
