@@ -322,7 +322,7 @@ func (db *GoDB) handleSandboxView(mainDB *GoDB) http.HandlerFunc {
 		responseContainer := SandboxElementsContainer{Elements: make([]SandboxElementEntry, 0)}
 		resp, _, err := db.SSelect(SandboxDB, map[string]string{
 			"pid-usr": fmt.Sprintf("%s-", sandboxID),
-		}, nil, 10, 100, true)
+		}, nil, 10, 100, true, false)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return

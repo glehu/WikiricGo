@@ -320,7 +320,7 @@ func (db *GoDB) countMessages(w http.ResponseWriter, r *http.Request, chatID str
 	// Count the messages of the provided channel
 	// We use getEntry=false to only retrieve UUIDs. Less memory consumption and less CPU time needed!
 	resp, _, err := db.SSelect(MessageDB, map[string]string{
-		"chatID": chatID}, nil, 30, 10, false)
+		"chatID": chatID}, nil, 30, 10, false, false)
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
@@ -639,7 +639,7 @@ func (db *GoDB) GetChatMessageDistribution(chatMember *ChatMember, mainDB *GoDB,
 	// Retrieve messages from this chat group
 	resp, _, err := db.SSelect(MessageDB, map[string]string{
 		"chatID": chatID,
-	}, nil, 30, 10, true)
+	}, nil, 30, 10, true, false)
 	if err != nil {
 		return nil
 	}

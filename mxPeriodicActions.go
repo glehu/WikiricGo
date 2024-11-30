@@ -154,13 +154,13 @@ func (db *GoDB) periodicCheck(connector *Connector, fcmClient *messaging.Client)
 	if twoQueries {
 		lastQuery := lastISO[0:13] // YYYY-MM-DDTHH
 		respLast, _, err = db.SSelect(PeriodDB, map[string]string{"due": lastQuery},
-			nil, 10, 100, true)
+			nil, 10, 100, true, false)
 		if err != nil {
 			return
 		}
 	}
 	respNow, _, err = db.SSelect(PeriodDB, map[string]string{"due": nowQuery},
-		nil, 10, 100, true)
+		nil, 10, 100, true, false)
 	if err != nil {
 		return
 	}

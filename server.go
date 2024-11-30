@@ -259,7 +259,7 @@ func setJWTProtectedRoutes(
 			// #### Periodic Actions
 			dbList.Map["rapid"].ProtectedPeriodicActionsEndpoints(r, tokenAuth, dbList.Map["main"], connector)
 			// #### Items
-			dbList.Map["rapid"].ProtectedItemEndpoints(r, tokenAuth, dbList.Map["main"])
+			dbList.Map["rapid"].ProtectedItemEndpoints(r, tokenAuth, dbList.Map["main"], connector)
 			// #### Orders
 			dbList.Map["rapid"].ProtectedOrdersEndpoints(r, tokenAuth, dbList.Map["main"], connector)
 			// #### Sandbox

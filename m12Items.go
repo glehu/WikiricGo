@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"github.com/go-chi/render"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -188,7 +190,7 @@ func (db *GoDB) PublicItemsEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, m
 	})
 }
 
-func (db *GoDB) ProtectedItemEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, mainDB *GoDB,
+func (db *GoDB) ProtectedItemEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth, mainDB *GoDB, connector *Connector,
 ) {
 	r.Route("/items/private", func(r chi.Router) {
 		// ############
@@ -207,7 +209,7 @@ func (db *GoDB) ProtectedItemEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 		// ### GET ###
 		// ###########
 		r.Get("/delete/{itemID}", db.handleItemDelete(mainDB))
-		r.Get("/index/{storeID}", db.handleGenerateIndex(mainDB))
+		r.Get("/index/{storeID}", db.handleGenerateIndex(mainDB, connector))
 	})
 }
 
@@ -570,10 +572,21 @@ func (db *GoDB) handleItemGet() http.HandlerFunc {
 
 func (db *GoDB) handleItemQuery() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		massQuery := r.URL.Query().Get("mass")
+		if massQuery == "true" || massQuery == "1" {
+			// TODO: Still in experimental mode! Does not work for the frontend!
+			db.doItemMassQuery(w, r)
+			return
+		}
+		wordQuery := r.URL.Query().Get("wrd")
+		if wordQuery == "true" || wordQuery == "1" {
+			db.doItemWordQuery(w, r)
+			return
+		}
 		// Don't imprison the caller
 		// ... we still need to handle an internal timeout, though,
 		// ... as this literally only protects the caller
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 		defer cancel()
 		c := make(chan *ItemQueryResponse)
 		// *** Start the request ***
@@ -584,6 +597,267 @@ func (db *GoDB) handleItemQuery() http.HandlerFunc {
 			http.Error(w, http.StatusText(http.StatusGatewayTimeout), http.StatusGatewayTimeout)
 		case resp := <-c:
 			render.JSON(w, r, resp)
+		}
+	}
+}
+
+func (db *GoDB) doItemWordQuery(w http.ResponseWriter, r *http.Request) {
+	timeStart := time.Now()
+	storeID := chi.URLParam(r, "storeID")
+	if storeID == "" {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	// Retrieve POST payload
+	request := &ItemQuery{}
+	if err := render.Bind(r, request); err != nil {
+		fmt.Println(err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if request.Brand != "" {
+		request.Brand = strings.ToLower(request.Brand)
+	}
+	// Options?
+	options := r.Context().Value("pagination").(*SelectOptions)
+	if options.MaxResults <= 0 {
+		options.MaxResults = 25
+	}
+	maxResults := int(options.MaxResults)
+	// Turn query text into a full regex pattern
+	words, p := GetRegexQuery(request.Query)
+	// Build csv (comma seperated values) content for variations query if provided
+	if len(request.Variations) > 0 {
+		for ix, variation := range request.Variations {
+			if len(variation.StringValues) > 0 {
+				for i := 0; i < len(variation.StringValues); i++ {
+					request.Variations[ix].Csv += fmt.Sprintf("|%s|", request.Variations[ix].StringValues[i])
+				}
+			}
+		}
+	}
+	// Set up variables
+	var analytics *Analytics
+	var points int64
+	var accuracy float64
+	var stockC chan float64
+	var stk float64
+	var cncl context.CancelFunc
+	var err error
+	var b bool
+	hasStockFilter := request.MinStock > 0
+	items := db.GetItemsFromWords(storeID, request.Query)
+	queryResponse := &ItemQueryResponse{
+		TimeSeconds: 0,
+		Items:       make([]*ItemContainer, 0),
+	}
+	if len(items.Items) < 1 {
+		duration := time.Since(timeStart)
+		queryResponse.TimeSeconds = duration.Seconds()
+		render.JSON(w, r, queryResponse)
+		return
+	}
+	var item *Item
+	for _, ic := range items.Items {
+		item = ic.Item
+		// Compare cost if provided
+		if request.MinCost != 0.0 && item.NetPrice*(1+item.VATPercent) < request.MinCost {
+			continue
+		}
+		if request.MaxCost != 0.0 && item.NetPrice*(1+item.VATPercent) > request.MaxCost {
+			continue
+		}
+		if request.Brand != "" && strings.ToLower(item.Brand) != request.Brand {
+			continue
+		}
+		// Compare variations if provided
+		if len(request.Variations) > 0 {
+			points = GetItemVariationPoints(item, request)
+			if points <= 0 {
+				continue
+			}
+		}
+		// Flip boolean on each iteration
+		b = !b
+		// Query content with provided prompt
+		accuracy, points = GetItemQueryPoints(item, request, p, words, b)
+		if points > 0 {
+			ic.Accuracy += accuracy
+		}
+		// Final (optional) check
+		if hasStockFilter {
+			stockC, cncl = db.calculateItemStock(storeID, ic.UUID, "[main]")
+			// Await answer
+			stk = <-stockC
+			if stk < request.MinStock {
+				cncl()
+				continue
+			}
+		} else {
+			stk = 0.0
+		}
+		ic.Stock = stk
+		// Truncate item description
+		if item.Description != "" {
+			item.Description = EllipticalTruncate(item.Description, 500)
+		}
+		// Load analytics if available
+		analytics = &Analytics{}
+		if item.AnalyticsUUID != "" {
+			anaBytes, okAna := db.Read(AnaDB, item.AnalyticsUUID)
+			if okAna {
+				err = json.Unmarshal(anaBytes.Data, analytics)
+				if err != nil {
+					analytics = &Analytics{}
+				}
+				ic.Analytics = analytics
+			}
+		}
+		queryResponse.Items = append(queryResponse.Items, ic)
+		if len(queryResponse.Items) >= maxResults {
+			break
+		}
+	}
+	// Sort entries by accuracy
+	if len(queryResponse.Items) > 1 {
+		sort.SliceStable(
+			queryResponse.Items, func(i, j int) bool {
+				return queryResponse.Items[i].Accuracy > queryResponse.Items[j].Accuracy
+			},
+		)
+	}
+	duration := time.Since(timeStart)
+	queryResponse.TimeSeconds = duration.Seconds()
+	render.JSON(w, r, queryResponse)
+}
+
+func (db *GoDB) GetItemsFromWords(storeID, query string) *ItemQueryResponse {
+	queryResponse := &ItemQueryResponse{
+		TimeSeconds: 0,
+		Items:       make([]*ItemContainer, 0),
+	}
+	// Construct index map with all words being queried
+	index := map[string]string{}
+	words := strings.Fields(query)
+	for i, word := range words {
+		word = strings.ToLower(strings.TrimSuffix(word, "*"))
+		index[fmt.Sprintf("wrd-%s[%d", storeID, i)] = word
+	}
+	// Retrieve slices of UUIDs mapped to words
+	response, cancel, err := db.SSelect(
+		ItemDB, index, nil, 4, 1, true, true,
+	)
+	defer cancel()
+	if err != nil {
+		return nil
+	}
+	var lst []string
+	var item *Item
+	var res *EntryResponse
+	var ok bool
+	var ixEntry []byte
+	var cnts *MassEntryResponse
+	var points int64
+	for entry := range response {
+		if entry == nil {
+			continue
+		}
+		lst = strings.Split(string(entry.Data), ";")
+		if len(lst) == 0 {
+			continue
+		}
+		// Get each item!
+		for _, uid := range lst {
+			res, ok = db.Read(ItemDB, uid)
+			if !ok {
+				continue
+			}
+			points = 0
+			ixEntry = res.Data
+			cnts = SearchInBytes(ixEntry, "t", words, 100)
+			if cnts != nil && len(cnts.Counts) > 0 {
+				for _, wCount := range cnts.Counts {
+					points += int64(len(wCount))
+				}
+				if points <= 0 {
+					continue
+				}
+			}
+			ixEntry = res.Data
+			cnts = SearchInBytes(ixEntry, "desc", words, 100)
+			if cnts != nil && len(cnts.Counts) > 0 {
+				for _, wCount := range cnts.Counts {
+					points += int64(len(wCount))
+				}
+			}
+			item = &Item{}
+			err = json.Unmarshal(res.Data, item)
+			if err != nil {
+				continue
+			}
+			queryResponse.Items = append(queryResponse.Items, &ItemContainer{
+				UUID:      res.uUID,
+				Stock:     0,
+				Item:      item,
+				Analytics: nil,
+				Accuracy:  0,
+			})
+		}
+	}
+	// Sort entries by accuracy
+	if len(queryResponse.Items) > 1 {
+		sort.SliceStable(
+			queryResponse.Items, func(i, j int) bool {
+				return queryResponse.Items[i].Accuracy > queryResponse.Items[j].Accuracy
+			},
+		)
+	}
+	return queryResponse
+}
+
+func (db *GoDB) doItemMassQuery(w http.ResponseWriter, r *http.Request) {
+	// Orchestrate a badger.Stream query over the database
+	storeID := chi.URLParam(r, "storeID")
+	if storeID == "" {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	response := db.MassSearch(ItemDB, "pid", storeID,
+		"desc", []string{"drift"},
+		1000, 0, ctx)
+	if response == nil {
+		return
+	}
+	timer := time.NewTimer(4 * time.Second)
+	var item *Item
+	var err error
+	for {
+		select {
+		case <-timer.C:
+			fmt.Println("CANCELLED!")
+			cancel()
+			render.JSON(w, r, ItemQueryResponse{
+				TimeSeconds: 0,
+				Items:       nil,
+			})
+			return
+		case <-ctx.Done():
+			render.JSON(w, r, ItemQueryResponse{
+				TimeSeconds: 0,
+				Items:       nil,
+			})
+			return
+		case entry := <-response:
+			if entry == nil {
+				continue
+			}
+			item = &Item{}
+			err = json.Unmarshal(entry.Data, item)
+			if err == nil {
+				fmt.Println(len(entry.Counts[0]), "ENTRY:", item.Description)
+			}
 		}
 	}
 }
@@ -612,6 +886,12 @@ func (db *GoDB) doItemQuery(w http.ResponseWriter, r *http.Request, c chan *Item
 	options := r.Context().Value("pagination").(*SelectOptions)
 	if options.MaxResults <= 0 {
 		options.MaxResults = 25
+	}
+	// Fast search? We will not parse the items and only query specific fields
+	fastT := r.URL.Query().Get("fast")
+	isFast := false
+	if fastT == "true" || fastT == "1" {
+		isFast = true
 	}
 	maxResults := int(options.MaxResults)
 	// Retrieve all Item entries respecting the query index filters
@@ -666,15 +946,56 @@ func (db *GoDB) doItemQuery(w http.ResponseWriter, r *http.Request, c chan *Item
 	var stockC chan float64
 	var stk float64
 	var cncl context.CancelFunc
+	var cnts *MassEntryResponse
+	var wrds []string
+	var ixEntry []byte
+	if isFast {
+		for wr := range words {
+			wrds = append(wrds, wr)
+		}
+	}
 	b := false
 	// Iterate over all items found
-	response, cancel, err := db.SSelect(ItemDB, index, nil, 4, int(options.MaxResults), true)
+	response, cancel, err := db.SSelect(ItemDB, index, nil, 4, int(options.MaxResults), true, false)
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		c <- queryResponse
 		return
 	}
 	for entry := range response {
+		if isFast {
+			// If user requested a fast search, we will not even parse the item at this point!
+			// To still be able to allow for regex searching, we will still parse the item afterward,
+			// ...so we use this superfast byte-level search to avoid looking at irrelevant entries. Smart!
+			points = 0
+			ixEntry = entry.Data
+			cnts = SearchInBytes(ixEntry, "t", wrds, 100)
+			if cnts != nil && len(cnts.Counts) > 0 {
+				for _, wCount := range cnts.Counts {
+					points += int64(len(wCount))
+				}
+				if points <= 0 {
+					continue
+				}
+			}
+			ixEntry = entry.Data
+			cnts = SearchInBytes(ixEntry, "desc", wrds, 200)
+			if cnts != nil && len(cnts.Counts) > 0 {
+				for _, wCount := range cnts.Counts {
+					points += int64(len(wCount))
+				}
+			}
+			ixEntry = entry.Data
+			cnts = SearchInBytes(ixEntry, "keys", wrds, 100)
+			if cnts != nil && len(cnts.Counts) > 0 {
+				for _, wCount := range cnts.Counts {
+					points += int64(len(wCount))
+				}
+			}
+			if points <= 0 {
+				continue
+			}
+		}
 		item = &Item{}
 		err = json.Unmarshal(entry.Data, item)
 		if err != nil {
@@ -973,7 +1294,7 @@ func GetItemVariationPoints(
 	return 0
 }
 
-func (db *GoDB) handleGenerateIndex(mainDB *GoDB) http.HandlerFunc {
+func (db *GoDB) handleGenerateIndex(mainDB *GoDB, connector *Connector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := r.Context().Value("user").(*User)
 		if user == nil {
@@ -999,6 +1320,11 @@ func (db *GoDB) handleGenerateIndex(mainDB *GoDB) http.HandlerFunc {
 		}
 		if user.Username != store.Username {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		wordQuery := r.URL.Query().Get("wrd")
+		if wordQuery == "true" || wordQuery == "1" {
+			_ = db.BuildQueryIndex(connector, storeID, user)
 			return
 		}
 		db.createStoreFilterCache(storeID)
@@ -1666,7 +1992,7 @@ func (db *GoDB) createStoreFilterCache(storeID string) *ItemFilters {
 	// Retrieve all Item entries
 	response, _, err := db.SSelect(ItemDB, map[string]string{
 		"pid": storeID,
-	}, nil, 30, 10, true)
+	}, nil, 30, 10, true, false)
 	if err != nil {
 		return nil
 	}
@@ -1870,7 +2196,7 @@ func (db *GoDB) doCalcItemStock(ctx context.Context, c chan float64, storeID, it
 	// Start retrieving stock entries
 	response, cancel, err := db.SSelect(ItemDB, map[string]string{
 		"pid-uid-st": fmt.Sprintf("%s;%s;%s;", storeID, itemID, storageUnit),
-	}, nil, -1, 100, true)
+	}, nil, -1, 100, true, false)
 	if err != nil {
 		c <- 0.0
 		return
@@ -1938,4 +2264,193 @@ func (db *GoDB) doCalcItemStock(ctx context.Context, c chan float64, storeID, it
 		}
 	}
 	c <- stk
+}
+
+// BuildQueryIndex iterates over all items of a store, generating an index of words, linked to items.
+// When a user searches for items, the query will also be split into words
+// ...and then matched against the word index.
+//
+// Since the DB is sorted and doesn't work with substring queries (it's full match only)
+// ...we need to find all complete words that contain the substring.
+//
+// With wheels as an example, the substring "rift" would lead to "drift".
+// To further enhance the query speed, the substrings successfully matched to complete words
+// ...will be indexed, too, so we can find "drift" almost instantly when searching for "rift".
+func (db *GoDB) BuildQueryIndex(connector *Connector, storeID string, user *User) error {
+	// Retrieve all Item entries
+	response, _, err := db.SSelect(ItemDB, map[string]string{
+		"pid": storeID,
+	}, nil, 120, 0, true, false)
+	if err != nil {
+		return nil
+	}
+	// wordCache maps slices of item UUIDs to words
+	// As soon as a slice gets too big, the word will get suffixed and inserted as a new one
+	wordCache := make(map[string][]string)
+	var ixEntry []byte
+	var field []byte
+	count := 0
+	maxCount := 0
+	// Retrieve connector entry of requester, so we can inform them about the progress!
+	connector.SessionsMu.RLock()
+	sesh, hasSesh := connector.Sessions.Get(user.Username)
+	connector.SessionsMu.RUnlock()
+	for entry := range response {
+		count += 1
+		maxCount += 1
+		// (1/2) Extract words from the title
+		ixEntry = entry.Data
+		field = GetByteValueFromField(ixEntry, []byte("\"t\":"), 100)
+		if len(field) > 0 {
+			wordCache = addWordsToCache(wordCache, entry, field)
+		}
+		// (2/2) Extract words from the description
+		ixEntry = entry.Data
+		field = GetByteValueFromField(ixEntry, []byte("\"desc\":"), 200)
+		if len(field) > 0 {
+			if len(field) > 0 {
+				wordCache = addWordsToCache(wordCache, entry, field)
+			}
+		}
+		if count >= 1_000 {
+			count = 0
+			// Don't think this helps? My single core server says otherwise!
+			if hasSesh {
+				_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+					Type:          "[s:storeix]",
+					Action:        "log",
+					ReferenceUUID: "",
+					Username:      user.Username,
+					Message:       fmt.Sprint("m12Items >>> (1/3) Generating word cache size", len(wordCache), "entries", maxCount),
+				})
+			}
+			timer := time.NewTimer(time.Millisecond * 200)
+			<-timer.C
+		}
+		if maxCount >= 100_000 {
+			break
+		}
+	}
+	timer := time.NewTimer(time.Second * 2)
+	<-timer.C
+	connector.SessionsMu.RLock()
+	sesh, hasSesh = connector.Sessions.Get(user.Username)
+	connector.SessionsMu.RUnlock()
+	if hasSesh {
+		_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+			Type:          "[s:storeix]",
+			Action:        "log",
+			ReferenceUUID: "",
+			Username:      user.Username,
+			Message:       fmt.Sprint("m12Items >>> (1/3) DONE size", len(wordCache), "entries", maxCount),
+		})
+		_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+			Type:          "[s:storeix]",
+			Action:        "log",
+			ReferenceUUID: "",
+			Username:      user.Username,
+			Message:       fmt.Sprint("m12Items >>> (2/3) Removing previous word caches"),
+		})
+	}
+	// Remove any word indices that had been saved on the DB so far
+	// These custom indices are suffixed by the store id
+	customKey := fmt.Sprintf("wrd-%s", storeID)
+	err = db.SUpdate(ItemDB, db.NewTransaction(true), []byte("WKRG:INIT"), map[string]string{
+		customKey: "",
+	})
+	if err != nil {
+		return err
+	}
+	timer = time.NewTimer(time.Second * 2)
+	<-timer.C
+	connector.SessionsMu.RLock()
+	sesh, hasSesh = connector.Sessions.Get(user.Username)
+	connector.SessionsMu.RUnlock()
+	if hasSesh {
+		_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+			Type:          "[s:storeix]",
+			Action:        "log",
+			ReferenceUUID: "",
+			Username:      user.Username,
+			Message:       fmt.Sprint("m12Items >>> (2/3) DONE"),
+		})
+	}
+	// Turn the results into indices and save them all!
+	count = 0
+	maxCount = 0
+	for wrd, ids := range wordCache {
+		if len(ids) < 1 {
+			continue
+		}
+		count += 1
+		maxCount += 1
+		uidStr := ""
+		for _, id := range ids {
+			uidStr += FIndex(id)
+		}
+		err = db.SInsert(ItemDB, []byte(uidStr), map[string]string{
+			customKey: FIndex(wrd),
+		})
+		if count >= 500 {
+			count = 0
+			if hasSesh {
+				_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+					Type:          "[s:storeix]",
+					Action:        "log",
+					ReferenceUUID: "",
+					Username:      user.Username,
+					Message:       fmt.Sprint("m12Items >>> (3/3) Inserting word cache entries", maxCount),
+				})
+			}
+			timer = time.NewTimer(time.Millisecond * 500)
+			<-timer.C
+		}
+	}
+	connector.SessionsMu.RLock()
+	sesh, hasSesh = connector.Sessions.Get(user.Username)
+	connector.SessionsMu.RUnlock()
+	if hasSesh {
+		_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+			Type:          "[s:storeix]",
+			Action:        "log",
+			ReferenceUUID: "",
+			Username:      user.Username,
+			Message:       fmt.Sprint("m12Items >>> (3/3) DONE size", len(wordCache)),
+		})
+	}
+	return nil
+}
+
+func addWordsToCache(wordCache map[string][]string, entry *EntryResponse, field []byte) map[string][]string {
+	var ok bool
+	var str string
+	var lst []string
+	stops := "a or the these this that those else other der die das um am ,.-!\"§$%&/\\()=?[]{}@€°^+#´`"
+	for _, fld := range bytes.Fields(field) {
+		str = strings.ToLower(string(fld))
+		// Check for a stop word or special characters
+		if strings.Contains(stops, str) {
+			continue
+		}
+	wkrgCommonW:
+		lst, ok = wordCache[str]
+		if !ok {
+			wordCache[str] = []string{entry.uUID}
+			continue
+		}
+		if len(lst) < 256 {
+			if !slices.Contains(lst, entry.uUID) {
+				wordCache[str] = append(wordCache[str], entry.uUID)
+			}
+		} else {
+			if len(str) > 200 {
+				continue
+			}
+			// Too many entries, try again with a suffixed word
+			str += "0"
+			// Dirty jump!!! He used a dirty jump!!!
+			goto wkrgCommonW
+		}
+	}
+	return wordCache
 }

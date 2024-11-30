@@ -62,6 +62,7 @@ type SyncRoom struct {
 	Data map[string]string
 	// DataOwners keeps track of all data keys mapped to their owner
 	DataOwners map[string][]string
+	Timer      *time.Ticker
 }
 
 type SyncRoomContainer struct {
@@ -194,6 +195,7 @@ func (server *SyncRoomServer) handleSyncedEndpoint(
 						RoomOwner:  user.Username,
 						Data:       make(map[string]string),
 						DataOwners: make(map[string][]string),
+						Timer:      nil,
 					},
 				},
 			)

@@ -633,7 +633,7 @@ func (db *GoDB) handleFilesGetFromChat(mainDB *GoDB) http.HandlerFunc {
 		files := &FileList{Files: make([]*FileMetaEntry, 0)}
 		// Retrieve all files
 		respFiles, _, err := db.SSelect(FileDB, index,
-			nil, 10, 100, true)
+			nil, 10, 100, true, false)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
@@ -694,7 +694,7 @@ func (db *GoDB) handleFilesGetFromWisdom(mainDB *GoDB) http.HandlerFunc {
 		files := &FileList{Files: make([]*FileMetaEntry, 0)}
 		// Retrieve all files
 		respFiles, _, err := db.SSelect(FileDB, index,
-			nil, 10, 100, true)
+			nil, 10, 100, true, false)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
