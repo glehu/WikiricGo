@@ -53,7 +53,6 @@ func GetRegexQuery(query string) (map[string]*QueryWord, *regexp.Regexp) {
 			// Attach neighbor to ensure context is being captured better
 			wordMap[fmt.Sprintf("%s%s", words[i], words[i+1])] = queryWord
 			wordMap[fmt.Sprintf("%s-%s", words[i], words[i+1])] = queryWord
-			wordMap[fmt.Sprintf("%s-%s", words[i], words[i+1])] = queryWord
 			builder.WriteString("((\\s|-)?")
 			builder.WriteString(words[i+1])
 			builder.WriteString(")?")

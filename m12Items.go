@@ -681,9 +681,7 @@ func (db *GoDB) doItemWordQuery(w http.ResponseWriter, r *http.Request) {
 		b = !b
 		// Query content with provided prompt
 		accuracy, points = GetItemQueryPoints(item, request, p, words, b)
-		if points > 0 {
-			ic.Accuracy += accuracy
-		}
+		ic.Accuracy = accuracy
 		// Final (optional) check
 		if hasStockFilter {
 			stockC, cncl = db.calculateItemStock(storeID, ic.UUID, "[main]")
@@ -736,6 +734,9 @@ func (db *GoDB) GetItemsFromWords(storeID, query string) *ItemQueryResponse {
 		TimeSeconds: 0,
 		Items:       make([]*ItemContainer, 0),
 	}
+	if storeID == "" || query == "" {
+		return queryResponse
+	}
 	// Construct index map with all words being queried
 	index := map[string]string{}
 	words := strings.Fields(query)
@@ -743,6 +744,7 @@ func (db *GoDB) GetItemsFromWords(storeID, query string) *ItemQueryResponse {
 		word = strings.ToLower(strings.TrimSuffix(word, "*"))
 		index[fmt.Sprintf("wrd-%s[%d", storeID, i)] = word
 	}
+	wordLen := len(words)
 	// Retrieve slices of UUIDs mapped to words
 	response, cancel, err := db.SSelect(
 		ItemDB, index, nil, 4, 1, true, true,
@@ -758,6 +760,7 @@ func (db *GoDB) GetItemsFromWords(storeID, query string) *ItemQueryResponse {
 	var ixEntry []byte
 	var cnts *MassEntryResponse
 	var points int64
+	var hitCount int
 	for entry := range response {
 		if entry == nil {
 			continue
@@ -773,22 +776,35 @@ func (db *GoDB) GetItemsFromWords(storeID, query string) *ItemQueryResponse {
 				continue
 			}
 			points = 0
+			hitCount = 0
 			ixEntry = res.Data
 			cnts = SearchInBytes(ixEntry, "t", words, 100)
 			if cnts != nil && len(cnts.Counts) > 0 {
+				// We want to match all the words provided!
+				if len(cnts.Counts) >= wordLen {
+					hitCount += 1
+				}
 				for _, wCount := range cnts.Counts {
-					points += int64(len(wCount))
+					// Title means the most so we reward it!
+					points += int64(len(wCount)) * 2
 				}
-				if points <= 0 {
-					continue
-				}
+			}
+			// We need to match the title
+			if points <= 0 {
+				continue
 			}
 			ixEntry = res.Data
 			cnts = SearchInBytes(ixEntry, "desc", words, 100)
 			if cnts != nil && len(cnts.Counts) > 0 {
+				if len(cnts.Counts) >= wordLen {
+					hitCount += 1
+				}
 				for _, wCount := range cnts.Counts {
 					points += int64(len(wCount))
 				}
+			}
+			if points <= 0 || hitCount <= 0 {
+				continue
 			}
 			item = &Item{}
 			err = json.Unmarshal(res.Data, item)
@@ -800,7 +816,7 @@ func (db *GoDB) GetItemsFromWords(storeID, query string) *ItemQueryResponse {
 				Stock:     0,
 				Item:      item,
 				Analytics: nil,
-				Accuracy:  0,
+				Accuracy:  float64(points),
 			})
 		}
 	}
@@ -2321,10 +2337,10 @@ func (db *GoDB) BuildQueryIndex(connector *Connector, storeID string, user *User
 					Action:        "log",
 					ReferenceUUID: "",
 					Username:      user.Username,
-					Message:       fmt.Sprint("m12Items >>> (1/3) Generating word cache size", len(wordCache), "entries", maxCount),
+					Message:       fmt.Sprint("m12Items >>> (1/3) Generating word cache size ", len(wordCache), " entries ", maxCount),
 				})
 			}
-			timer := time.NewTimer(time.Millisecond * 200)
+			timer := time.NewTimer(time.Millisecond * 500)
 			<-timer.C
 		}
 		if maxCount >= 100_000 {
@@ -2342,7 +2358,7 @@ func (db *GoDB) BuildQueryIndex(connector *Connector, storeID string, user *User
 			Action:        "log",
 			ReferenceUUID: "",
 			Username:      user.Username,
-			Message:       fmt.Sprint("m12Items >>> (1/3) DONE size", len(wordCache), "entries", maxCount),
+			Message:       fmt.Sprint("m12Items >>> (1/3) DONE size ", len(wordCache), " entries ", maxCount),
 		})
 		_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
 			Type:          "[s:storeix]",
@@ -2391,7 +2407,7 @@ func (db *GoDB) BuildQueryIndex(connector *Connector, storeID string, user *User
 		err = db.SInsert(ItemDB, []byte(uidStr), map[string]string{
 			customKey: FIndex(wrd),
 		})
-		if count >= 500 {
+		if count >= 250 {
 			count = 0
 			if hasSesh {
 				_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
@@ -2399,7 +2415,7 @@ func (db *GoDB) BuildQueryIndex(connector *Connector, storeID string, user *User
 					Action:        "log",
 					ReferenceUUID: "",
 					Username:      user.Username,
-					Message:       fmt.Sprint("m12Items >>> (3/3) Inserting word cache entries", maxCount),
+					Message:       fmt.Sprint("m12Items >>> (3/3) Inserting word cache entries ", maxCount),
 				})
 			}
 			timer = time.NewTimer(time.Millisecond * 500)

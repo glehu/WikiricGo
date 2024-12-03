@@ -130,8 +130,6 @@ func CreatePeerConnection(server *SyncRoomServer, s *SyncedSession) (*webrtc.Pee
 	//
 	// label = 'data'
 	// channelDict = {
-	//   negotiated: true,
-	//   id: 0,
 	//   ordered: true,
 	//   maxRetransmits: 0
 	// }
