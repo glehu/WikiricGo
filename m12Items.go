@@ -753,6 +753,9 @@ func (db *GoDB) GetItemsFromWords(storeID, query string) *ItemQueryResponse {
 	if err != nil {
 		return nil
 	}
+	// We cannot guarantee that both the title and description of an item will match
+	// ...all words provided. We will basically just check if every word got matched at least once in total.
+	var hits []bool
 	var lst []string
 	var item *Item
 	var res *EntryResponse
@@ -760,7 +763,7 @@ func (db *GoDB) GetItemsFromWords(storeID, query string) *ItemQueryResponse {
 	var ixEntry []byte
 	var cnts *MassEntryResponse
 	var points int64
-	var hitCount int
+	var tmpLen int
 	for entry := range response {
 		if entry == nil {
 			continue
@@ -776,17 +779,18 @@ func (db *GoDB) GetItemsFromWords(storeID, query string) *ItemQueryResponse {
 				continue
 			}
 			points = 0
-			hitCount = 0
+			hits = make([]bool, wordLen)
 			ixEntry = res.Data
 			cnts = SearchInBytes(ixEntry, "t", words, 100)
 			if cnts != nil && len(cnts.Counts) > 0 {
-				// We want to match all the words provided!
-				if len(cnts.Counts) >= wordLen {
-					hitCount += 1
-				}
-				for _, wCount := range cnts.Counts {
+				for ix, wCount := range cnts.Counts {
+					tmpLen = len(wCount)
+					if tmpLen < 1 {
+						continue
+					}
+					hits[ix] = true
 					// Title means the most so we reward it!
-					points += int64(len(wCount)) * 2
+					points += int64(tmpLen) * 2
 				}
 			}
 			// We need to match the title
@@ -796,15 +800,24 @@ func (db *GoDB) GetItemsFromWords(storeID, query string) *ItemQueryResponse {
 			ixEntry = res.Data
 			cnts = SearchInBytes(ixEntry, "desc", words, 100)
 			if cnts != nil && len(cnts.Counts) > 0 {
-				if len(cnts.Counts) >= wordLen {
-					hitCount += 1
-				}
-				for _, wCount := range cnts.Counts {
-					points += int64(len(wCount))
+				for ix, wCount := range cnts.Counts {
+					tmpLen = len(wCount)
+					if tmpLen < 1 {
+						continue
+					}
+					hits[ix] = true
+					points += int64(tmpLen)
 				}
 			}
-			if points <= 0 || hitCount <= 0 {
+			if points <= 0 {
 				continue
+			}
+			// Check if we matched every word at least once!
+			for _, hit := range hits {
+				if !hit {
+					// TODO: Check importance of word missed e.g. was the input length less than x?
+					continue
+				}
 			}
 			item = &Item{}
 			err = json.Unmarshal(res.Data, item)
