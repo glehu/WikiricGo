@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dgraph-io/badger/v4"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
@@ -32,6 +33,44 @@ type Store struct {
 	AnalyticsUUID        string          `json:"ana"` // Views, likes etc. will be stored in a separate database
 	IsShiny              bool            `json:"shiny"`
 	Appearance           StoreAppearance `json:"visual"`
+	ItemCategories       []ItemCategory  `json:"icats"`
+}
+
+type ItemCategory struct {
+	Name         string `json:"t"`
+	Description  string `json:"desc"`
+	ColorHex     string `json:"hex"`
+	ThumbnailURL string `json:"iurl"`
+	Type         string `json:"type"` // "cat" || "query"
+	Value        string `json:"val"`
+}
+
+type StoreJourney struct {
+	Name         string   `json:"t"`
+	Description  string   `json:"desc"`
+	StoreUUID    string   `json:"pid"`
+	IsStart      bool     `json:"start"`
+	TimeCreated  string   `json:"ts"`
+	TimeUpdated  string   `json:"tsu"`
+	ColorHex     string   `json:"hex"`
+	ThumbnailURL string   `json:"iurl"`
+	Optional     bool     `json:"opt"`
+	NextUID      string   `json:"next"`
+	PreviousUID  string   `json:"prev"`
+	Categories   []string `json:"cats"`
+	Query        string   `json:"query"`
+	Brand        string   `json:"brand"`
+	Colors       []string `json:"colors"`
+	AmountItems  int      `json:"amt"` // Gets calculated by indexing
+}
+
+type StoreJourneyContainer struct {
+	UUID string `json:"uid"`
+	*StoreJourney
+}
+
+type StoreJourneyList struct {
+	Journeys []*StoreJourneyContainer `json:"journeys"`
 }
 
 type BankDetails struct {
@@ -89,6 +128,11 @@ func (db *GoDB) PublicStoreEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth,
 		// ###########
 		r.Get("/get/{storeID}", db.handleStoreVisit(rapidDB, false))
 		r.Get("/usr/{storeID}", db.handleStoreVisit(rapidDB, true))
+		// Journey Operations
+		r.Route("/journey", func(r chi.Router) {
+			r.Get("/get/{storeID}", db.handleStoreJourneyGet(rapidDB))
+			r.Get("/discover/{journeyID}", db.handleStoreJourneyDiscover(rapidDB))
+		})
 	})
 }
 
@@ -102,6 +146,15 @@ func (db *GoDB) ProtectedStoreEndpoints(r chi.Router, tokenAuth *jwtauth.JWTAuth
 		r.Post("/create", db.handleStoreCreate(rapidDB, connector))
 		r.Post("/mod/{storeID}", db.handleStoreModification(rapidDB))
 		r.Post("/cats/mod/{storeID}", db.handleStoreCategoryModification())
+		// Journey Operations
+		r.Route("/journey", func(r chi.Router) {
+			r.Post("/create/{storeID}", db.handleStoreJourneyCreate(rapidDB))
+			r.Post("/mod/{journeyID}", db.handleStoreJourneyModification(rapidDB))
+			r.Post("/edit/{journeyID}", db.handleStoreJourneyEdit(rapidDB))
+			// GET
+			r.Get("/index/{storeID}", db.handleStoreJourneyIndex(rapidDB, connector))
+			r.Get("/delete/{journeyID}", db.handleStoreJourneyDelete(rapidDB))
+		})
 		// ###########
 		// ### GET ###
 		// ###########
@@ -129,6 +182,23 @@ func (a *StoreModification) Bind(_ *http.Request) error {
 func (a *StoreQuery) Bind(_ *http.Request) error {
 	if a.Query == "" {
 		return errors.New("missing query")
+	}
+	return nil
+}
+
+func (a *ItemCategory) Bind(_ *http.Request) error {
+	if a.Name == "" {
+		return errors.New("missing name")
+	}
+	return nil
+}
+
+func (a *StoreJourney) Bind(_ *http.Request) error {
+	if a.Name == "" {
+		return errors.New("missing name")
+	}
+	if a.StoreUUID == "" {
+		return errors.New("missing pid")
 	}
 	return nil
 }
@@ -852,4 +922,747 @@ func GetStoreQueryPoints(
 	}
 	accuracy = float64(points) / float64(pointsMax)
 	return accuracy, points
+}
+
+func (db *GoDB) handleStoreJourneyCreate(rapidDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		storeID := chi.URLParam(r, "storeID")
+		if storeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		response, ok := db.Read(StoreDB, storeID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		store := &Store{}
+		err := json.Unmarshal(response.Data, store)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if store.Username != user.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Retrieve POST payload
+		request := &StoreJourney{}
+		if err = render.Bind(r, request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Sanitize
+		request.TimeCreated = TimeNowIsoString()
+		// We're at the start if there is no journey entry before this one (duh!)
+		request.IsStart = request.PreviousUID == ""
+		// Store
+		jsonEntry, err := json.Marshal(request)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Construct indices if we're at the start!
+		indices := map[string]string{}
+		if request.IsStart {
+			indices["pid-jny"] = FIndex(request.StoreUUID)
+		}
+		uUID, err := rapidDB.Insert(StoreDB, jsonEntry, indices)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		_, _ = fmt.Fprintln(w, uUID)
+	}
+}
+
+func (db *GoDB) handleStoreJourneyModification(rapidDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		// What is supposed to happen?
+		modType := r.URL.Query().Get("modtype")
+		if modType == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		// The following code will repeat link and unlink a lot since it assumes a future implementation
+		// ...of more features as those two. Now stop looking at this comment. Thanks.
+		if modType != "link" && modType != "unlink" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		dirType := ""
+		if modType == "link" || modType == "unlink" {
+			dirType = r.URL.Query().Get("dirtype")
+			if dirType == "" {
+				http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+				return
+			}
+			if dirType != "next" && dirType != "prev" {
+				http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+				return
+			}
+		}
+		// Retrieve journey that is about to be modified
+		journeyID := chi.URLParam(r, "journeyID")
+		if journeyID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		var response *EntryResponse
+		var ok bool
+		response, ok = rapidDB.Read(StoreDB, journeyID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		other := &StoreJourney{}
+		err := json.Unmarshal(response.Data, other)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if user is the owner
+		response, ok = db.Read(StoreDB, other.StoreUUID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		store := &Store{}
+		err = json.Unmarshal(response.Data, store)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if store.Username != user.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// If we (un)link, we need to remove the entry that is currently linked
+		if modType == "link" || modType == "unlink" {
+			uid := ""
+			if dirType == "next" {
+				uid = other.NextUID
+			} else if dirType == "prev" {
+				uid = other.PreviousUID
+			}
+			if uid != "" {
+				err = rapidDB.Delete(StoreDB, uid, []string{"pid-jny"})
+				if err != nil {
+					fmt.Println(err)
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+			}
+		}
+		// If unlinking was everything, we quit
+		if modType == "unlink" {
+			return
+		}
+		if modType == "link" {
+			// Retrieve POST payload
+			request := &StoreJourney{}
+			if err = render.Bind(r, request); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			// Retrieve other journey once again (now with a transaction!)
+			var txnOther *badger.Txn
+			response, txnOther = rapidDB.Get(StoreDB, journeyID)
+			if txnOther == nil {
+				http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+				return
+			}
+			other = &StoreJourney{}
+			err = json.Unmarshal(response.Data, other)
+			if err != nil {
+				fmt.Println(err)
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			// Link this journey to the other, but flipped
+			// When we modify the others next, it will be the prev for the request journey
+			if dirType == "next" {
+				request.PreviousUID = journeyID
+			} else if dirType == "prev" {
+				request.NextUID = journeyID
+			}
+			// Sanitize
+			request.IsStart = request.PreviousUID == ""
+			// Store request journey
+			var jsonEntry []byte
+			jsonEntry, err = json.Marshal(request)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			var uUID string
+			indices := map[string]string{}
+			if request.IsStart {
+				indices["pid-jny"] = FIndex(request.StoreUUID)
+			}
+			uUID, err = rapidDB.Insert(StoreDB, jsonEntry, indices)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			// Also link the other
+			if dirType == "next" {
+				other.NextUID = uUID
+			} else if dirType == "prev" {
+				other.PreviousUID = uUID
+			}
+			// Sanitize
+			other.IsStart = other.PreviousUID == ""
+			// Also update other journey
+			jsonEntry, err = json.Marshal(other)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			// Remove index if this journey entry is not at the start anymore
+			indices = map[string]string{}
+			if other.IsStart {
+				indices["pid-jny"] = FIndex(request.StoreUUID)
+			} else {
+				indices["pid-jny"] = ""
+			}
+			err = rapidDB.Update(StoreDB, txnOther, journeyID, jsonEntry, indices)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			_, _ = fmt.Fprintln(w, uUID)
+		}
+	}
+}
+
+func (db *GoDB) handleStoreJourneyEdit(rapidDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		// Retrieve journey that is about to be edited
+		journeyID := chi.URLParam(r, "journeyID")
+		if journeyID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		var response *EntryResponse
+		var ok bool
+		response, ok = rapidDB.Read(StoreDB, journeyID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		journey := &StoreJourney{}
+		err := json.Unmarshal(response.Data, journey)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if user is the owner
+		response, ok = db.Read(StoreDB, journey.StoreUUID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		store := &Store{}
+		err = json.Unmarshal(response.Data, store)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if store.Username != user.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		txnOther := rapidDB.NewTransaction(true)
+		// Retrieve POST payload
+		request := &StoreJourney{}
+		if err = render.Bind(r, request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Remove index if this journey entry is not at the start anymore
+		request.IsStart = request.PreviousUID == ""
+		indices := map[string]string{}
+		if request.IsStart {
+			indices["pid-jny"] = FIndex(request.StoreUUID)
+		} else {
+			indices["pid-jny"] = ""
+		}
+		// Override the journey
+		var jsonEntry []byte
+		jsonEntry, err = json.Marshal(request)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		err = rapidDB.Update(StoreDB, txnOther, journeyID, jsonEntry, indices)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+	}
+}
+
+func (db *GoDB) handleStoreJourneyGet(rapidDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		storeID := chi.URLParam(r, "storeID")
+		if storeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		journeys := StoreJourneyList{Journeys: make([]*StoreJourneyContainer, 0)}
+		// Retrieve store journeys
+		resp, cancel, err := rapidDB.SSelect(StoreDB, map[string]string{
+			"pid-jny": FIndex(storeID),
+		}, nil, 10, 1, true, false)
+		defer cancel()
+		if err != nil {
+			render.JSON(w, r, journeys)
+			return
+		}
+		var journey *StoreJourney
+		for entry := range resp {
+			journey = &StoreJourney{}
+			err = json.Unmarshal(entry.Data, journey)
+			if err != nil {
+				continue
+			}
+			journeys.Journeys = append(journeys.Journeys, &StoreJourneyContainer{
+				UUID:         entry.uUID,
+				StoreJourney: journey,
+			})
+		}
+		render.JSON(w, r, journeys)
+	}
+}
+
+func (db *GoDB) handleStoreJourneyIndex(rapidDB *GoDB, connector *Connector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		// Check if user has access to the store
+		storeID := chi.URLParam(r, "storeID")
+		if storeID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		response, ok := db.Read(StoreDB, storeID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		store := &Store{}
+		err := json.Unmarshal(response.Data, store)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if store.Username != user.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Retrieve connector entry of requester, so we can inform them about the progress!
+		connector.SessionsMu.RLock()
+		sesh, hasSesh := connector.Sessions.Get(user.Username)
+		connector.SessionsMu.RUnlock()
+		if hasSesh {
+			_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+				Type:          "[s:storeix]",
+				Action:        "log",
+				ReferenceUUID: "",
+				Username:      user.Username,
+				Message:       fmt.Sprint("m11Stores >>> (1/2) Retrieving store journeys"),
+			})
+		}
+		// Retrieve store journeys
+		resp, cancel, err := rapidDB.SSelect(StoreDB, map[string]string{
+			"pid-jny": FIndex(storeID),
+		}, nil, 10, 1, true, false)
+		defer cancel()
+		if err != nil {
+			if hasSesh {
+				_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+					Type:          "[s:storeix]",
+					Action:        "log",
+					ReferenceUUID: "",
+					Username:      user.Username,
+					Message:       fmt.Sprint("m11Stores >>> Cancelled due to an error: ", err.Error()),
+				})
+			}
+			return
+		}
+		if hasSesh {
+			_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+				Type:          "[s:storeix]",
+				Action:        "log",
+				ReferenceUUID: "",
+				Username:      user.Username,
+				Message:       fmt.Sprint("m11Stores >>> (1/2) DONE"),
+			})
+			_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+				Type:          "[s:storeix]",
+				Action:        "log",
+				ReferenceUUID: "",
+				Username:      user.Username,
+				Message:       fmt.Sprint("m11Stores >>> (2/2) Updating store journeys..."),
+			})
+		}
+		var journey *StoreJourney
+		var index map[string]string
+		var words map[string]*QueryWord
+		var points int
+		var cnts *MassEntryResponse
+		var offerCount int
+		var jsonEntry []byte
+		var wrds []string
+		var ixEntry []byte
+		var customIndices bool
+		for entry := range resp {
+			journey = &StoreJourney{}
+			err = json.Unmarshal(entry.Data, journey)
+			if err != nil || (journey.Query == "" && len(journey.Categories) < 1 && journey.Brand == "") {
+				continue
+			}
+			// Get all items matching the journey's criteria!
+			// Retrieve all Item entries respecting the query index filters
+			customIndices = false
+			index = map[string]string{}
+			if journey.Brand != "" {
+				index["pid-brand"] =
+					fmt.Sprintf("%s;%s", storeID, strings.ToLower(journey.Brand))
+				customIndices = true
+			}
+			if len(journey.Categories) > 0 {
+				for i, category := range journey.Categories {
+					journey.Categories[i] = strings.ToLower(category)
+					index[fmt.Sprintf("pid-cat[%d", i)] =
+						fmt.Sprintf("%s;%s;", storeID, journey.Categories[i])
+				}
+				customIndices = true
+			}
+			if len(journey.Colors) > 0 {
+				for i, color := range journey.Colors {
+					index[fmt.Sprintf("pid-clrs[%d", i)] =
+						fmt.Sprintf("%s;%s;", storeID, strings.ToLower(color))
+				}
+				customIndices = true
+			}
+			if journey.Brand != "" {
+				journey.Brand = strings.ToLower(journey.Brand)
+			}
+			// If there would be no indices, we simply continue with the next journey
+			// ...as it is pointless to go through all offers for each journey
+			if !customIndices {
+				continue
+			}
+			if journey.Query != "" {
+				words, _ = GetRegexQuery(journey.Query)
+				for wr := range words {
+					wrds = append(wrds, wr)
+				}
+			}
+			// Iterate over all items found
+			responseT, cancelT, errT := rapidDB.SSelect(ItemDB, index, nil,
+				30, 1, true, false,
+			)
+			if errT != nil {
+				cancelT()
+				continue
+			}
+			offerCount = 0
+			for entryT := range responseT {
+				if journey.Query == "" {
+					offerCount += 1
+					continue
+				}
+				points = 0
+				ixEntry = entryT.Data
+				cnts = SearchInBytes(ixEntry, "t", wrds, 100)
+				if cnts != nil && len(cnts.Counts) > 0 {
+					for _, wCount := range cnts.Counts {
+						points += len(wCount)
+					}
+					if points <= 0 {
+						continue
+					}
+				}
+				ixEntry = entryT.Data
+				cnts = SearchInBytes(ixEntry, "desc", wrds, 200)
+				if cnts != nil && len(cnts.Counts) > 0 {
+					for _, wCount := range cnts.Counts {
+						points += len(wCount)
+					}
+				}
+				ixEntry = entryT.Data
+				cnts = SearchInBytes(ixEntry, "keys", wrds, 100)
+				if cnts != nil && len(cnts.Counts) > 0 {
+					for _, wCount := range cnts.Counts {
+						points += len(wCount)
+					}
+				}
+				if points > 0 {
+					offerCount += 1
+				}
+			}
+			if offerCount < 1 {
+				continue
+			}
+			// Update the journey's offer count
+			jny, txn := rapidDB.Get(StoreDB, entry.uUID)
+			journey = &StoreJourney{}
+			err = json.Unmarshal(jny.Data, journey)
+			if err != nil {
+				txn.Discard()
+				continue
+			}
+			journey.AmountItems = offerCount
+			journey.TimeUpdated = TimeNowIsoString()
+			jsonEntry, err = json.Marshal(journey)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			err = rapidDB.Update(StoreDB, txn, entry.uUID, jsonEntry, map[string]string{})
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			timer := time.NewTimer(time.Millisecond * 500)
+			<-timer.C
+			if hasSesh {
+				_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+					Type:          "[s:storeix]",
+					Action:        "log",
+					ReferenceUUID: "",
+					Username:      user.Username,
+					Message:       fmt.Sprint("m11Stores >>> (2/2) Set ", offerCount, " offers for ", journey.Name),
+				})
+			}
+		}
+		// We are done!
+		connector.SessionsMu.RLock()
+		sesh, hasSesh = connector.Sessions.Get(user.Username)
+		connector.SessionsMu.RUnlock()
+		if hasSesh {
+			_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
+				Type:          "[s:storeix]",
+				Action:        "log",
+				ReferenceUUID: "",
+				Username:      user.Username,
+				Message:       fmt.Sprint("m11Stores >>> (2/2) DONE"),
+			})
+		}
+	}
+}
+
+func (db *GoDB) handleStoreJourneyDiscover(rapidDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Retrieve journey that is marking the beginning of our discovery
+		journeyID := chi.URLParam(r, "journeyID")
+		if journeyID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		var response *EntryResponse
+		var ok bool
+		response, ok = rapidDB.Read(StoreDB, journeyID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		list := StoreJourneyList{Journeys: make([]*StoreJourneyContainer, 0)}
+		journey := &StoreJourney{}
+		err := json.Unmarshal(response.Data, journey)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		list.Journeys = append(list.Journeys, &StoreJourneyContainer{
+			UUID:         response.uUID,
+			StoreJourney: journey,
+		})
+		// Store journey are double linked lists, so we will retrieve journey entries until there is no <next> uuid
+		for {
+			if journey.NextUID == "" {
+				render.JSON(w, r, list)
+				return
+			}
+			response, ok = rapidDB.Read(StoreDB, journey.NextUID)
+			if !ok {
+				render.JSON(w, r, list)
+				return
+			}
+			// We override our current journey since we are in a loop!
+			journey = &StoreJourney{}
+			err = json.Unmarshal(response.Data, journey)
+			if err != nil {
+				// We would not be able to retrieve more journeys, so we need to stop here...
+				render.JSON(w, r, list)
+				return
+			}
+			list.Journeys = append(list.Journeys, &StoreJourneyContainer{
+				UUID:         response.uUID,
+				StoreJourney: journey,
+			})
+		}
+	}
+}
+
+func (db *GoDB) handleStoreJourneyDelete(rapidDB *GoDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value("user").(*User)
+		if user == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		// Retrieve journey that is about to be deleted
+		journeyID := chi.URLParam(r, "journeyID")
+		if journeyID == "" {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		var response *EntryResponse
+		var ok bool
+		response, ok = rapidDB.Read(StoreDB, journeyID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		journey := &StoreJourney{}
+		err := json.Unmarshal(response.Data, journey)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		// Check if user is the owner
+		response, ok = db.Read(StoreDB, journey.StoreUUID)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		store := &Store{}
+		err = json.Unmarshal(response.Data, store)
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		if store.Username != user.Username {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		// Do we have to re-link journey entries?
+		// If there is a previous and next one for example, we will join them
+		hasPrev := false
+		hasNext := false
+		var prev *StoreJourney
+		var next *StoreJourney
+		var responsePrev, responseNext *EntryResponse
+		var txnPrev, txnNext *badger.Txn
+		if journey.PreviousUID != "" {
+			responsePrev, txnPrev = rapidDB.Get(StoreDB, journey.PreviousUID)
+			if txnPrev != nil {
+				prev = &StoreJourney{}
+				err = json.Unmarshal(responsePrev.Data, prev)
+				if err == nil {
+					hasPrev = true
+				}
+			}
+		}
+		if journey.NextUID != "" {
+			responseNext, txnNext = rapidDB.Get(StoreDB, journey.NextUID)
+			if txnNext != nil {
+				next = &StoreJourney{}
+				err = json.Unmarshal(responseNext.Data, next)
+				if err == nil {
+					hasNext = true
+				}
+			}
+		}
+		if hasPrev && hasNext {
+			// Join the two entries
+			prev.NextUID = responseNext.uUID
+			next.PreviousUID = responsePrev.uUID
+		} else {
+			// Clear the UUID instead
+			if hasPrev {
+				prev.NextUID = ""
+			} else if hasNext {
+				next.PreviousUID = ""
+			}
+		}
+		// Save the entries
+		var jsonEntry []byte
+		var indices map[string]string
+		if hasPrev {
+			prev.IsStart = prev.PreviousUID == ""
+			indices = map[string]string{}
+			if prev.IsStart {
+				indices["pid-jny"] = FIndex(journey.StoreUUID)
+			} else {
+				indices["pid-jny"] = ""
+			}
+			jsonEntry, err = json.Marshal(prev)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			err = rapidDB.Update(StoreDB, txnPrev, responsePrev.uUID, jsonEntry, map[string]string{})
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+		}
+		if hasNext {
+			next.IsStart = next.PreviousUID == ""
+			indices = map[string]string{}
+			if next.IsStart {
+				indices["pid-jny"] = FIndex(journey.StoreUUID)
+			} else {
+				indices["pid-jny"] = ""
+			}
+			jsonEntry, err = json.Marshal(next)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			err = rapidDB.Update(StoreDB, txnNext, responseNext.uUID, jsonEntry, map[string]string{})
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+		}
+		// Finally, delete the journey that was targeted
+		err = rapidDB.Delete(StoreDB, journeyID, []string{"pid-jny"})
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+	}
 }

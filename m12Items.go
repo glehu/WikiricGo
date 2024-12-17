@@ -809,15 +809,16 @@ func (db *GoDB) GetItemsFromWords(storeID, query string) *ItemQueryResponse {
 					points += int64(tmpLen)
 				}
 			}
-			if points <= 0 {
-				continue
-			}
 			// Check if we matched every word at least once!
 			for _, hit := range hits {
 				if !hit {
 					// TODO: Check importance of word missed e.g. was the input length less than x?
-					continue
+					points = 0
+					break
 				}
+			}
+			if points <= 0 {
+				continue
 			}
 			item = &Item{}
 			err = json.Unmarshal(res.Data, item)
@@ -2343,7 +2344,6 @@ func (db *GoDB) BuildQueryIndex(connector *Connector, storeID string, user *User
 		}
 		if count >= 1_000 {
 			count = 0
-			// Don't think this helps? My single core server says otherwise!
 			if hasSesh {
 				_ = WSSendJSON(sesh.Conn, sesh.Ctx, &ConnectorMsg{
 					Type:          "[s:storeix]",
@@ -2353,6 +2353,7 @@ func (db *GoDB) BuildQueryIndex(connector *Connector, storeID string, user *User
 					Message:       fmt.Sprint("m12Items >>> (1/3) Generating word cache size ", len(wordCache), " entries ", maxCount),
 				})
 			}
+			// Don't think this helps? My single core server says otherwise!
 			timer := time.NewTimer(time.Millisecond * 500)
 			<-timer.C
 		}
@@ -2444,7 +2445,7 @@ func (db *GoDB) BuildQueryIndex(connector *Connector, storeID string, user *User
 			Action:        "log",
 			ReferenceUUID: "",
 			Username:      user.Username,
-			Message:       fmt.Sprint("m12Items >>> (3/3) DONE size", len(wordCache)),
+			Message:       fmt.Sprint("m12Items >>> (3/3) DONE size ", len(wordCache)),
 		})
 	}
 	return nil
